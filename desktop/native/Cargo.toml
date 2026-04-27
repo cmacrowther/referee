@@ -1,0 +1,67 @@
+[package]
+name = "referee"
+default-run = "referee"
+version = "0.6.0"
+description = "Live transcoding proxy service for upscaling remote livestreams locally using supported NVIDIA RTX and AMD Radeon graphics hardware."
+authors = ["cmacrowther"]
+edition = "2021"
+
+[features]
+headless = []
+# Enable at build time when a Vulkan SDK + C++ toolchain are present and the
+# rife-worker binary should be compiled (e.g. in release CI).
+rife-ffi = []
+
+[lib]
+name = "referee_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+doctest = false
+
+[[bin]]
+name = "referee-server"
+path = "src/server_main.rs"
+required-features = ["headless"]
+
+[[bin]]
+name = "rife-worker"
+path = "src/rife_worker_main.rs"
+required-features = ["rife-ffi"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# cmake and cc are always available as build-dependencies; they are only
+# actually *used* (incurring a compile + link invocation) when the
+# `rife-ffi` feature is enabled.  The crates themselves are tiny wrappers
+# that add no overhead when unused.
+cmake = "0.1"
+cc    = { version = "1", features = ["parallel"] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net", "process", "fs", "signal"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tar = "0.4"
+xz2 = "0.1"
+dashmap = "6"
+regex = "1"
+flate2 = "1"
+open = "5"
+sevenz-rust = "0.6"
+zstd = "0.13"
+zip = "2"
+sysinfo = "0.33"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

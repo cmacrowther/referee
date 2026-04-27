@@ -1,0 +1,19 @@
+# Rust build artifacts — can be several GB
+desktop/native/target/
+
+# Node dependencies and build output
+node_modules/
+desktop/ui/node_modules/
+docs/node_modules/
+desktop/ui/dist/
+docs/.next/
+docs/out/
+
+# Version control
+.git/
+.gitignore
+
+# Editor/OS
+.vscode/
+*.DS_Store
+Thumbs.db

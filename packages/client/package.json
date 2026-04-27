@@ -1,0 +1,70 @@
+{
+  "name": "@cmacrowther/referee-client",
+  "version": "0.6.0",
+  "description": "Official JavaScript/TypeScript client for the REFEREE upscaling API",
+  "license": "GPL-3.0-or-later",
+  "author": {
+    "name": "cmacrowther",
+    "email": "cmacrowther@gmail.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cmacrowther/referee.git",
+    "directory": "packages/client"
+  },
+  "keywords": ["referee", "upscaling", "ai", "video", "hls", "streaming"],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./react": {
+      "import": {
+        "types": "./dist/react.d.ts",
+        "default": "./dist/react.js"
+      },
+      "require": {
+        "types": "./dist/react.d.cts",
+        "default": "./dist/react.cjs"
+      }
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run typecheck"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^6.0.2"
+  }
+}

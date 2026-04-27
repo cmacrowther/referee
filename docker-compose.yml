@@ -1,0 +1,62 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # NVIDIA profile
+  # Requires: nvidia-container-toolkit installed on the host.
+  # Usage:    docker compose --profile nvidia up
+  # ---------------------------------------------------------------------------
+  referee-nvidia:
+    profiles: [nvidia]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.nvidia
+    image: referee-server:nvidia
+    ports:
+      - "14003:14002"
+    volumes:
+      # Persists config, downloaded encoder binaries, and logs across restarts.
+      - referee_data:/home/referee/.local/share/com.referee.proxy
+    restart: unless-stopped
+    environment:
+      # Expose all NVIDIA GPUs inside the container.
+      NVIDIA_VISIBLE_DEVICES: all
+      # `all` exposes every driver capability including NVENC, NVML, and the
+      # full Vulkan/GL stack required by libplacebo for GPU-accelerated filtering.
+      NVIDIA_DRIVER_CAPABILITIES: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              # Compose reserves GPU devices using the generic `gpu` capability.
+              capabilities: [gpu]
+
+  # ---------------------------------------------------------------------------
+  # AMD profile
+  # Requires: amdgpu-pro or ROCm driver installed on the host.
+  # Usage:    docker compose --profile amd up
+  # ---------------------------------------------------------------------------
+  referee-amd:
+    profiles: [amd]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.amd
+    image: referee-server:amd
+    ports:
+      - "14002:14002"
+    volumes:
+      - referee_data:/home/referee/.local/share/com.referee.proxy
+    restart: unless-stopped
+    devices:
+      # DRI render nodes — required by AMF/Vulkan for GPU access
+      - /dev/dri:/dev/dri
+      # KFD — required by ROCm / AMF for full compute/video access
+      - /dev/kfd:/dev/kfd
+    group_add:
+      # These groups own /dev/dri and /dev/kfd on most distros
+      - video
+      - render
+
+volumes:
+  referee_data:

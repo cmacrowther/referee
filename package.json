@@ -1,0 +1,61 @@
+{
+  "name": "referee",
+  "version": "0.6.0",
+  "author": {
+    "name": "cmacrowther",
+    "email": "cmacrowther@gmail.com"
+  },
+  "description": "Live transcoding proxy service for upscaling remote livestreams locally using supported NVIDIA RTX and AMD Radeon graphics hardware.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cmacrowther/referee.git"
+  },
+  "workspaces": [
+    "packages/client"
+  ],
+  "scripts": {
+    "dev": "node scripts/sync-tauri-version.js && tauri dev -c desktop/native/tauri.conf.json",
+    "dev:ui": "vite --logLevel warn",
+    "dev:server": "cargo run --manifest-path desktop/native/Cargo.toml --features headless --bin referee-server",
+    "dev:docs": "npm --prefix docs run dev",
+    "build": "node scripts/sync-tauri-version.js && tauri build -c desktop/native/tauri.conf.json",
+    "build:ui": "vite build",
+    "build:server": "cargo build --manifest-path desktop/native/Cargo.toml --features headless --bin referee-server --release",
+    "build:client": "npm run build -w @cmacrowther/referee-client",
+    "build:docs": "npm --prefix docs run build",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest run --coverage",
+    "typecheck:client": "npm run typecheck -w @cmacrowther/referee-client",
+    "pack:client": "npm pack -w @cmacrowther/referee-client --dry-run",
+    "test:all": "vitest run && cargo test --manifest-path desktop/native/Cargo.toml"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/cli": "^2",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.2.0",
+    "@vitest/coverage-v8": "^4.1.4",
+    "@vitest/ui": "^4.1.4",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "jsdom": "^29.0.2",
+    "lucide-react": "^1.7.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "tailwind-merge": "^3.5.0",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^6.0.2",
+    "vite": "^7.3.1",
+    "vitest": "^4.1.4"
+  },
+  "dependencies": {
+    "@icons-pack/react-simple-icons": "^13.11.1",
+    "hls.js": "^1.6.16"
+  }
+}

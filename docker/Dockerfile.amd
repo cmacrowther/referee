@@ -1,0 +1,66 @@
+# =============================================================================
+# Stage 1 — Builder (identical to Dockerfile.nvidia)
+# =============================================================================
+FROM rust:1-bookworm AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    libgtk-3-dev \
+    libwebkit2gtk-4.1-dev \
+    libayatana-appindicator3-dev \
+    librsvg2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/desktop/native
+
+# Preserve the repo-relative layout expected by tauri.conf.json paths like
+# ../../assets/icons/... during headless Cargo builds.
+COPY desktop/native/ /workspace/desktop/native/
+COPY assets/ /workspace/assets/
+
+RUN cargo build --features headless --bin referee-server --release
+
+# =============================================================================
+# Stage 2 — AMD runtime
+# VCEEncC uses AMF (AMD Advanced Media Framework) which is exposed via
+# /dev/dri and /dev/kfd — both passed through in docker-compose.yml.
+# The host must have the amdgpu-pro or ROCm driver stack installed.
+# Vulkan is installed here as VCEEncC uses it for device enumeration.
+# =============================================================================
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # lspci — required by gpu.rs for GPU vendor/name detection
+    pciutils \
+    # TLS roots for outbound HTTPS (binary download, HLS probing)
+    ca-certificates \
+    # Ubuntu 24.04 ships OpenSSL 3 as libssl3t64
+    libssl3t64 \
+    # Vulkan loader + Mesa ICD for VCEEncC device enumeration
+    libvulkan1 \
+    mesa-vulkan-drivers \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /workspace/desktop/native/target/release/referee-server /usr/local/bin/referee-server
+
+# Run as a non-root user to limit the blast radius of a container escape.
+# Pre-create the data/log directory and own it so the named volume is
+# initialised with the correct ownership on first mount.
+RUN groupadd -r referee && useradd -r -g referee -m -d /home/referee referee \
+    && mkdir -p /home/referee/.local/share/com.referee.proxy \
+    && chown -R referee:referee /home/referee/.local
+
+EXPOSE 14002
+
+# VCEEncC .so files are copied by binary_manager into lib_dir at first run.
+ENV LD_LIBRARY_PATH="/home/referee/.local/share/com.referee.proxy/lib"
+
+USER referee
+
+CMD ["/usr/local/bin/referee-server"]

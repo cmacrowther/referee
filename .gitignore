@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Build Output
+dist/
+lib/
+desktop/native/target/
+desktop/native/gen/
+!desktop/ui/src/lib/
+!desktop/ui/src/lib/**
+!docs/lib/
+!docs/lib/**
+release/
+*.upx
+
+# Test Output
+desktop/ui/coverage/
+
+# Configuration & Secrets
+config.json
+.env
+.env.*
+
+# Large Binaries (bundled during build, not committed to git)
+*.exe
+*.dll
+*.zip
+*.rlib
+
+# App-specific runtime logs or temp files
+*.log
+/tmp/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE Settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.claude
+
+# Next
+/docs/.next/
+/docs/tsconfig.tsbuildinfo
+tsconfig.web.tsbuildinfo
+
+/dist
+
