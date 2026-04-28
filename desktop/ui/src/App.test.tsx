@@ -233,9 +233,9 @@ describe('App - unsupported hardware Relay prompt', () => {
             mockApi.emit.statusUpdate({ gpuVendor: 'intel' })
         })
 
-        await screen.findByText('Unsupported Hardware')
+        await screen.findByText('Relay Required')
 
-        fireEvent.click(document.querySelector('#status-view .stream-message-outline-action')!)
+        fireEvent.click(screen.getByRole('button', { name: 'Open Relay Settings' }))
 
         await waitFor(() => {
             expect(document.getElementById('app-shell')?.getAttribute('data-view')).toBe('settings')

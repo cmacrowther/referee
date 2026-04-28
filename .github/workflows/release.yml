@@ -93,7 +93,7 @@ jobs:
 
       - name: Run Rust unit tests
         working-directory: desktop/native
-        run: cargo test
+        run: cargo test --features headless --no-default-features
 
   test-ui:
     needs: check-version

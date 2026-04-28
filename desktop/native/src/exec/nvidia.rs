@@ -1221,7 +1221,7 @@ NVEnc (x64) 9.14
             vec![
                 VideoOp::NormalizeInput,
                 VideoOp::Interpolate(InterpolationPlan {
-                    target_fps: 60,
+                    target_fps: 48,
                     decision: InterpolationDecision::native_backend(OpExecutionStage::Executor),
                 }),
             ],

@@ -9,6 +9,7 @@ interface ConsentModalProps {
 
 export function ConsentModal({ request, onRespond }: ConsentModalProps) {
     const displayOrigin = request.origin.replace(/^https?:\/\//, '');
+    const displayAppName = request.appName?.trim();
 
     return (
         <div className="absolute inset-0 z-50 flex flex-col justify-end">
@@ -27,6 +28,11 @@ export function ConsentModal({ request, onRespond }: ConsentModalProps) {
                             <p className="text-[9.5px] pt-2 font-bold uppercase tracking-widest text-referee-accent leading-none">
                                 Access Request
                             </p>
+                            {displayAppName ? (
+                                <p className="max-w-full truncate text-[12px] font-semibold text-white leading-none">
+                                    {displayAppName}
+                                </p>
+                            ) : null}
                             <p className="font-mono text-[11px] font-medium text-white/70 leading-none">
                                 {displayOrigin}
                             </p>
