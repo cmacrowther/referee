@@ -6,6 +6,13 @@ import { RefereeWordmark } from "@/components/referee-wordmark"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
+  REFEREE_RELEASES_URL,
+  fetchRefereeReleases,
+  findNewestReleaseAsset,
+  hasExtension,
+  type ReleaseAsset,
+} from "@/lib/github-releases"
+import {
   ChevronDown,
   Download,
   ExternalLink,
@@ -24,21 +31,6 @@ export const metadata = {
   description: "Download REFEREE for Windows or Linux and get up and running in minutes.",
 }
 
-type ReleaseAsset = {
-  name: string
-  browser_download_url: string
-  size: number
-  updated_at: string
-}
-
-type Release = {
-  tag_name: string
-  name: string
-  published_at: string
-  assets: ReleaseAsset[]
-  html_url: string
-}
-
 function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
@@ -52,20 +44,8 @@ function formatDate(iso: string): string {
   })
 }
 
-async function fetchLatestRelease(): Promise<Release | null> {
-  try {
-    const res = await fetch(
-      "https://api.github.com/repos/cmacrowther/referee/releases/latest",
-      {
-        headers: { Accept: "application/vnd.github+json" },
-        next: { revalidate: 3600 },
-      }
-    )
-    if (!res.ok) return null
-    return res.json()
-  } catch {
-    return null
-  }
+function isPresent<T>(value: T | null | undefined): value is T {
+  return value != null
 }
 
 function WindowsIcon({ className }: { className?: string }) {
@@ -92,6 +72,7 @@ type PlatformCardProps = {
   primaryIcon?: React.ReactNode
   secondaryIcon?: React.ReactNode
   releasesUrl: string
+  version?: string
   steps: InstallStep[]
   primaryStepsLabel?: string
   secondarySteps?: InstallStep[]
@@ -127,6 +108,7 @@ function PlatformCard({
   primaryIcon,
   secondaryIcon,
   releasesUrl,
+  version,
   steps,
   primaryStepsLabel,
   secondarySteps,
@@ -292,14 +274,46 @@ const rpmSteps: InstallStep[] = [
 ]
 
 export default async function DownloadsPage() {
-  const release = await fetchLatestRelease()
-  const assets: ReleaseAsset[] = release?.assets ?? []
+  const releases = await fetchRefereeReleases()
+  const release = releases[0] ?? null
+  const windowsExe = findNewestReleaseAsset(releases, (asset) => hasExtension(asset, ".exe"))
+  const linuxDeb = findNewestReleaseAsset(releases, (asset) => hasExtension(asset, ".deb"))
+  const linuxRpm = findNewestReleaseAsset(releases, (asset) => hasExtension(asset, ".rpm"))
 
-  const windowsExe = assets.find((a) => a.name.endsWith(".exe"))
-  const linuxDeb = assets.find((a) => a.name.endsWith(".deb"))
-  const linuxRpm = assets.find((a) => a.name.endsWith(".rpm"))
+  const linuxPackages = [
+    linuxDeb
+      ? {
+          download: linuxDeb,
+          label: "Download .deb",
+          icon: (
+            <svg role="img" viewBox="0 0 24 24" className="h-4 w-4 mr-2 fill-current" aria-hidden="true">
+              <path d={siDebian.path} />
+            </svg>
+          ),
+          steps: debSteps,
+          stepsLabel: ".deb Installation (Ubuntu · Debian)",
+          distros: { label: ".deb", distros: ["Ubuntu 22.04+", "Debian 12+"] },
+        }
+      : null,
+    linuxRpm
+      ? {
+          download: linuxRpm,
+          label: "Download .rpm",
+          icon: (
+            <svg role="img" viewBox="0 0 24 24" className="h-4 w-4 mr-2 fill-current" aria-hidden="true">
+              <path d={siFedora.path} />
+            </svg>
+          ),
+          steps: rpmSteps,
+          stepsLabel: ".rpm Installation (Fedora · RHEL)",
+          distros: { label: ".rpm", distros: ["Fedora 38+", "RHEL / CentOS Stream 9+"] },
+        }
+      : null,
+  ].filter(isPresent)
 
-  const releasesUrl = "https://github.com/cmacrowther/referee/releases"
+  const primaryLinuxPackage = linuxPackages[0]
+  const secondaryLinuxPackage = linuxPackages[1]
+  const releasesUrl = REFEREE_RELEASES_URL
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -378,9 +392,10 @@ export default async function DownloadsPage() {
             <PlatformCard
               name="Windows"
               icon={<WindowsIcon className="h-5 w-5" />}
-              primaryAsset={windowsExe}
+              primaryAsset={windowsExe?.asset}
               primaryLabel="Download .exe"
               releasesUrl={releasesUrl}
+              version={windowsExe?.release.tag_name ?? release?.tag_name}
               steps={windowsSteps}
               packageDistros={[
                 { label: ".exe", distros: ["Windows 10/11"] },
@@ -388,48 +403,40 @@ export default async function DownloadsPage() {
             />
 
             {/* Linux — early access */}
-            <section>
-              <div className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-2">
-                <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs font-semibold text-amber-400">
-                  <AlertCircle className="h-3 w-3" />
-                  Early Access
-                </span>
-                <p className="text-sm text-muted-foreground">
-                  Linux support is under active development. Feature parity with Windows is limited and some GPU and distribution combinations may be unstable.
-                </p>
-              </div>
-              <PlatformCard
-                name="Linux"
-                icon={
-                  <svg role="img" viewBox="0 0 24 24" className="h-5 w-5 fill-current" aria-hidden="true">
-                    <path d={siLinux.path} />
-                  </svg>
-                }
-                primaryAsset={linuxDeb}
-                secondaryAsset={linuxRpm}
-                primaryLabel="Download .deb"
-                secondaryLabel="Download .rpm"
-                primaryIcon={
-                  <svg role="img" viewBox="0 0 24 24" className="h-4 w-4 mr-2 fill-current" aria-hidden="true">
-                    <path d={siDebian.path} />
-                  </svg>
-                }
-                secondaryIcon={
-                  <svg role="img" viewBox="0 0 24 24" className="h-4 w-4 mr-2 fill-current" aria-hidden="true">
-                    <path d={siFedora.path} />
-                  </svg>
-                }
-                releasesUrl={releasesUrl}
-                steps={debSteps}
-                primaryStepsLabel=".deb Installation (Ubuntu · Debian)"
-                secondarySteps={rpmSteps}
-                secondaryStepsLabel=".rpm Installation (Fedora · RHEL)"
-                packageDistros={[
-                  { label: ".deb", distros: ["Ubuntu 22.04+", "Debian 12+"] },
-                  { label: ".rpm", distros: ["Fedora 38+", "RHEL / CentOS Stream 9+"] },
-                ]}
-              />
-            </section>
+            {primaryLinuxPackage && (
+              <section>
+                <div className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-2">
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs font-semibold text-amber-400">
+                    <AlertCircle className="h-3 w-3" />
+                    Early Access
+                  </span>
+                  <p className="text-sm text-muted-foreground">
+                    Linux support is under active development. Feature parity with Windows is limited and some GPU and distribution combinations may be unstable.
+                  </p>
+                </div>
+                <PlatformCard
+                  name="Linux"
+                  icon={
+                    <svg role="img" viewBox="0 0 24 24" className="h-5 w-5 fill-current" aria-hidden="true">
+                      <path d={siLinux.path} />
+                    </svg>
+                  }
+                  primaryAsset={primaryLinuxPackage.download.asset}
+                  secondaryAsset={secondaryLinuxPackage?.download.asset}
+                  primaryLabel={primaryLinuxPackage.label}
+                  secondaryLabel={secondaryLinuxPackage?.label}
+                  primaryIcon={primaryLinuxPackage.icon}
+                  secondaryIcon={secondaryLinuxPackage?.icon}
+                  releasesUrl={releasesUrl}
+                  version={primaryLinuxPackage.download.release.tag_name}
+                  steps={primaryLinuxPackage.steps}
+                  primaryStepsLabel={primaryLinuxPackage.stepsLabel}
+                  secondarySteps={secondaryLinuxPackage?.steps}
+                  secondaryStepsLabel={secondaryLinuxPackage?.stepsLabel}
+                  packageDistros={linuxPackages.map((pkg) => pkg.distros)}
+                />
+              </section>
+            )}
           </div>
 
           {/* Requirements note */}

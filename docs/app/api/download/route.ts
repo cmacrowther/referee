@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from "next/server"
+import {
+  REFEREE_RELEASES_URL,
+  fetchRefereeReleases,
+  findNewestReleaseAsset,
+  hasExtension,
+} from "@/lib/github-releases"
 
 export const dynamic = "force-dynamic"
-
-type ReleaseAsset = { name: string; browser_download_url: string }
 
 function resolveRequestedPlatform(request: NextRequest): "windows" | "linux" {
   const platform = request.nextUrl.searchParams.get("platform")?.toLowerCase()
@@ -17,37 +21,26 @@ function resolveRequestedPlatform(request: NextRequest): "windows" | "linux" {
   return userAgent.includes("linux") ? "linux" : "windows"
 }
 
-function pickReleaseAsset(assets: ReleaseAsset[], platform: "windows" | "linux") {
+function pickReleaseDownload(
+  releases: Awaited<ReturnType<typeof fetchRefereeReleases>>,
+  platform: "windows" | "linux"
+) {
   if (platform === "linux") {
-    return assets.find((a) => a.name.endsWith(".AppImage"))
-      ?? assets.find((a) => a.name.endsWith(".deb"))
+    return findNewestReleaseAsset(releases, (asset) => hasExtension(asset, ".deb"))
+      ?? findNewestReleaseAsset(releases, (asset) => hasExtension(asset, ".rpm"))
   }
 
-  return assets.find((a) => a.name.endsWith(".exe"))
+  return findNewestReleaseAsset(releases, (asset) => hasExtension(asset, ".exe"))
 }
 
 export async function GET(request: NextRequest) {
-  const res = await fetch(
-    "https://api.github.com/repos/cmacrowther/referee/releases/latest",
-    { headers: { Accept: "application/vnd.github+json" }, next: { revalidate: 0 } }
-  )
-
-  if (!res.ok) {
-    return NextResponse.redirect(
-      "https://github.com/cmacrowther/referee/releases"
-    )
-  }
-
-  const release = await res.json()
-  const assets = (release.assets as ReleaseAsset[]) ?? []
+  const releases = await fetchRefereeReleases(0)
   const requestedPlatform = resolveRequestedPlatform(request)
-  const asset = pickReleaseAsset(assets, requestedPlatform)
+  const download = pickReleaseDownload(releases, requestedPlatform)
 
-  if (!asset) {
-    return NextResponse.redirect(
-      `https://github.com/cmacrowther/referee/releases/tag/${release.tag_name}`
-    )
+  if (!download) {
+    return NextResponse.redirect(REFEREE_RELEASES_URL)
   }
 
-  return NextResponse.redirect(asset.browser_download_url)
+  return NextResponse.redirect(download.asset.browser_download_url)
 }
