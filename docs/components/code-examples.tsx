@@ -28,6 +28,8 @@ if (!status.gpuReady) return; // no compatible GPU
 const { session, dispose } = await referee.startManagedSession({
   url: 'https://example.com/live/stream.m3u8',
   streamTitle: 'Friday Night Stream',
+  contentKind: 'live', // use 'vod' for on-demand content
+  displayRefreshRate: 144, // viewer refresh rate for matchDisplay
 });
 
 // session.url is the absolute HLS URL — load it directly in your player
@@ -868,6 +870,16 @@ export function CodeExamples() {
             </TabsContent>
           ))}
           </Tabs>
+        </section>
+
+        <section id="relay-integration" className="scroll-mt-28 mt-10 rounded-xl border border-border/60 bg-card/40 px-5 py-6 sm:px-6">
+          <h2 className="mb-4 text-xl font-semibold tracking-tight sm:text-2xl">Relay Integration in 0.7.0</h2>
+          <div className="space-y-3 text-sm leading-7 text-muted-foreground">
+            <p>Connect your player to the viewing device&apos;s REFEREE instance as usual. With a linked peer selected in Relay settings, stream start, heartbeat, stop, and HLS output are forwarded through that instance. Use the returned session ID and playback URL unchanged.</p>
+            <p><code>GET /v1/status</code> reports the linked peer&apos;s readiness when Relay is enabled. During a relay session, GPU utilization, executor, capability flags, and session processing details come from the peer, while session IDs and output URLs stay local. <code>GET /v1/ping</code> identifies the local installation.</p>
+            <p>Peer discovery recovers a linked device after its LAN address changes. If the peer is unavailable, handle the relay error and offer the original source as a fallback. Configure quality and frame generation on the processing peer before starting a new session.</p>
+            <p>For processing badges, read <code>sessions[].framegenEngine</code>, <code>framegenEnabled</code>, <code>targetFps</code>, and <code>hdrEnabled</code>. These describe the active pipeline after capability checks and fallbacks. The <code>encoderHasStreamingRife</code> client property is reserved and is absent from current server responses.</p>
+          </div>
         </section>
 
         <div className="mt-12 grid gap-6 lg:grid-cols-[minmax(0,1.45fr)_minmax(280px,0.95fr)]">

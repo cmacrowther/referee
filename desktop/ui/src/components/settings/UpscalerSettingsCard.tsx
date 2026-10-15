@@ -1,6 +1,14 @@
-import { ChevronDown, LockKeyhole, Sparkles } from 'lucide-react';
-import { useState } from 'react';
+import { ChevronDown } from 'lucide-react';
+import { type ReactNode, useState } from 'react';
 
+import {
+    AiBadge,
+    CONTROL_CLASS,
+    SelectField,
+    SettingRow,
+    SettingsGroup,
+    ToggleRow,
+} from '@/components/settings/SettingsPrimitives';
 import {
     deriveSettingsUiCapabilities,
     formatResolutionLabel,
@@ -19,6 +27,7 @@ import {
     type SettingsUiRendererPreferenceOption,
     type Status
 } from '@/lib/types';
+import { cn } from '@/lib/utils';
 
 interface UpscalerSettingsCardProps {
     settings: Settings;
@@ -37,36 +46,9 @@ interface UpscalerSettingsCardProps {
     onChange: (patch: Partial<Settings>) => void;
 }
 
-function ToggleField({
-    checked,
-    disabled = false,
-    onChange
-}: {
-    checked: boolean;
-    disabled?: boolean;
-    onChange: (checked: boolean) => void;
-}) {
-    return (
-        <label className={`relative inline-flex items-center ${disabled ? 'cursor-not-allowed opacity-30' : 'cursor-pointer'}`}>
-            <input
-                type="checkbox"
-                className="sr-only toggle-checkbox"
-                checked={checked}
-                disabled={disabled}
-                onChange={event => {
-                    onChange(event.currentTarget.checked);
-                }}
-            />
-            <div className="toggle-label h-[20px] w-[36px] rounded-full bg-[#535353] after:absolute after:left-[2px] after:top-[2px] after:h-[16px] after:w-[16px] after:rounded-full after:border after:border-gray-300 after:bg-white after:transition-all after:content-[''] hover:bg-[#666666]" />
-        </label>
-    );
-}
-
-const SELECT_CLASS =
-    'cursor-pointer appearance-none rounded border border-transparent bg-[#282828] py-1.5 pl-3 pr-7 text-xs font-medium text-white transition-colors hover:border-white/10 hover:bg-[#333333] focus:border-referee-green focus:outline-none focus:ring-1 focus:ring-referee-green disabled:cursor-not-allowed disabled:opacity-40';
-
 /**
- * A compact labelled select row used for the Motion Boost sub-settings.
+ * A compact select row nested under Motion Boost. The label stays on one line and the
+ * select takes the remaining width, truncating long option names rather than wrapping.
  */
 function SubSettingSelect({
     label,
@@ -81,31 +63,57 @@ function SubSettingSelect({
     value: string;
     disabled: boolean;
     onChange: (value: string) => void;
-    children: React.ReactNode;
+    children: ReactNode;
 }) {
     return (
-        <div className="group flex items-center justify-between gap-3 pl-3">
-            <div className="flex min-w-0 flex-col pr-2">
-                <span className="text-[12px] font-medium text-white/90">{label}</span>
-                {description && <span className="text-[11px] text-referee-muted">{description}</span>}
-            </div>
-            <div className="relative shrink-0">
-                <select
+        <div className="py-1 pl-4 pr-3">
+            <div className="flex items-center gap-3">
+                <span className="w-[72px] shrink-0 whitespace-nowrap text-[12px] font-medium text-white/85">{label}</span>
+                <SelectField
                     aria-label={label}
                     value={value}
                     disabled={disabled}
                     onChange={event => {
                         onChange(event.currentTarget.value);
                     }}
-                    className={SELECT_CLASS}
+                    className="flex-1"
                 >
                     {children}
-                </select>
-                <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2 text-referee-muted group-hover:text-white">
-                    <ChevronDown className="size-3" />
-                </div>
+                </SelectField>
             </div>
+            {description && <p className="mt-1 text-[11px] leading-[15px] text-referee-muted">{description}</p>}
         </div>
+    );
+}
+
+function NumberField({
+    label,
+    value,
+    min,
+    max,
+    step,
+    onChange,
+}: {
+    label: string;
+    value: number;
+    min: number;
+    max?: number;
+    step?: number;
+    onChange: (value: number) => void;
+}) {
+    return (
+        <label className="flex min-w-0 flex-col gap-1">
+            <span className="truncate text-[10px] text-referee-muted">{label}</span>
+            <input
+                type="number"
+                min={min}
+                max={max}
+                step={step}
+                value={value}
+                onChange={event => onChange(Number(event.currentTarget.value))}
+                className={cn(CONTROL_CLASS, 'w-full px-2 py-1 text-right')}
+            />
+        </label>
     );
 }
 
@@ -168,13 +176,13 @@ function getFeatureToggleDescription(
 }
 
 /**
- * Choose the label text color class for a feature toggle based on availability and lock state.
+ * Whether a feature toggle's label should render muted.
  *
  * @param feature - Object describing the feature's availability and lock state
- * @returns `'text-white'` when the feature is available and not locked, `'text-referee-muted'` otherwise
+ * @returns `false` when the feature is available and not locked, `true` otherwise
  */
-function getFeatureToggleLabelClass(feature: SettingsUiFeatureSupport) {
-    return feature.available && feature.lockState !== 'locked' ? 'text-white' : 'text-referee-muted';
+function isFeatureToggleMuted(feature: SettingsUiFeatureSupport) {
+    return !feature.available || feature.lockState === 'locked';
 }
 
 /**
@@ -276,7 +284,97 @@ function getEffectiveSettingsStatus({
 }
 
 /**
- * Render the Upscaler settings card with stream controls, advanced encoder tuning, and optional engine-only debug controls.
+ * Banner shown above the stream controls when they are routed to, or locked by, REFEREE Relay.
+ */
+function RelayNotice({
+    relayRemote,
+    relayRemoteOffline,
+    relayUpdating,
+    relayUpdateError,
+    relayRequired,
+    relayPeerName,
+    onOpenRelaySettings,
+}: {
+    relayRemote: boolean;
+    relayRemoteOffline: boolean;
+    relayUpdating: boolean;
+    relayUpdateError: string | null;
+    relayRequired: boolean;
+    relayPeerName: string | null;
+    onOpenRelaySettings?: () => void;
+}) {
+    const peerName = relayPeerName ?? 'the linked REFEREE instance';
+    const amber = relayRemote && !relayRemoteOffline;
+    const statusError = relayRemoteOffline || Boolean(relayUpdateError);
+
+    return (
+        <section
+            className={cn(
+                'rounded-lg border px-3 py-2.5',
+                amber ? 'border-[#FFB36B]/25 bg-[#FFB36B]/[0.08]' : 'border-[#FF6B35]/20 bg-[#FF6B35]/[0.08]'
+            )}
+        >
+            <span className="text-[9px] font-bold uppercase tracking-widest text-[#FFD8B8]/80">
+                {relayRemote ? 'Remote Relay Settings' : 'Stream Settings Locked'}
+            </span>
+            <p className="mt-0.5 text-[13px] font-medium leading-[18px] text-white">
+                {relayRemoteOffline
+                    ? `${relayPeerName ?? 'The linked REFEREE instance'} is offline`
+                    : relayRemote
+                    ? `Updating ${peerName}`
+                    : relayRequired
+                    ? 'This device requires REFEREE Relay'
+                    : 'You have REFEREE Relay enabled.'}
+            </p>
+            <p className="mt-0.5 text-[11px] leading-[15px] text-white/70">
+                {relayRemoteOffline
+                    ? `Remote Relay settings are locked until ${peerName} comes online.`
+                    : relayRemote
+                    ? `Changes here are saved to ${peerName} for new relay streams.`
+                    : relayRequired
+                    ? relayPeerName
+                        ? `New streams are routed through ${relayPeerName}. Stream Settings are managed on the relay device.`
+                        : 'No supported graphics hardware detected. Link a REFEREE Relay peer to route streams.'
+                    : `New streams are routed through ${peerName}. Switch routing back to This REFEREE in Relay settings to edit these controls here.`}
+            </p>
+            <div className="mt-2 flex items-center justify-between gap-2">
+                {relayRemote ? (
+                    <p
+                        role="status"
+                        aria-live="polite"
+                        className={cn(
+                            'flex min-w-0 items-center gap-1.5 text-[11px] font-medium leading-[15px]',
+                            statusError ? 'text-[#FF6B35]' : 'text-[#FFD8B8]'
+                        )}
+                    >
+                        <span aria-hidden="true" className={cn('size-1.5 shrink-0 rounded-full', statusError ? 'bg-[#FF6B35]' : 'bg-[#FFB36B]')} />
+                        <span className="min-w-0 break-words">
+                            {relayRemoteOffline
+                                ? 'Remote relay offline'
+                                : relayUpdateError
+                                ? relayUpdateError
+                                : relayUpdating
+                                    ? 'Updating remote relay...'
+                                    : 'Remote relay ready'}
+                        </span>
+                    </p>
+                ) : (
+                    <span />
+                )}
+                <button
+                    type="button"
+                    className="shrink-0 rounded-md border border-white/15 px-2 py-1 text-[11px] font-medium text-white/80 transition-colors hover:border-white/30 hover:bg-white/[0.04] hover:text-white"
+                    onClick={onOpenRelaySettings}
+                >
+                    Open Relay Settings
+                </button>
+            </div>
+        </section>
+    );
+}
+
+/**
+ * Render the Stream settings tab: picture and motion controls, advanced encoder tuning, and optional engine-only debug controls.
  *
  * Renders controls driven by derived UI capabilities (quality limits, feature availability, renderer options) and emits partial Settings patches via `onChange`. Advanced encoder profile editing targets a local profile selection and updates the corresponding encoding profile in `settings.encodingProfiles`. When `import.meta.env.DEV` and `engineSettings` are true, a debug "Engine Settings" panel is shown.
  *
@@ -323,9 +421,7 @@ export function UpscalerSettingsCard({
         { label: `Motion ${framegenFeature.support === 'native' ? 'Native' : framegenFeature.support === 'fallback' ? 'Fallback' : 'Unavailable'}`, support: framegenFeature.support },
         { label: `HDR ${hdrFeature.support === 'native' ? 'Native' : hdrFeature.support === 'fallback' ? 'Fallback' : 'Unavailable'}`, support: hdrFeature.support },
     ];
-    const cardClass = `rounded-lg border bg-referee-card p-3.5 transition-colors duration-300 ${
-        controlsLocked ? 'border-[#FF6B35]/20' : relayRemote ? 'border-[#FFB36B]/25' : 'border-referee-border'
-    }`;
+    const groupTone = controlsLocked ? 'border-[#FF6B35]/20' : relayRemote ? 'border-[#FFB36B]/25' : undefined;
     const [advancedSettingsEnabled, setAdvancedSettingsEnabled] = useState(false);
     const [profileResolution, setProfileResolution] = useState(settings.resolution);
 
@@ -352,101 +448,38 @@ export function UpscalerSettingsCard({
     }
 
     return (
-        <div id="settings-card" className="flex flex-col gap-3">
+        <div id="settings-card" className="flex flex-col gap-2.5">
             {(relayLocked || relayRemote) && (
-                <section className={`rounded-lg border p-3.5 ${
-                    relayRemoteOffline
-                        ? 'border-[#FF6B35]/20 bg-[#FF6B35]/10'
-                        : relayRemote
-                        ? 'border-[#FFB36B]/25 bg-[#FFB36B]/10'
-                        : 'border-[#FF6B35]/20 bg-[#FF6B35]/10'
-                }`}>
-                    <div className="flex items-start gap-3">
-                        <div>
-                            <span className="text-[10px] font-bold uppercase tracking-widest text-[#FFD8B8]">
-                                {relayRemote ? 'Remote Relay Settings' : 'Stream Settings Locked'}
-                            </span>
-                            <p className="mt-1 text-[13px] font-medium text-white">
-                                {relayRemoteOffline
-                                    ? `${relayPeerName ?? 'The linked REFEREE instance'} is offline`
-                                    : relayRemote
-                                    ? `Updating ${relayPeerName ?? 'the linked REFEREE instance'}`
-                                    : relayRequired
-                                    ? 'This device requires REFEREE Relay'
-                                    : 'You have REFEREE Relay enabled.'}
-                            </p>
-                            <p className="mt-1 text-[11px] leading-relaxed text-white/75">
-                                {relayRemoteOffline
-                                    ? `Remote Relay settings are locked until ${relayPeerName ?? 'the linked REFEREE instance'} comes online.`
-                                    : relayRemote
-                                    ? `Changes here are saved to ${relayPeerName ?? 'the linked REFEREE instance'} for new relay streams.`
-                                    : relayRequired
-                                    ? relayPeerName
-                                        ? `New streams are routed through ${relayPeerName}. Stream Settings are managed on the relay device.`
-                                        : 'No supported graphics hardware detected. Link a REFEREE Relay peer to route streams.'
-                                    : `New streams are routed through ${relayPeerName ?? 'the linked REFEREE instance'}. Switch routing back to This REFEREE in Relay settings to edit these controls here.`}
-                            </p>
-                            {relayRemote && (
-                                <p
-                                    role="status"
-                                    aria-live="polite"
-                                    className={`mt-2 text-[10px] font-bold uppercase tracking-wider ${
-                                        relayRemoteOffline || relayUpdateError ? 'text-[#FF6B35]' : 'text-[#FFD8B8]'
-                                    }`}
-                                >
-                                    {relayRemoteOffline
-                                        ? 'Remote relay offline'
-                                        : relayUpdateError
-                                        ? relayUpdateError
-                                        : relayUpdating
-                                            ? 'Updating remote relay...'
-                                            : 'Remote relay ready'}
-                                </p>
-                            )}
-                            <button
-                                type="button"
-                                className="mt-2 rounded-md border border-white/15 px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider text-white/75 transition-colors hover:border-white/30 hover:bg-white/[0.04] hover:text-white"
-                                onClick={onOpenRelaySettings}
-                            >
-                                Open Relay Settings
-                            </button>
-                        </div>
-                    </div>
-                </section>
+                <RelayNotice
+                    relayRemote={relayRemote}
+                    relayRemoteOffline={relayRemoteOffline}
+                    relayUpdating={relayUpdating}
+                    relayUpdateError={relayUpdateError}
+                    relayRequired={relayRequired}
+                    relayPeerName={relayPeerName}
+                    onOpenRelaySettings={onOpenRelaySettings}
+                />
             )}
 
             <fieldset
                 disabled={controlsLocked}
                 aria-disabled={controlsLocked}
                 id="upscaler-controls"
-                className={`m-0 flex min-w-0 flex-col gap-3 border-0 p-0 transition-all duration-300 ${controlsLocked ? 'pointer-events-none opacity-30' : ''}`}
+                className={`m-0 flex min-w-0 flex-col gap-2.5 border-0 p-0 transition-all duration-300 ${controlsLocked ? 'pointer-events-none opacity-30' : ''}`}
             >
-                <section className={`${cardClass} flex flex-col gap-3.5`}>
-                    <div className="flex flex-col">
-                        <span className="text-[10px] font-bold uppercase tracking-widest text-referee-muted">Stream Settings</span>
-                    </div>
-
-                    <div className="group flex items-center justify-between gap-3">
-                        <div className="flex min-w-0 flex-col pr-2">
-                            <span className="flex items-center gap-0 text-[13px] font-medium text-white">
-                                Upscale Target
-                                <span className="ml-1.5 inline-flex items-center gap-0.5 rounded bg-referee-green/10 px-1.5 py-0.5 text-[9px] font-bold tracking-wide text-referee-green">
-                                    <Sparkles className="size-2.5" />
-                                    AI
-                                </span>
-                            </span>
-                            <span className="text-[11px] text-referee-muted">
-                                {uiCapabilities.resolvedPath.kind === 'nvidiaNative'
-                                    ? 'Target for NVIDIA® AI-based upscaling'
-                                    : uiCapabilities.resolvedPath.kind === 'amdNative'
-                                        ? 'Target for AMD® FSR upscaling'
-                                        : uiCapabilities.resolvedPath.kind === 'pending'
-                                            ? 'Target output resolution'
-                                            : 'Target for REFEREE upscaling'}
-                            </span>
-                        </div>
-                        <div className="relative shrink-0">
-                            <select
+                <SettingsGroup className={groupTone}>
+                    <SettingRow
+                        label="Upscale Target"
+                        badge={<AiBadge />}
+                        description={uiCapabilities.resolvedPath.kind === 'nvidiaNative'
+                            ? 'NVIDIA® AI upscaling'
+                            : uiCapabilities.resolvedPath.kind === 'amdNative'
+                                ? 'AMD® FSR upscaling'
+                                : uiCapabilities.resolvedPath.kind === 'pending'
+                                    ? 'Output resolution'
+                                    : 'REFEREE upscaling'}
+                        control={
+                            <SelectField
                                 aria-label="Resolution Target"
                                 value={settings.resolution}
                                 onChange={event => {
@@ -457,71 +490,68 @@ export function UpscalerSettingsCard({
                                         quality: Math.min(settings.quality, getMaxQualityForResolution(resolution))
                                     });
                                 }}
-                                className="cursor-pointer appearance-none rounded border border-transparent bg-[#282828] py-1.5 pl-3 pr-7 text-xs font-medium text-white transition-colors hover:border-white/10 hover:bg-[#333333] focus:border-referee-green focus:outline-none focus:ring-1 focus:ring-referee-green"
+                                className="w-[84px]"
                             >
                                 <option value="1920x1080">1080p</option>
                                 <option value="2560x1440">1440p</option>
                                 <option value="3840x2160">4K</option>
-                            </select>
-                            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2 text-referee-muted group-hover:text-white">
-                                <ChevronDown className="size-3" />
-                            </div>
-                        </div>
-                    </div>
+                            </SelectField>
+                        }
+                    />
 
-                    <div className="group flex flex-col gap-3 border-y border-white/[0.03] py-3">
-                        <div className="flex items-end justify-between">
-                            <div className="flex flex-col">
-                                <span className="text-[13px] font-medium text-white">Upscaling Quality</span>
-                                <span className="text-[11px] text-referee-muted">Sharper image at higher GPU cost</span>
-                            </div>
-                            <span className="min-w-[32px] rounded bg-referee-green/10 px-2.5 py-0.5 text-center text-[16px] font-bold text-referee-green">
+                    <div className="px-3 pb-2 pt-2">
+                        <div className="flex items-center justify-between gap-3">
+                            <span className="text-[13px] font-medium leading-[18px] text-white">Upscaling Quality</span>
+                            <span className="min-w-[26px] rounded bg-referee-green/10 px-1.5 text-center text-[13px] font-bold leading-[18px] tabular-nums text-referee-green">
                                 {settings.quality}
                             </span>
                         </div>
-                        <div className="mt-1 px-1">
-                            <input
-                                type="range"
-                                aria-label="Upscaling Quality"
-                                min={1}
-                                max={maxQuality}
-                                value={settings.quality}
-                                style={{ '--range-fill': `${((settings.quality - 1) / (maxQuality - 1)) * 100}%` } as React.CSSProperties}
-                                onChange={event => {
-                                    onChange({ quality: Number(event.currentTarget.value) });
-                                }}
-                            />
-                            <div className="mt-2 flex justify-between text-[9px] font-bold uppercase tracking-wider text-referee-muted">
-                                <span>Fast</span>
-                                <span>Quality</span>
-                            </div>
+                        <input
+                            type="range"
+                            aria-label="Upscaling Quality"
+                            min={1}
+                            max={maxQuality}
+                            value={settings.quality}
+                            style={{ '--range-fill': `${((settings.quality - 1) / (maxQuality - 1)) * 100}%` } as React.CSSProperties}
+                            onChange={event => {
+                                onChange({ quality: Number(event.currentTarget.value) });
+                            }}
+                            className="mt-2 block"
+                        />
+                        <div className="mt-1 flex justify-between text-[9px] font-bold uppercase tracking-wider text-referee-muted/80">
+                            <span>Faster</span>
+                            <span>Sharper</span>
                         </div>
                     </div>
 
-                    <div className="flex items-center justify-between gap-3">
-                        <div className="flex min-w-0 flex-col pr-2">
-                            <span className={`flex items-center gap-0 text-[13px] font-medium ${getFeatureToggleLabelClass(framegenFeature)}`}>
-                                Motion Boost
-                                <span className="ml-1.5 inline-flex items-center gap-0.5 rounded bg-referee-green/10 px-1.5 py-0.5 text-[9px] font-bold tracking-wide text-referee-green">
-                                    <Sparkles className="size-2.5" />
-                                    AI
-                                </span>
-                            </span>
-                            <span className="text-[11px] text-referee-muted">
-                                {getFeatureToggleDescription(framegenFeature, 'Smooths motion by generating extra frames')}
-                            </span>
-                        </div>
-                        <ToggleField
-                            checked={framegenFeature.support === 'unavailable' ? false : settings.framegen}
-                            disabled={framegenFeature.disabled}
-                            onChange={checked => {
-                                onChange({ framegen: checked });
-                            }}
-                        />
-                    </div>
+                    <ToggleRow
+                        label="HDR Mapping"
+                        badge={<AiBadge />}
+                        description={getFeatureToggleDescription(hdrFeature, 'Maps SDR video for HDR displays')}
+                        muted={isFeatureToggleMuted(hdrFeature)}
+                        checked={hdrFeature.support === 'unavailable' ? false : settings.hdr}
+                        disabled={hdrFeature.disabled}
+                        onChange={checked => {
+                            onChange({ hdr: checked });
+                        }}
+                    />
+                </SettingsGroup>
+
+                <SettingsGroup className={groupTone}>
+                    <ToggleRow
+                        label="Motion Boost"
+                        badge={<AiBadge />}
+                        description={getFeatureToggleDescription(framegenFeature, 'Smooths motion by generating extra frames')}
+                        muted={isFeatureToggleMuted(framegenFeature)}
+                        checked={framegenFeature.support === 'unavailable' ? false : settings.framegen}
+                        disabled={framegenFeature.disabled}
+                        onChange={checked => {
+                            onChange({ framegen: checked });
+                        }}
+                    />
 
                     {showFramegenOptions && (
-                        <div className="-mt-1 flex flex-col gap-2">
+                        <div className="py-1">
                             <SubSettingSelect
                                 label="Frame Rate"
                                 description={
@@ -592,168 +622,113 @@ export function UpscalerSettingsCard({
                             )}
                         </div>
                     )}
+                </SettingsGroup>
 
-                    <div className="flex items-center justify-between gap-3">
-                        <div className="flex min-w-0 flex-col pr-2">
-                            <span className={`flex items-center gap-0 text-[13px] font-medium ${getFeatureToggleLabelClass(hdrFeature)}`}>
-                                HDR Mapping
-                                <span className="ml-1.5 inline-flex items-center gap-0.5 rounded bg-referee-green/10 px-1.5 py-0.5 text-[9px] font-bold tracking-wide text-referee-green">
-                                    <Sparkles className="size-2.5" />
-                                    AI
-                                </span>
-                            </span>
-                            <span className="text-[11px] text-referee-muted">
-                                {getFeatureToggleDescription(hdrFeature, 'Maps SDR video for HDR displays')}
-                            </span>
-                        </div>
-                        <ToggleField
-                            checked={hdrFeature.support === 'unavailable' ? false : settings.hdr}
-                            disabled={hdrFeature.disabled}
-                            onChange={checked => {
-                                onChange({ hdr: checked });
-                            }}
+                <SettingsGroup className={groupTone}>
+                    <button
+                        type="button"
+                        aria-expanded={advancedSettingsEnabled}
+                        onClick={() => setAdvancedSettingsEnabled(open => !open)}
+                        className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left transition-[background-color] hover:bg-white/[0.02]"
+                    >
+                        <span className="flex min-w-0 flex-col">
+                            <span className="text-[13px] font-medium leading-[18px] text-white">Advanced Encoding</span>
+                            <span className="text-[11px] leading-[15px] text-referee-muted">Bitrate, preset, and HLS tuning</span>
+                        </span>
+                        <ChevronDown
+                            className={cn('size-4 shrink-0 text-referee-muted transition-transform', advancedSettingsEnabled && 'rotate-180')}
                         />
-                    </div>
-                </section>
-
-                <section className={cardClass}>
-                    <div className="mb-3 flex flex-col">
-                        <span className="text-[10px] font-bold uppercase tracking-widest text-referee-muted">Advanced Settings</span>
-                    </div>
-
-                    <div className="flex items-center justify-between gap-3">
-                        <div className="flex flex-col pr-2">
-                            <span className="text-[13px] font-medium text-white">Show Advanced</span>
-                            <span className="text-[11px] leading-4 text-referee-muted">Most users can leave this off</span>
-                        </div>
-                        <ToggleField
-                            checked={advancedSettingsEnabled}
-                            onChange={setAdvancedSettingsEnabled}
-                        />
-                    </div>
+                    </button>
 
                     {advancedSettingsEnabled && (
-                        <div
-                            className="mt-3 border-l border-[#FF6B35]/30 pl-3"
-                            aria-label="Advanced encoder tuning controls"
-                        >
-                            <div className="flex flex-col gap-3">
-                                <p className="text-[11px] leading-4 text-referee-muted">
-                                    Fine-tune bitrate, encoder preset, lookahead, B-frames, and HLS segment length.
+                        <div className="flex flex-col gap-2.5 px-3 pb-3 pt-2.5" aria-label="Advanced encoder tuning controls">
+                            {uiCapabilities.advancedEncoding.reason && (
+                                <p className="text-[10px] leading-[14px] text-referee-muted">
+                                    {uiCapabilities.advancedEncoding.reason}
                                 </p>
-                                {uiCapabilities.advancedEncoding.reason && (
-                                    <p className="text-[10px] leading-4 text-referee-muted">
-                                        {uiCapabilities.advancedEncoding.reason}
-                                    </p>
-                                )}
+                            )}
 
-                                <div className="flex items-center justify-between gap-3">
-                                    <span className="text-[13px] font-medium text-white">Encoding Profile</span>
-                                    <div className="relative shrink-0">
-                                        <select
-                                            aria-label="Encoding Profile"
-                                            value={profileResolution}
-                                            onChange={event => {
-                                                setProfileResolution(event.currentTarget.value);
-                                            }}
-                                            className="cursor-pointer appearance-none rounded border border-transparent bg-[#282828] py-1.5 pl-3 pr-7 text-xs font-medium text-white transition-colors hover:border-white/10 hover:bg-[#333333] focus:border-referee-green focus:outline-none focus:ring-1 focus:ring-referee-green"
-                                        >
-                                            {ENCODING_PROFILE_RESOLUTIONS.map(resolution => (
-                                                <option key={resolution} value={resolution}>
-                                                    {formatResolutionLabel(resolution)}
-                                                </option>
-                                            ))}
-                                        </select>
-                                        <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2 text-referee-muted">
-                                            <ChevronDown className="size-3" />
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div className="flex flex-col gap-2 border-t border-white/[0.04] pt-3">
-                                    <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2">
-                                        <span className="text-[11px] text-referee-muted">Bitrate (kbps)</span>
-                                        <input
-                                            type="number"
-                                            min={1000}
-                                            step={500}
-                                            value={currentProfile.bitrate}
-                                            onChange={e => updateProfile({ bitrate: Number(e.currentTarget.value) })}
-                                            className="w-[72px] rounded border border-transparent bg-[#282828] px-2 py-1 text-right text-xs font-medium text-white transition-colors hover:border-white/10 focus:border-referee-green focus:outline-none focus:ring-1 focus:ring-referee-green"
-                                        />
-
-                                        <span className="text-[11px] text-referee-muted">Max Bitrate (kbps)</span>
-                                        <input
-                                            type="number"
-                                            min={1000}
-                                            step={500}
-                                            value={currentProfile.max_bitrate}
-                                            onChange={e => updateProfile({ max_bitrate: Number(e.currentTarget.value) })}
-                                            className="w-[72px] rounded border border-transparent bg-[#282828] px-2 py-1 text-right text-xs font-medium text-white transition-colors hover:border-white/10 focus:border-referee-green focus:outline-none focus:ring-1 focus:ring-referee-green"
-                                        />
-
-                                        <span className="text-[11px] text-referee-muted">Preset</span>
-                                        <div className="relative">
-                                            <select
-                                                value={currentProfile.preset}
-                                                onChange={e => updateProfile({ preset: e.currentTarget.value })}
-                                                className="w-[72px] cursor-pointer appearance-none rounded border border-transparent bg-[#282828] py-1 pl-2 pr-6 text-xs font-medium text-white transition-colors hover:border-white/10 focus:border-referee-green focus:outline-none focus:ring-1 focus:ring-referee-green"
-                                            >
-                                                {NVENC_PRESETS.map(p => (
-                                                    <option key={p} value={p}>{p}</option>
-                                                ))}
-                                            </select>
-                                            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-1.5 text-referee-muted">
-                                                <ChevronDown className="size-3" />
-                                            </div>
-                                        </div>
-
-                                        <span className="text-[11px] text-referee-muted">Lookahead</span>
-                                        <input
-                                            type="number"
-                                            min={0}
-                                            max={32}
-                                            value={currentProfile.lookahead}
-                                            onChange={e => updateProfile({ lookahead: Number(e.currentTarget.value) })}
-                                            className="w-[72px] rounded border border-transparent bg-[#282828] px-2 py-1 text-right text-xs font-medium text-white transition-colors hover:border-white/10 focus:border-referee-green focus:outline-none focus:ring-1 focus:ring-referee-green"
-                                        />
-
-                                        <span className="text-[11px] text-referee-muted">B-Frames</span>
-                                        <input
-                                            type="number"
-                                            min={0}
-                                            max={4}
-                                            value={currentProfile.bframes}
-                                            onChange={e => updateProfile({ bframes: Number(e.currentTarget.value) })}
-                                            className="w-[72px] rounded border border-transparent bg-[#282828] px-2 py-1 text-right text-xs font-medium text-white transition-colors hover:border-white/10 focus:border-referee-green focus:outline-none focus:ring-1 focus:ring-referee-green"
-                                        />
-
-                                        <span className="text-[11px] text-referee-muted">HLS Segment (s)</span>
-                                        <input
-                                            type="number"
-                                            min={1}
-                                            max={10}
-                                            value={currentProfile.hls_time}
-                                            onChange={e => updateProfile({ hls_time: Number(e.currentTarget.value) })}
-                                            className="w-[72px] rounded border border-transparent bg-[#282828] px-2 py-1 text-right text-xs font-medium text-white transition-colors hover:border-white/10 focus:border-referee-green focus:outline-none focus:ring-1 focus:ring-referee-green"
-                                        />
-                                    </div>
-
-                                    <button
-                                        type="button"
-                                        onClick={resetProfile}
-                                        className="mt-1 self-end text-[10px] font-bold uppercase tracking-wider text-referee-muted transition-colors hover:text-white"
-                                    >
-                                        Reset to Defaults
-                                    </button>
-                                </div>
+                            <div className="flex items-center justify-between gap-3">
+                                <span className="text-[12px] font-medium text-white/85">Encoding Profile</span>
+                                <SelectField
+                                    aria-label="Encoding Profile"
+                                    value={profileResolution}
+                                    onChange={event => {
+                                        setProfileResolution(event.currentTarget.value);
+                                    }}
+                                    className="w-[84px]"
+                                >
+                                    {ENCODING_PROFILE_RESOLUTIONS.map(resolution => (
+                                        <option key={resolution} value={resolution}>
+                                            {formatResolutionLabel(resolution)}
+                                        </option>
+                                    ))}
+                                </SelectField>
                             </div>
+
+                            <div className="grid grid-cols-2 gap-x-2.5 gap-y-2">
+                                <NumberField
+                                    label="Bitrate (kbps)"
+                                    min={1000}
+                                    step={500}
+                                    value={currentProfile.bitrate}
+                                    onChange={bitrate => updateProfile({ bitrate })}
+                                />
+                                <NumberField
+                                    label="Max Bitrate (kbps)"
+                                    min={1000}
+                                    step={500}
+                                    value={currentProfile.max_bitrate}
+                                    onChange={max_bitrate => updateProfile({ max_bitrate })}
+                                />
+                                <label className="flex min-w-0 flex-col gap-1">
+                                    <span className="text-[10px] text-referee-muted">Preset</span>
+                                    <SelectField
+                                        value={currentProfile.preset}
+                                        onChange={e => updateProfile({ preset: e.currentTarget.value })}
+                                        selectClassName="py-1"
+                                    >
+                                        {NVENC_PRESETS.map(p => (
+                                            <option key={p} value={p}>{p}</option>
+                                        ))}
+                                    </SelectField>
+                                </label>
+                                <NumberField
+                                    label="Lookahead"
+                                    min={0}
+                                    max={32}
+                                    value={currentProfile.lookahead}
+                                    onChange={lookahead => updateProfile({ lookahead })}
+                                />
+                                <NumberField
+                                    label="B-Frames"
+                                    min={0}
+                                    max={4}
+                                    value={currentProfile.bframes}
+                                    onChange={bframes => updateProfile({ bframes })}
+                                />
+                                <NumberField
+                                    label="HLS Segment (s)"
+                                    min={1}
+                                    max={10}
+                                    value={currentProfile.hls_time}
+                                    onChange={hls_time => updateProfile({ hls_time })}
+                                />
+                            </div>
+
+                            <button
+                                type="button"
+                                onClick={resetProfile}
+                                className="self-end text-[10px] font-bold uppercase tracking-wider text-referee-muted transition-colors hover:text-white"
+                            >
+                                Reset to Defaults
+                            </button>
                         </div>
                     )}
-                </section>
+                </SettingsGroup>
 
                 {import.meta.env.DEV && engineSettings && (
-                    <section className={cardClass + ' border-referee-green/30 bg-referee-green/10'}>
+                    <section className="rounded-lg border border-referee-green/30 bg-referee-green/10 p-3">
                         <div className="mb-3 flex items-center justify-between">
                             <span className="text-[10px] font-bold uppercase tracking-widest text-referee-muted">Engine Settings</span>
                             <span className="ml-2">

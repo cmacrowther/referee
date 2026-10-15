@@ -235,8 +235,7 @@ export default function App() {
 
     function handleOpenRelaySettings() {
         setSettingsFocusRequest(previousRequest => ({
-            tab: 'app',
-            target: 'relay',
+            tab: 'relay',
             nonce: (previousRequest?.nonce ?? 0) + 1,
         }));
         setView('settings');
@@ -288,7 +287,6 @@ export default function App() {
                 onChangeSettings={handleChangeSettings}
                 onChangeStreamSettings={handleChangeStreamSettings}
                 onChangeBootSetting={updateBootSetting}
-                onOpenRelaySettings={handleOpenRelaySettings}
                 isSavingRelayStreamSettings={isSavingRelayStreamSettings}
                 relayStreamSettingsError={relayStreamSettingsError}
                 focusRequest={settingsFocusRequest}

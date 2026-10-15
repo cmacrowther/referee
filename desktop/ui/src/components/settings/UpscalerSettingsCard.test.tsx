@@ -60,7 +60,7 @@ describe('UpscalerSettingsCard', () => {
 
     it('allows Motion Boost to be toggled for an NVIDIA relay peer', () => {
         const onChange = vi.fn();
-        const { container } = render(
+        render(
             <UpscalerSettingsCard
                 settings={{ ...DEFAULT_SETTINGS, framegen: true }}
                 locked={false}
@@ -82,7 +82,7 @@ describe('UpscalerSettingsCard', () => {
             />
         );
 
-        const motionBoostToggle = container.querySelectorAll<HTMLInputElement>('.toggle-checkbox')[0];
+        const motionBoostToggle = screen.getByRole('switch', { name: 'Motion Boost' }) as HTMLInputElement;
 
         expect(motionBoostToggle.disabled).toBe(false);
 

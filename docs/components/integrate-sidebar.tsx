@@ -34,6 +34,7 @@ const navItems: NavItem[] = [
     id: "quick-start",
     label: "Quick Start",
     children: [
+      { id: "relay-integration", label: "Relay Integration" },
       { id: "session-lifecycle", label: "Session Lifecycle" },
       { id: "heartbeat-contract", label: "Heartbeat Contract" },
     ],
@@ -56,6 +57,7 @@ const navItems: NavItem[] = [
       { id: "endpoint-stream-stop", label: "/v1/stream/stop", method: "POST" },
       { id: "endpoint-hls", label: "/v1/tmp/... (HLS)", method: "GET" },
       { id: "endpoint-settings-stream", label: "/v1/settings/stream", method: "POST" },
+      { id: "session-info", label: "Session Info" },
       { id: "supported-formats", label: "Supported Source Formats" },
       { id: "error-codes", label: "Error Codes" },
     ],

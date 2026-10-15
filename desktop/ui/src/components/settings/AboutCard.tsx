@@ -1,6 +1,7 @@
 import { ArrowUpCircle, BookOpen, ExternalLink, GitBranch, PlayCircle, Scale, User } from 'lucide-react';
 import { type ReactNode, useEffect, useState } from 'react';
 
+import { SettingsSection } from '@/components/settings/SettingsPrimitives';
 import type { RendererApi, UpdateInfo } from '@/lib/types';
 
 interface AboutCardProps {
@@ -10,25 +11,23 @@ interface AboutCardProps {
 interface LinkRowProps {
     icon: ReactNode;
     title: string;
-    subtitle: string;
+    url: string;
     onClick: () => void;
 }
 
-function LinkRow({ icon, title, subtitle, onClick }: LinkRowProps) {
+function LinkRow({ icon, title, url, onClick }: LinkRowProps) {
     return (
         <button
             type="button"
+            title={url}
             onClick={onClick}
-            className="group flex w-full cursor-pointer items-center justify-between border-t border-white/[0.04] px-3.5 py-3 transition-colors hover:bg-white/[0.02]"
+            className="group flex w-full cursor-pointer items-center justify-between gap-2 px-3 py-2 transition-colors hover:bg-white/[0.02]"
         >
-            <div className="flex min-w-0 items-center gap-2.5">
-                <div className="shrink-0 text-referee-muted transition-colors group-hover:text-white">{icon}</div>
-                <div className="flex min-w-0 flex-col text-left">
-                    <span className="text-[13px] font-medium text-white">{title}</span>
-                    <span className="truncate text-[11px] text-referee-muted">{subtitle}</span>
-                </div>
-            </div>
-            <ExternalLink className="ml-2 size-3 shrink-0 text-referee-muted" />
+            <span className="flex min-w-0 items-center gap-2.5">
+                <span className="shrink-0 text-referee-muted transition-colors group-hover:text-white">{icon}</span>
+                <span className="truncate text-[12px] font-medium text-white">{title}</span>
+            </span>
+            <ExternalLink className="size-3 shrink-0 text-referee-muted transition-colors group-hover:text-white" />
         </button>
     );
 }
@@ -91,9 +90,9 @@ export function AboutCard({ api }: AboutCardProps) {
     const updateLabel = downloadProgress !== null ? `${downloadProgress}%` : 'Update';
 
     return (
-        <div className="overflow-hidden rounded-lg border border-referee-border bg-referee-card">
-            <div className="flex items-center justify-between px-3.5 pb-3 pt-3.5">
-                <div className="text-[10px] font-bold uppercase tracking-widest text-referee-muted">About</div>
+        <SettingsSection
+            title="About"
+            aside={
                 <div className="flex items-center gap-2">
                     <span className="text-[10px] font-medium text-referee-muted">v{version}</span>
                     {updateInfo.hasUpdate && updateInfo.downloadUrl && (
@@ -108,12 +107,12 @@ export function AboutCard({ api }: AboutCardProps) {
                         </button>
                     )}
                 </div>
-            </div>
-
+            }
+        >
             <LinkRow
                 icon={<BookOpen className="size-4" />}
                 title="Documentation"
-                subtitle="https://referee.craw.ca"
+                url="https://referee.craw.ca"
                 onClick={() => {
                     api.openExternal('https://referee.craw.ca/');
                 }}
@@ -121,7 +120,7 @@ export function AboutCard({ api }: AboutCardProps) {
             <LinkRow
                 icon={<PlayCircle className="size-4" />}
                 title="Demo"
-                subtitle="https://referee.craw.ca/demo"
+                url="https://referee.craw.ca/demo"
                 onClick={() => {
                     api.openExternal('https://referee.craw.ca/demo');
                 }}
@@ -129,7 +128,7 @@ export function AboutCard({ api }: AboutCardProps) {
             <LinkRow
                 icon={<GitBranch className="size-4" />}
                 title="Repository"
-                subtitle="https://github.com/cmacrowther/referee"
+                url="https://github.com/cmacrowther/referee"
                 onClick={() => {
                     api.openGithub();
                 }}
@@ -137,7 +136,7 @@ export function AboutCard({ api }: AboutCardProps) {
             <LinkRow
                 icon={<Scale className="size-4" />}
                 title="Licensing"
-                subtitle="https://github.com/cmacrowther/referee/blob/main/LICENSE"
+                url="https://github.com/cmacrowther/referee/blob/main/LICENSE"
                 onClick={() => {
                     api.openExternal('https://github.com/cmacrowther/referee/blob/main/LICENSE');
                 }}
@@ -145,11 +144,11 @@ export function AboutCard({ api }: AboutCardProps) {
             <LinkRow
                 icon={<User className="size-4" />}
                 title="Colin Crowther"
-                subtitle="https://craw.ca"
+                url="https://craw.ca"
                 onClick={() => {
                     api.openExternal('https://craw.ca/');
                 }}
             />
-        </div>
+        </SettingsSection>
     );
 }

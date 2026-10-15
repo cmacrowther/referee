@@ -1,8 +1,10 @@
 import { SiLinux, SiMacos } from '@icons-pack/react-simple-icons';
-import { ChevronDown, Monitor, Radio, RefreshCw } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Monitor, Radio, RefreshCw } from 'lucide-react';
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 
+import { RadioDot, SettingsSection } from '@/components/settings/SettingsPrimitives';
 import type { ApprovedOrigin, RelayLinkStatus, RelayPeer, RelayPeerMetadata, RendererApi, Settings } from '@/lib/types';
+import { cn } from '@/lib/utils';
 
 const RELAY_APPROVAL_REFRESH_MS = 15000;
 const RELAY_PEER_DISCOVERY_REFRESH_MS = 30000;
@@ -242,49 +244,69 @@ function RelayRouteOption({
             aria-label={accessibilityLabel}
             disabled={disabled}
             onClick={onClick}
-            className={[
-                'flex w-full items-start gap-2.5 rounded-md border px-3 py-2.5 text-left transition-colors',
+            className={cn(
+                'flex w-full items-start gap-2.5 px-3 py-2 text-left transition-colors',
                 disabled
-                    ? 'cursor-not-allowed border-white/[0.04] bg-white/[0.015] text-referee-muted opacity-45'
+                    ? 'cursor-not-allowed opacity-45'
                     : selected
-                      ? 'border-referee-accent/40 bg-referee-accent/10 text-white shadow-sm'
-                      : 'border-white/[0.06] bg-white/[0.02] text-referee-muted hover:border-white/[0.12] hover:bg-white/[0.04] hover:text-white',
-            ].join(' ')}
+                      ? 'bg-referee-accent/[0.08]'
+                      : 'hover:bg-white/[0.03]'
+            )}
         >
-            <span
-                aria-hidden="true"
-                className={[
-                    'mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border',
-                    selected ? 'border-referee-accent bg-referee-accent' : 'border-white/25',
-                ].join(' ')}
-            >
-                {selected ? <span className="size-2 rounded-full bg-black" /> : null}
+            <span className="mt-[2px]">
+                <RadioDot selected={selected} />
             </span>
             <span className="min-w-0 flex-1">
                 <span className="flex min-w-0 items-center justify-between gap-2">
-                    <span className="min-w-0 break-words text-[13px] font-semibold leading-4">
+                    <span className={cn('min-w-0 truncate text-[13px] font-medium leading-[18px]', selected ? 'text-white' : 'text-white/80')}>
                         {title}
                     </span>
                     {statusPill ? (
-                        <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider ${statusPill.className}`}>
+                        <span className={`shrink-0 rounded-full border px-1.5 py-px text-[9px] font-bold uppercase tracking-wider ${statusPill.className}`}>
                             {statusPill.label}
                         </span>
                     ) : (
-                        <span className="shrink-0 text-[9px] font-bold uppercase tracking-wider opacity-70">
+                        <span className="shrink-0 text-[9px] font-bold uppercase tracking-wider text-referee-muted/80">
                             {badge}
                         </span>
                     )}
                 </span>
-                <span className={`${statusPill ? 'mt-1.5' : 'mt-1'} block text-[11px] leading-4 opacity-80`}>
+                <span className="block text-[11px] leading-[15px] text-referee-muted">
                     {description}
                 </span>
                 {hint ? (
-                    <span className="mt-1 block text-[10px] leading-4 opacity-70">
+                    <span className="mt-0.5 block text-[10px] leading-[14px] text-referee-muted/80">
                         {hint}
                     </span>
                 ) : null}
             </span>
         </button>
+    );
+}
+
+const PEER_ACTION_CLASS =
+    'shrink-0 rounded border border-white/[0.08] px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-referee-muted transition-colors hover:border-white/[0.16] hover:text-white disabled:cursor-not-allowed disabled:opacity-40';
+
+function PeerRow({
+    platform,
+    name,
+    details,
+    action,
+}: {
+    platform?: string | null;
+    name: string;
+    details: string;
+    action?: ReactNode;
+}) {
+    return (
+        <div className="flex items-center gap-2.5 py-2 pl-3 pr-2">
+            <RelayPeerPlatformIcon platform={platform} className="size-4 shrink-0 text-referee-muted/50" />
+            <div className="flex min-w-0 flex-1 flex-col">
+                <span className="truncate text-[12px] font-medium leading-4 text-white">{name}</span>
+                <span className="truncate text-[11px] leading-[15px] text-referee-muted">{details}</span>
+            </div>
+            {action}
+        </div>
     );
 }
 
@@ -456,21 +478,14 @@ export function RelayCard({ api, settings, relayLinkStatus, requireRelayRoute = 
     }, [onChange, requireRelayRoute, settings.relay]);
 
     return (
-        <div id="relay-settings-card" className="rounded-lg border border-referee-border bg-referee-card p-2.5">
-            <div className="mb-2 flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                    <div className="text-[10px] font-bold uppercase tracking-widest text-referee-muted">
-                        Relay
-                    </div>
-                    <p className="mt-1 text-[11px] leading-4 text-referee-muted/90">
-                        Route new streams locally or through Relay.
-                    </p>
-                </div>
-            </div>
+        <div id="relay-settings" className="flex flex-col gap-3">
+            <p className="px-1 text-[11px] leading-[15px] text-referee-muted">
+                Route new streams locally or through Relay.
+            </p>
 
             {linkedPeer ? (
-                <section className="mb-2.5">
-                    <div role="radiogroup" aria-label="Relay route selection" className="flex flex-col gap-1.5">
+                <SettingsSection title="Route">
+                    <div role="radiogroup" aria-label="Relay route selection" className="flex flex-col divide-y divide-white/[0.05]">
                         <RelayRouteOption
                             title="This REFEREE"
                             badge="Local"
@@ -493,129 +508,111 @@ export function RelayCard({ api, settings, relayLinkStatus, requireRelayRoute = 
                             onClick={() => selectRelayRoute(true)}
                         />
                     </div>
-                </section>
+                </SettingsSection>
             ) : null}
 
             {linkedPeer || relayApprovals.length > 0 ? (
-                <details className="group mb-2.5 border-t border-white/[0.05] pt-2">
-                    <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-[10px] font-bold uppercase tracking-widest text-referee-muted">
-                        <span className="flex min-w-0 items-center gap-1.5">
-                            <ChevronDown className="size-3 shrink-0 transition-transform group-open:rotate-180" />
-                            <span className="truncate">Trusted for Relay</span>
-                        </span>
-                        <span className="shrink-0 rounded-full border border-white/[0.08] bg-white/[0.04] px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-referee-muted">
+                <SettingsSection
+                    title="Trusted for Relay"
+                    aside={
+                        <span className="shrink-0 rounded-full border border-white/[0.08] bg-white/[0.04] px-1.5 py-px text-[9px] font-semibold uppercase tracking-wider text-referee-muted">
                             {relayApprovals.length > 0
                                 ? `${relayApprovals.length} Saved`
                                 : 'Linked'}
                         </span>
-                    </summary>
-
-                    <ul className="mt-2 flex flex-col divide-y divide-white/[0.04]">
-                        {linkedPeer ? (
-                            <li className="flex items-center gap-2.5 py-2 first:pt-0 last:pb-0">
-                                <RelayPeerPlatformIcon platform={liveLinkedPeer?.platform} className="size-4 shrink-0 text-referee-muted/50" />
-                                <div className="flex min-w-0 flex-1 flex-col gap-1">
-                                    <span className="truncate text-[12px] font-medium text-white">{linkedPeerName}</span>
-                                    <span className="truncate text-[11px] text-referee-muted">{linkedPeerDetails}</span>
-                                </div>
+                    }
+                >
+                    {linkedPeer ? (
+                        <PeerRow
+                            platform={liveLinkedPeer?.platform}
+                            name={linkedPeerName}
+                            details={linkedPeerDetails}
+                            action={
                                 <button
                                     type="button"
                                     onClick={unlinkPeer}
                                     disabled={unlinking || scanning || linkingPeerKey !== null}
-                                    className="rounded border border-white/[0.08] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-referee-muted transition-colors hover:border-white/[0.16] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                                    className={PEER_ACTION_CLASS}
                                 >
                                     {unlinking ? 'Unlinking...' : 'Unlink'}
                                 </button>
-                            </li>
-                        ) : null}
+                            }
+                        />
+                    ) : null}
 
-                        {relayApprovals.slice(0, 3).map((origin) => (
-                            <li key={origin.origin} className="flex items-center gap-2.5 py-2 first:pt-0 last:pb-0">
-                                <RelayPeerPlatformIcon platform={relayApprovalPeerPlatform(origin, peers)} className="size-4 shrink-0 text-referee-muted/50" />
-                                <div className="flex min-w-0 flex-1 flex-col gap-1">
-                                    <span className="truncate text-[12px] font-medium text-white">
-                                        {relayOriginDisplayName(origin)}
-                                    </span>
-                                    <span className="truncate text-[11px] text-referee-muted">
-                                        Approved for relay control
-                                    </span>
-                                </div>
-                            </li>
-                        ))}
-                    </ul>
-                </details>
+                    {relayApprovals.slice(0, 3).map((origin) => (
+                        <PeerRow
+                            key={origin.origin}
+                            platform={relayApprovalPeerPlatform(origin, peers)}
+                            name={relayOriginDisplayName(origin)}
+                            details="Approved for relay control"
+                        />
+                    ))}
+                </SettingsSection>
             ) : null}
 
             {actionError ? (
-                <p role="alert" className="mb-2.5 rounded-md border border-red-500/20 bg-red-500/10 px-2.5 py-2 text-[11px] text-red-100/90">
+                <p role="alert" className="rounded-md border border-red-500/20 bg-red-500/10 px-2.5 py-2 text-[11px] text-red-100/90">
                     {actionError}
                 </p>
             ) : null}
 
-            <details className="group border-t border-white/[0.05] pt-2" open={!linkedPeer}>
-                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-[10px] font-bold uppercase tracking-widest text-referee-muted">
-                    <span className="flex min-w-0 items-center gap-1.5">
-                        <ChevronDown className="size-3 shrink-0 transition-transform group-open:rotate-180" />
-                        <span className="truncate">Network Peers</span>
-                    </span>
-                    <span className="flex shrink-0 items-center gap-1.5">
-                        <button
-                            type="button"
-                            aria-label="Scan"
-                            title="Scan"
-                            onClick={(event) => {
-                                event.preventDefault();
-                                event.stopPropagation();
-                                scan();
-                            }}
-                            disabled={scanning || unlinking || linkingPeerKey !== null}
-                            className="rounded p-1 text-referee-muted transition-colors hover:bg-white/[0.06] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
-                        >
-                            <RefreshCw className={`size-3 ${scanning ? 'animate-spin' : ''}`} />
-                        </button>
-                    </span>
-                </summary>
+            <SettingsSection
+                title="Network Peers"
+                aside={
+                    <button
+                        type="button"
+                        aria-label="Scan"
+                        title="Scan"
+                        onClick={() => {
+                            void scan();
+                        }}
+                        disabled={scanning || unlinking || linkingPeerKey !== null}
+                        className="-my-1 rounded p-1 text-referee-muted transition-colors hover:bg-white/[0.06] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                        <RefreshCw className={`size-3 ${scanning ? 'animate-spin' : ''}`} />
+                    </button>
+                }
+            >
+                {networkPeers === null ? (
+                    <p className="px-3 py-2.5 text-[11px] leading-[15px] text-referee-muted">
+                        Searching this network...
+                    </p>
+                ) : networkPeers.length === 0 ? (
+                    <div className="flex items-center gap-2.5 px-3 py-2.5">
+                        <Radio className="size-4 shrink-0 text-referee-muted/50" />
+                        <p className="text-[11px] leading-[15px] text-referee-muted">
+                            No other REFEREE instances found on this network.
+                        </p>
+                    </div>
+                ) : (
+                    networkPeers.map((peer) => {
+                        const peerKey = peer.instanceId ?? peer.ip;
+                        const peerLinked = isPeerLinked(peer, settings);
+                        const peerLinking = linkingPeerKey === peerKey;
+                        const label = peerLinked ? 'Linked' : hasStoredLinkedPeer ? 'Replace Link' : 'Link';
 
-                <div className="mt-2">
-                    {networkPeers === null ? (
-                        null
-                    ) : networkPeers.length === 0 ? (
-                        <div className="flex items-center gap-2 rounded-md bg-black/10 px-2 py-1.5">
-                            <Radio className="size-4 shrink-0 text-referee-muted/50" />
-                            <p className="text-[11px] text-referee-muted">
-                                No other REFEREE instances found on this network.
-                            </p>
-                        </div>
-                    ) : (
-                        <ul className="flex flex-col divide-y divide-white/[0.04]">
-                            {networkPeers.map((peer) => {
-                                const peerKey = peer.instanceId ?? peer.ip;
-                                const peerLinked = isPeerLinked(peer, settings);
-                                const peerLinking = linkingPeerKey === peerKey;
-                                const label = peerLinked ? 'Linked' : hasStoredLinkedPeer ? 'Replace Link' : 'Link';
-
-                                return (
-                                    <li key={peerKey} className="flex items-center gap-2.5 py-2 first:pt-0 last:pb-0">
-                                        <RelayPeerPlatformIcon platform={peer.platform} className="size-4 shrink-0 text-referee-muted/50" />
-                                        <div className="flex min-w-0 flex-1 flex-col gap-1">
-                                            <span className="truncate text-[12px] font-medium text-white">{peer.hostname}</span>
-                                            <span className="truncate text-[11px] text-referee-muted">{peer.ip} - v{peer.version}</span>
-                                        </div>
-                                        <button
-                                            type="button"
-                                            onClick={() => linkPeer(peer)}
-                                            disabled={peerLinked || unlinking || scanning || linkingPeerKey !== null}
-                                            className="rounded border border-white/[0.08] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-referee-muted transition-colors hover:border-white/[0.16] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
-                                        >
-                                            {peerLinking ? 'Linking...' : label}
-                                        </button>
-                                    </li>
-                                );
-                            })}
-                        </ul>
-                    )}
-                </div>
-            </details>
+                        return (
+                            <PeerRow
+                                key={peerKey}
+                                platform={peer.platform}
+                                name={peer.hostname}
+                                details={`${peer.ip} - v${peer.version}`}
+                                action={
+                                    <button
+                                        type="button"
+                                        onClick={() => linkPeer(peer)}
+                                        disabled={peerLinked || unlinking || scanning || linkingPeerKey !== null}
+                                        className={PEER_ACTION_CLASS}
+                                    >
+                                        {peerLinking ? 'Linking...' : label}
+                                    </button>
+                                }
+                            />
+                        );
+                    })
+                )}
+            </SettingsSection>
         </div>
     );
 }

@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { makeMockApi } from '@/test/mocks';
@@ -47,7 +47,7 @@ const onlineRelayStatus: RelayLinkStatus = {
 describe('SettingsView - remote relay settings', () => {
     it('enables Motion Boost settings for an online NVIDIA relay peer', () => {
         const { api } = makeMockApi();
-        const { container } = render(
+        render(
             <SettingsView
                 api={api}
                 settings={linkedRelaySettings}
@@ -59,7 +59,7 @@ describe('SettingsView - remote relay settings', () => {
             />
         );
 
-        const motionBoostToggle = container.querySelectorAll<HTMLInputElement>('.toggle-checkbox')[0];
+        const motionBoostToggle = screen.getByRole('switch', { name: 'Motion Boost' }) as HTMLInputElement;
 
         expect(motionBoostToggle.disabled).toBe(false);
     });
@@ -81,5 +81,30 @@ describe('SettingsView - remote relay settings', () => {
         expect(screen.getByText('Remote Relay Settings')).not.toBeNull();
         expect(screen.getByText('media-box is offline')).not.toBeNull();
         expect((container.querySelector('#upscaler-controls') as HTMLFieldSetElement | null)?.disabled).toBe(true);
+    });
+});
+
+describe('SettingsView - tabs', () => {
+    it('switches to the Relay tab from the remote relay notice', async () => {
+        const { api } = makeMockApi();
+        render(
+            <SettingsView
+                api={api}
+                settings={linkedRelaySettings}
+                status={DEFAULT_STATUS}
+                relayLinkStatus={onlineRelayStatus}
+                bootSetting={false}
+                onChangeSettings={vi.fn()}
+                onChangeBootSetting={vi.fn()}
+            />
+        );
+
+        expect(screen.getByRole('tab', { name: 'Stream' }).getAttribute('aria-selected')).toBe('true');
+
+        fireEvent.click(screen.getByRole('button', { name: 'Open Relay Settings' }));
+
+        expect(screen.getByRole('tab', { name: 'Relay' }).getAttribute('aria-selected')).toBe('true');
+        expect(await screen.findByText('Route new streams locally or through Relay.')).not.toBeNull();
+        expect(screen.queryByRole('switch', { name: 'Motion Boost' })).toBeNull();
     });
 });

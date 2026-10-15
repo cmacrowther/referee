@@ -129,13 +129,13 @@ const endpoints = [
 }`,
 
     responseFields: [
-      { name: "gpuReady", type: "boolean", description: "true if a compatible GPU and encoder were detected" },
+      { name: "gpuReady", type: "boolean | null", description: "Processing readiness, including completed setup. With Relay enabled, reflects the linked peer's readiness rather than the local GPU." },
       { name: "gpuName", type: "string", description: "Normalized GPU model name, or null" },
       { name: "gpuVendor", type: "string", description: "GPU vendor — \"nvidia\" or \"amd\"" },
       { name: "gpuUtilization", type: "number", description: "GPU utilization percentage, or null if unavailable" },
       { name: "encoderBackend", type: "string", description: "Active encoder backend (\"nvenc\" or \"vceenc\"), or null" },
       { name: "activeSessions", type: "number", description: "Number of currently active upscaling sessions" },
-      { name: "sessions", type: "array", description: "Array of active session info objects" },
+      { name: "sessions", type: "array", description: "Active session objects; see Session Info below for processing and startup fields. Relay sessions retain local IDs and playback URLs while reporting the peer's processing details." },
       { name: "primarySession", type: "object", description: "The first active session object, or null" },
       { name: "settings", type: "object", description: "Current settings snapshot — resolution, quality, framegen, framegenTarget, framegenEngine, hdr" },
       { name: "encoderHasFramegen", type: "boolean", description: "True if the detected encoder supports optical flow frame generation (NVIDIA only)" },
@@ -156,7 +156,7 @@ const endpoints = [
     response: `{
   "instanceId": "peer-a1b2c3d4-...",
   "hostname": "my-pc",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "platform": "windows",
   "gpuReady": true,
   "gpuVendor": "nvidia",
@@ -237,7 +237,7 @@ const endpoints = [
         ),
       },
       { name: "sourceResolution", type: "string", description: "Detected source resolution, or null if probe timed out" },
-      { name: "effectiveQuality", type: "number", description: "The quality level (1–5) actually applied by the encoder" },
+      { name: "effectiveQuality", type: "number", description: "The quality level (1–4) actually applied by the encoder" },
       { name: "evictedSessions", type: "array", description: "IDs of sessions that were stopped to make room for this one" },
       { name: "appName", type: "string", description: "Echoed back from the request" },
       { name: "streamTitle", type: "string", description: "Echoed back from the request" },
@@ -297,16 +297,16 @@ const endpoints = [
 
 // seg000.ts, seg001.ts, … — MPEG-TS segments (video/mp2t)`,
     responseFields: [
-      { name: "index.m3u8", type: "m3u8", description: "Rolling 3-segment HLS playlist. Your player refreshes this at its standard interval." },
+      { name: "index.m3u8", type: "m3u8", description: "Rolling HLS playlist (8-segment live window). Your player refreshes this at its standard interval." },
       { name: "seg{N}.ts", type: "ts", description: "1-second MPEG-TS video segments. Older segments are deleted automatically as the window advances." },
     ],
-    note: "All responses include Access-Control-Allow-Origin: * so cross-origin media players can fetch segments directly.",
+    note: "Browser media requests require an approved origin. Playlists are not cached; .ts segments use public, max-age=60. Relay output is proxied through the local instance; use the returned URL unchanged.",
   },
   {
     id: "endpoint-settings-stream",
     method: "POST",
     path: "/v1/settings/stream",
-    description: "Apply live settings changes to the encoder without restarting any active session. Fields are all optional — omit any you do not want to change.",
+    description: "Update the server's stream settings for subsequent session starts. This endpoint does not reconfigure a running pipeline. Fields are optional; omit any you do not want to change.",
     request: `{
   "resolution": "1920x1080",
   "quality": 4,
@@ -314,21 +314,21 @@ const endpoints = [
   "framegenTarget": "matchDisplay",
   "framegenEngine": "opticalFlow",
   "hdr": false,
-  "executorPreference": null
+  "executorPreference": "auto"
 }`,
     requestFields: [
       { name: "resolution", type: "string", required: false, description: "Output resolution, e.g. \"1920x1080\" or \"3840x2160\"." },
-      { name: "quality", type: "number", required: false, description: "Encoder quality level 1–5." },
+      { name: "quality", type: "number", required: false, description: "Encoder quality level 1–4; values are clamped to this range." },
       { name: "framegen", type: "boolean", required: false, description: "Enable frame generation." },
-      { name: "framegenTarget", type: "string", required: false, description: "Frame rate to generate up to: \"30fps\", \"60fps\" (default), or \"matchDisplay\" (the viewer's refresh rate, capped at 144 fps, or 120 fps at 4K). Sources already at the target are left alone." },
-      { name: "framegenEngine", type: "string", required: false, description: "\"opticalFlow\" (default: NVIDIA FRUC on NVIDIA, FFmpeg motion interpolation elsewhere) or \"nativeDouble\" (doubles the source frame rate with NVIDIA Framegen on RTX 40 Series or newer, or AMD Fluid Motion through VCEEncC on Windows; otherwise optical flow is used; \"nvidiaFramegen\" is accepted as an alias). \"rife\" runs RIFE on any GPU through Vulkan and falls back to optical flow without the worker or a model." },
+      { name: "framegenTarget", type: "string", required: false, description: "\"30fps\", \"60fps\" (default), or \"matchDisplay\". Match Display divides the refresh rate by a whole number to stay within 144 fps (120 fps at 4K): 240 Hz becomes 120 fps; 144 Hz at 4K becomes 72 fps. Ignored by nativeDouble. Sources already at the target are left alone." },
+      { name: "framegenEngine", type: "string", required: false, description: "\"opticalFlow\" (default) selects an available interpolator for the target frame rate. \"nativeDouble\" doubles source FPS with NVIDIA Framegen or AMD Fluid Motion on supported hardware and ignores framegenTarget; \"nvidiaFramegen\" remains an alias. \"rife\" uses the standalone Vulkan worker and needs a model and known source FPS; unavailable RIFE falls back to the optical-flow path. Read session.framegenEngine for the actual engine." },
       { name: "hdr", type: "boolean", required: false, description: "Enable SDR-to-HDR10 mapping: NVIDIA TrueHDR, AMD VCEEncC mapping, or FFmpeg libplacebo elsewhere." },
-      { name: "executorPreference", type: "string | null", required: false, description: "Override executor selection. Pass null to use automatic selection." },
+      { name: "executorPreference", type: "string", required: false, description: "\"auto\" (default), \"nvidiaAi\", \"amdAi\", or \"universal\". Use auto to restore automatic selection." },
     ],
     response: `{
   "status": "ok"
 }`,
-    note: "Protected by X-Referee-Token. Returns 400 INVALID_SETTINGS if a field value is out of range.",
+    note: "Protected by X-Referee-Token. A non-object body returns 400 INVALID_SETTINGS. Settings are persisted when a settings store is available. For relay processing, update the processing peer's settings; restart the session to apply changes.",
   },
 ]
 
@@ -350,7 +350,7 @@ export function ApiReference() {
             </h2>
           </div>
           <p className="text-sm leading-7 text-muted-foreground sm:text-base">
-            All endpoints accept and return JSON. Base URL:{" "}
+            Control endpoints accept and return JSON; HLS endpoints return media. Base URL:{" "}
             <code className="text-accent">http://localhost:14002</code>
           </p>
           <section id="api-versioning" className="scroll-mt-28 mt-6 space-y-4">
@@ -366,7 +366,7 @@ export function ApiReference() {
               <div className="rounded-r-lg border-l-2 border-accent pl-4 space-y-3 text-sm leading-7 text-muted-foreground">
                 <p>
                   Mutating endpoints (<code>POST /v1/stream/start</code>, <code>/heartbeat</code>, <code>/stop</code>,
-                  and the <code>/v1/auth/rotate-token</code> and <code>/v1/origins</code> management endpoints)
+                  <code>/v1/settings/stream</code>, and the <code>/v1/auth/rotate-token</code> and <code>/v1/origins</code> management endpoints, including GET origins)
                   require an <code>X-Referee-Token</code> header.
                 </p>
                 <p>
@@ -485,6 +485,22 @@ export function ApiReference() {
             </AccordionItem>
           ))}
         </Accordion>
+
+        <section id="session-info" className="scroll-mt-28 mt-12">
+          <h3 className="mb-4 text-xl font-semibold tracking-tight sm:text-2xl">Session Info</h3>
+          <p className="mb-4 text-sm leading-7 text-muted-foreground">
+            <code>GET /v1/status</code> returns these objects in <code>sessions</code> and
+            <code> primarySession</code>. Use actual session fields to show processing results;
+            requested settings and capability flags alone do not guarantee an effect is running.
+          </p>
+          <dl className="space-y-3 text-sm leading-7 text-muted-foreground">
+            <div><dt className="font-mono text-accent">id, sourceUrl, outputUrl, appName, streamTitle</dt><dd>Session identity, source and absolute playback URLs, and optional application labels. Keep using the local ID and URL for Relay sessions.</dd></div>
+            <div><dt className="font-mono text-accent">sourceContentKind, sourceResolution, outputResolution, sourceFps, targetFps</dt><dd>Detected content kind (live or vod), source/output dimensions, and frame rates. Unknown source metadata and an inactive frame-rate target can be null.</dd></div>
+            <div><dt className="font-mono text-accent">executor, encoderBackend, upscaler, qualityLevel</dt><dd>Actual processing path and quality (1–4). The executor is nvidiaSpecialized, amdSpecialized, universal, or cpu. Encoder and upscaler labels can be null.</dd></div>
+            <div><dt className="font-mono text-accent">framegenEnabled, framegenEngine, hdrEnabled</dt><dd>Effects actually enabled for this session. Engine labels include NVIDIA FRUC, NVIDIA Framegen, AMD Fluid Motion, RIFE, and Portable; null means frame generation is off. RIFE needs the worker, model, and known source frame rate, and can fall back if startup fails.</dd></div>
+            <div><dt className="font-mono text-accent">startupComplete, retryingStartup, startupStage</dt><dd>Startup state for polling: startupStage is starting or ready. Completion means the final HLS playlist exists and is non-empty; retryingStartup reports a startup retry.</dd></div>
+          </dl>
+        </section>
 
         {/* Supported Source Formats */}
         <div id="supported-formats" className="scroll-mt-28 mt-12">
@@ -644,6 +660,19 @@ export function ApiReference() {
                   <td className="px-4 py-3 align-top leading-6 text-muted-foreground">Pipeline exited early</td>
                   <td className="px-4 py-3 text-muted-foreground">Encoder crashed before producing output — check source URL is reachable</td>
                 </tr>
+                {[
+                  ["400", "INVALID_SETTINGS", "Settings body must be a JSON object", "Send an object containing the settings to update"],
+                  ["503", "RELAY_REQUIRED", "No supported local AMD or NVIDIA GPU", "Configure a linked REFEREE peer for Relay processing"],
+                  ["502", "RELAY_UNAVAILABLE", "Selected relay peer is unavailable or not ready", "Check the peer connection and processing readiness"],
+                  ["502", "RELAY_START_FAILED", "The peer could not start the stream", "Check the peer and source before retrying"],
+                  ["502", "RELAY_STATUS_SYNC_FAILED", "The started peer session could not be synchronized", "The remote start is rolled back; check peer connectivity and retry"],
+                ].map(([status, code, meaning, action]) => (
+                  <tr key={code}>
+                    <td className="px-4 py-3 align-top"><code className="text-accent">{status}</code>{" "}<code className="text-muted-foreground text-xs">{code}</code></td>
+                    <td className="px-4 py-3 align-top leading-6 text-muted-foreground">{meaning}</td>
+                    <td className="px-4 py-3 align-top leading-6 text-muted-foreground">{action}</td>
+                  </tr>
+                ))}
                 <tr>
                   <td className="px-4 py-3 align-top"><code className="text-accent">503</code> <code className="text-muted-foreground text-xs">NO_ENCODER</code></td>
                   <td className="px-4 py-3 align-top leading-6 text-muted-foreground">No compatible GPU</td>

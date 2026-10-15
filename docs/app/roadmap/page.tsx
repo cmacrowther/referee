@@ -651,6 +651,29 @@ export default async function RoadmapPage() {
                 <li className="relative pl-8">
                   <span className="absolute left-0 top-1.5 flex h-[15px] w-[15px] items-center justify-center rounded-full border-2 border-accent bg-background" aria-hidden="true" />
                   <div className="flex flex-wrap items-baseline gap-3 mb-3">
+                    <h3 className="font-semibold">v0.7.0</h3>
+                    <time dateTime="2026-10-15" className="text-xs text-muted-foreground">October 15, 2026</time>
+                  </div>
+                  <ul className="space-y-1.5 text-sm text-muted-foreground">
+                    {[
+                      "Processing pipeline reorganized into source, normalization, preprocessing, execution, and packaging stages, with expanded startup, fallback, and cleanup coverage.",
+                      "RIFE frame interpolation now runs in a standalone worker with Vulkan support, model detection, and fallback when the worker cannot start.",
+                      "Expanded NVIDIA, AMD, and universal processing paths; session status reports the active frame-generation engine and actual processing effects.",
+                      "Match Display frame generation respects display cadence and resolution limits; native frame doubling supports NVIDIA Framegen and AMD Fluid Motion on compatible hardware.",
+                      "Relay status reflects the peer's readiness and live processing statistics while preserving local session IDs and playback URLs. Linked peers are rediscovered after LAN address changes.",
+                      "HLS delivery uses cacheable media segments and uncached playlists, with improved relay connection handling and startup rollback.",
+                      "Dependency installation adds transactional updates, improved download recovery, and shader handling. API and relay tokens are redacted from settings logs.",
+                      "Automated release builds and GitHub-backed downloads improve platform installer selection and release asset delivery.",
+                      "Client package and developer documentation updated for 0.7.0, including session fields, relay errors, quality limits, and settings behavior.",
+                    ].map((change) => (
+                      <li key={change} className="flex gap-2"><span className="text-accent flex-shrink-0">+</span>{change}</li>
+                    ))}
+                  </ul>
+                </li>
+
+                <li className="relative pl-8">
+                  <span className="absolute left-0 top-1.5 flex h-[15px] w-[15px] items-center justify-center rounded-full border-2 border-accent bg-background" aria-hidden="true" />
+                  <div className="flex flex-wrap items-baseline gap-3 mb-3">
                     <h3 className="font-semibold">v0.6.0</h3>
                     <span className="text-xs text-muted-foreground">April 27, 2026</span>
                   </div>

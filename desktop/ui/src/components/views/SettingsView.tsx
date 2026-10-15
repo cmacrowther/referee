@@ -9,6 +9,7 @@ import { PlayerSettingsCard } from '@/components/settings/PlayerSettingsCard';
 import { RelayCard } from '@/components/settings/RelayCard';
 import { UpscalerSettingsCard } from '@/components/settings/UpscalerSettingsCard';
 import type { RelayLinkStatus, RendererApi, Settings, Status } from '@/lib/types';
+import { cn } from '@/lib/utils';
 
 interface SettingsViewProps {
     api: RendererApi;
@@ -20,7 +21,6 @@ interface SettingsViewProps {
     onChangeSettings: (patch: Partial<Settings>) => void;
     onChangeStreamSettings?: (patch: Partial<Settings>) => void;
     onChangeBootSetting: (value: boolean) => void;
-    onOpenRelaySettings?: () => void;
     isSavingRelayStreamSettings?: boolean;
     relayStreamSettingsError?: string | null;
     focusRequest?: SettingsFocusRequest | null;
@@ -30,6 +30,7 @@ interface SettingsViewProps {
 
 const TABS = [
     { id: 'pipeline', label: 'Stream' },
+    { id: 'relay',    label: 'Relay' },
     { id: 'app',      label: 'App' },
     { id: 'about',    label: 'About' },
 ] as const;
@@ -38,7 +39,6 @@ type SettingsTab = typeof TABS[number]['id'];
 
 export interface SettingsFocusRequest {
     tab: SettingsTab;
-    target?: 'relay';
     nonce: number;
 }
 
@@ -64,7 +64,6 @@ export function SettingsView({
     onChangeSettings,
     onChangeStreamSettings,
     onChangeBootSetting,
-    onOpenRelaySettings,
     isSavingRelayStreamSettings = false,
     relayStreamSettingsError = null,
     focusRequest,
@@ -96,27 +95,9 @@ export function SettingsView({
         setActiveTab(focusRequest.tab);
     }, [focusRequest]);
 
-    useEffect(() => {
-        if (!focusRequest || focusRequest.target !== 'relay' || activeTab !== 'app') {
-            return;
-        }
-
-        const animationFrame = window.requestAnimationFrame(() => {
-            document.getElementById('relay-settings-card')?.scrollIntoView?.({
-                block: 'start',
-                behavior: 'smooth',
-            });
-        });
-
-        return () => {
-            window.cancelAnimationFrame(animationFrame);
-        };
-    }, [activeTab, focusRequest]);
-
     return (
         <section id="settings-view" className="view-pane !p-0 flex flex-col overflow-hidden">
-            <div className="shrink-0 px-2.5 pt-3 pb-3">
-                <div className="flex rounded-lg bg-white/[0.04] p-0.5">
+            <div role="tablist" aria-label="Settings sections" className="flex shrink-0 border-b border-[#282828] px-1.5">
                 {TABS.map(tab => {
                     const active = activeTab === tab.id;
                     const relayRemoteTab = tab.id === 'pipeline' && relayRouteEnabled;
@@ -125,29 +106,29 @@ export function SettingsView({
                         <button
                             key={tab.id}
                             type="button"
+                            role="tab"
+                            aria-selected={active}
                             onClick={() => setActiveTab(tab.id)}
-                            className={[
-                                'relative flex flex-1 items-center justify-center rounded-md py-1.5 transition-colors',
+                            className={cn(
+                                'relative flex h-9 flex-1 items-center justify-center gap-1 text-[10px] font-semibold uppercase tracking-[0.12em] transition-colors',
+                                'after:absolute after:inset-x-2.5 after:bottom-0 after:h-0.5 after:rounded-full after:transition-colors',
                                 active
-                                    ? 'bg-referee-accent/20 text-referee-accent shadow-sm'
+                                    ? 'text-referee-accent after:bg-referee-accent'
                                     : relayLockedTab || relayRemoteTab
-                                      ? 'text-[#FFB36B] hover:text-[#FFD7AE]'
-                                    : 'text-referee-muted hover:text-white/60',
-                            ].join(' ')}
+                                      ? 'text-[#FFB36B] after:bg-transparent hover:text-[#FFD7AE]'
+                                      : 'text-referee-muted after:bg-transparent hover:text-white'
+                            )}
                         >
-                            <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-widest">
-                                {relayLockedTab ? <LockKeyhole className="size-3" /> : null}
-                                {relayRemoteTab ? <RadioTower className="size-3" /> : null}
-                                {tab.label}
-                            </span>
+                            {relayLockedTab ? <LockKeyhole className="size-3" /> : null}
+                            {relayRemoteTab ? <RadioTower className="size-3" /> : null}
+                            {tab.label}
                         </button>
                     );
                 })}
-                </div>
             </div>
 
-            <div className="custom-scrollbar flex-1 overflow-y-auto">
-                <div className="flex flex-col gap-3 px-2.5 pb-3">
+            <div key={activeTab} role="tabpanel" className="custom-scrollbar flex-1 overflow-y-auto">
+                <div className="flex flex-col gap-3 p-2.5">
                     {isActive && activeTab === 'pipeline' && (
                         <UpscalerSettingsCard
                             settings={settings}
@@ -162,8 +143,18 @@ export function SettingsView({
                             relayPeer={relayRoutePeer}
                             status={status}
                             onChange={onChangeStreamSettings ?? onChangeSettings}
-                            onOpenRelaySettings={onOpenRelaySettings}
+                            onOpenRelaySettings={() => setActiveTab('relay')}
                             engineSettings={!!debugPanel}
+                        />
+                    )}
+
+                    {isActive && activeTab === 'relay' && (
+                        <RelayCard
+                            api={api}
+                            settings={settings}
+                            relayLinkStatus={relayLinkStatus}
+                            requireRelayRoute={requireRelayRoute}
+                            onChange={onChangeSettings}
                         />
                     )}
 
@@ -177,13 +168,6 @@ export function SettingsView({
                                 onBootChange={onChangeBootSetting}
                             />
                             <AccessCard api={api} />
-                            <RelayCard
-                                api={api}
-                                settings={settings}
-                                relayLinkStatus={relayLinkStatus}
-                                requireRelayRoute={requireRelayRoute}
-                                onChange={onChangeSettings}
-                            />
                             {debugPanel}
                         </>
                     )}
