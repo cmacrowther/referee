@@ -115,6 +115,9 @@ pub struct ServerState {
     /// reflects this flag so external callers cannot mistake "GPU detected but
     /// still downloading binaries" for "ready to process streams".
     pub setup_complete: Arc<AtomicBool>,
+    /// Cached reachability of the linked relay peer, shared by every status
+    /// producer, plus rebinding when the peer's address changes.
+    pub relay_link: Arc<RelayLinkMonitor>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +125,8 @@ pub struct ServerSettings {
     pub resolution: String,
     pub quality: u8,
     pub framegen: bool,
+    pub framegen_target: FramegenTarget,
+    pub framegen_engine: FramegenEngine,
     pub hdr: bool,
     pub executor_preference: ExecutorPreference,
     pub show_on_proxy_start: bool,
@@ -130,12 +135,24 @@ pub struct ServerSettings {
     pub relay: RelaySettings,
 }
 
+impl ServerSettings {
+    pub(super) fn framegen(&self) -> FramegenSettings {
+        FramegenSettings {
+            enabled: self.framegen,
+            target: self.framegen_target,
+            engine: self.framegen_engine,
+        }
+    }
+}
+
 impl From<&Settings> for ServerSettings {
     fn from(s: &Settings) -> Self {
         Self {
             resolution: s.resolution.clone(),
             quality: s.quality,
             framegen: s.framegen,
+            framegen_target: s.framegen_target,
+            framegen_engine: s.framegen_engine,
             hdr: s.hdr,
             executor_preference: s.executor_preference,
             show_on_proxy_start: s.show_on_proxy_start,
@@ -166,7 +183,7 @@ impl From<&ServerSettings> for StreamUiSettings {
 pub(super) struct LocalStreamSettings {
     pub(super) resolution: String,
     pub(super) quality: u8,
-    pub(super) framegen: bool,
+    pub(super) framegen: FramegenSettings,
     pub(super) hdr: bool,
     pub(super) executor_preference: ExecutorPreference,
     pub(super) encoding_profiles: HashMap<String, EncodingProfile>,
@@ -178,7 +195,7 @@ impl From<&ServerSettings> for LocalStreamSettings {
         Self {
             resolution: settings.resolution.clone(),
             quality: settings.quality,
-            framegen: settings.framegen,
+            framegen: settings.framegen(),
             hdr: settings.hdr,
             executor_preference: settings.executor_preference,
             encoding_profiles: settings.encoding_profiles.clone(),

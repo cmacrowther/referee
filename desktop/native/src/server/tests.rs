@@ -1,9 +1,12 @@
 use super::{
-    assemble_startup_context, build_pipeline_request, build_remote_tmp_proxy_url,
-    build_remote_tmp_target_url, build_status, enrich_status_with_remote_processing_stats,
-    fetch_remote_session_info, forward_remote_heartbeat_request, forward_remote_stream_start,
-    local_output_url, stop_tracked_session, tmp_file_response_headers, RateLimiter,
-    RelayControlTarget, RuntimeBackend, ServerSettings, StopRequest, StreamStartRequest,
+    adopt_relay_peer_address, assemble_startup_context, build_pipeline_request,
+    build_remote_tmp_proxy_url, build_remote_tmp_target_url, build_status,
+    fetch_remote_session_info, finalize_status, forward_remote_heartbeat_request,
+    forward_remote_stream_start, local_output_url, relay_client_expiry, retarget_relay_settings,
+    select_moved_relay_peer, spawn_relay_session_keepalive, stop_tracked_session,
+    take_remote_session_info, tmp_file_response_headers, RateLimiter, RelayControlTarget,
+    RemoteSessionTarget, RemoteStatusResponse, RuntimeBackend, ServerSettings, StopRequest,
+    StreamStartRequest,
 };
 use crate::gpu::GpuInfo;
 use crate::graph::{
@@ -13,7 +16,7 @@ use crate::graph::{
 };
 use crate::pipeline::{
     new_session_map, EncoderCapabilities, EncodingProfile, ExecutorPreference,
-    PipelineCompletionSignal, RemoteSessionBacking, Session, SessionInfo,
+    PipelineCompletionSignal, Session, SessionInfo,
 };
 use crate::settings::{ApprovedOriginMeta, RelayPeerMetadata, SettingsManager};
 use crate::source::{
@@ -38,6 +41,8 @@ fn settings(resolution: &str, framegen: bool) -> ServerSettings {
         resolution: resolution.to_string(),
         quality: 3,
         framegen,
+        framegen_target: crate::pipeline::FramegenTarget::Fps60,
+        framegen_engine: crate::pipeline::FramegenEngine::OpticalFlow,
         hdr: false,
         executor_preference: ExecutorPreference::Auto,
         show_on_proxy_start: false,
@@ -215,7 +220,7 @@ fn planner_capabilities() -> BackendCapabilities {
             min_quality: 1,
             max_quality: 4,
         },
-        interpolation: InterpolationSupport::To60,
+        interpolation: InterpolationSupport::Native,
         hdr: HdrSupport {
             passthrough_10_bit: false,
             tonemap_to_hdr10: true,
@@ -238,6 +243,8 @@ fn encoder_capabilities() -> EncoderCapabilities {
         has_fruc: true,
         has_truehdr: true,
         has_rife: false,
+        has_native_double: false,
+        has_hdr_tonemap: false,
     }
 }
 
@@ -279,6 +286,7 @@ fn insert_session_with_executor(sessions: &crate::pipeline::SessionMap, executor
                 source_fps: Some(30.0),
                 target_fps: Some(60.0),
                 framegen_enabled: executor == ExecutorKind::NvidiaSpecialized,
+                framegen_engine: None,
                 hdr_enabled: true,
                 quality_level: 3,
                 executor,
@@ -316,13 +324,124 @@ fn tmp_file_headers_mark_segments_as_transport_stream() {
     assert!(!headers.legacy_no_cache);
 }
 
+fn remote_target(base_url: &str) -> RemoteSessionTarget {
+    RemoteSessionTarget {
+        base_url: base_url.to_string(),
+        session_id: "remote-session-1".to_string(),
+        token: "relay-secret".to_string(),
+    }
+}
+
+fn relay_session_info(id: &str, app_name: &str) -> SessionInfo {
+    SessionInfo {
+        id: id.to_string(),
+        source_url: "https://example.com/live/master.m3u8".to_string(),
+        output_url: format!("http://localhost:14002/v1/tmp/{}/index.m3u8", id),
+        app_name: Some(app_name.to_string()),
+        stream_title: Some("Remote Stream".to_string()),
+        source_content_kind: Some(SourceContentKind::Animated),
+        upscaler: Some("Anime4K2x".to_string()),
+        source_resolution: Some("1920x1080".to_string()),
+        output_resolution: "3840x2160".to_string(),
+        source_fps: Some(30.0),
+        target_fps: Some(60.0),
+        framegen_enabled: true,
+        framegen_engine: None,
+        hdr_enabled: true,
+        quality_level: 4,
+        executor: ExecutorKind::NvidiaSpecialized,
+        encoder_backend: Some("nvenc".to_string()),
+        startup_complete: true,
+        retrying_startup: false,
+        startup_stage: "ready".to_string(),
+    }
+}
+
+/// Inserts a relay-backed session pointing at `base_url` and returns the
+/// receiving end of its heartbeat channel.
+fn insert_remote_session(
+    sessions: &crate::pipeline::SessionMap,
+    local_session_id: &str,
+    base_url: &str,
+    app_name: &str,
+) -> mpsc::Receiver<()> {
+    let (heartbeat_tx, heartbeat_rx) = mpsc::channel(1);
+    sessions.insert(
+        local_session_id.to_string(),
+        Session::new_remote(
+            relay_session_info(local_session_id, app_name),
+            base_url.to_string(),
+            "remote-session-1".to_string(),
+            "relay-secret".to_string(),
+            RelayPeerMetadata::default(),
+            heartbeat_tx,
+        ),
+    );
+    heartbeat_rx
+}
+
+fn linked_relay_settings(ip: Option<&str>) -> crate::settings::RelaySettings {
+    crate::settings::RelaySettings {
+        enabled: true,
+        linked_peer_id: Some("peer-1".to_string()),
+        linked_peer_hostname: Some("media-box".to_string()),
+        linked_peer_ip: ip.map(str::to_string),
+        remote_token: Some("relay-secret".to_string()),
+        last_known_peer: Some(RelayPeerMetadata {
+            instance_id: Some("peer-1".to_string()),
+            hostname: Some("media-box".to_string()),
+            ip: ip.map(str::to_string),
+            version: Some("1.2.3".to_string()),
+            platform: Some("linux".to_string()),
+            gpu_ready: Some(true),
+            gpu_vendor: Some("nvidia".to_string()),
+            gpu_name: Some("RTX 4080".to_string()),
+        }),
+    }
+}
+
+fn scanned_peer(instance_id: &str, hostname: &str, ip: &str) -> RelayPeerMetadata {
+    RelayPeerMetadata {
+        instance_id: Some(instance_id.to_string()),
+        hostname: Some(hostname.to_string()),
+        ip: Some(ip.to_string()),
+        version: Some("1.2.3".to_string()),
+        platform: Some("linux".to_string()),
+        gpu_ready: Some(true),
+        gpu_vendor: Some("nvidia".to_string()),
+        gpu_name: Some("RTX 4080".to_string()),
+    }
+}
+
+/// Returns a loopback base URL where nothing is listening, so requests fail fast.
+async fn unreachable_base_url() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{}", address)
+}
+
+async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+    for _ in 0..100 {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    condition()
+}
+
 #[test]
 fn remote_tmp_proxy_url_rewrites_back_through_localhost_tmp_route() {
     let target = reqwest::Url::parse(
         "http://192.168.1.25:14002/v1/tmp/remote-session-1/chunks/segment0.ts?token=abc",
     )
     .unwrap();
-    let proxy_url = build_remote_tmp_proxy_url("local-session-1", &target);
+    let proxy_url = build_remote_tmp_proxy_url(
+        "local-session-1",
+        &remote_target("http://192.168.1.25:14002"),
+        &target,
+    );
 
     assert_eq!(
             proxy_url,
@@ -331,22 +450,47 @@ fn remote_tmp_proxy_url_rewrites_back_through_localhost_tmp_route() {
 }
 
 #[test]
+fn remote_tmp_proxy_url_maps_flat_session_files_without_exposing_the_peer() {
+    let remote = remote_target("http://192.168.1.25:14002");
+    let target =
+        reqwest::Url::parse("http://192.168.1.25:14002/v1/tmp/remote-session-1/segment_00042.ts")
+            .unwrap();
+
+    let proxy_url = build_remote_tmp_proxy_url("local-session-1", &remote, &target);
+
+    assert_eq!(
+        proxy_url,
+        "http://localhost:14002/v1/tmp/local-session-1/segment_00042.ts"
+    );
+    // The query-less form must resolve back to the same peer file.
+    assert_eq!(
+        build_remote_tmp_target_url(&remote, "segment_00042.ts", None).unwrap(),
+        target
+    );
+}
+
+#[test]
+fn remote_tmp_proxy_url_keeps_explicit_target_for_other_sessions_or_hosts() {
+    let remote = remote_target("http://192.168.1.25:14002");
+
+    for raw in [
+        "http://192.168.1.25:14002/v1/tmp/other-session/index.m3u8",
+        "http://192.168.1.99:14002/v1/tmp/remote-session-1/index.m3u8",
+    ] {
+        let target = reqwest::Url::parse(raw).unwrap();
+        let proxy_url = build_remote_tmp_proxy_url("local-session-1", &remote, &target);
+        assert!(
+            proxy_url.contains("?url="),
+            "expected {} to keep its explicit target, got {}",
+            raw,
+            proxy_url
+        );
+    }
+}
+
+#[test]
 fn remote_tmp_target_url_rejects_requests_outside_the_remote_session_prefix() {
-    let remote = RemoteSessionBacking {
-        remote_base_url: "http://192.168.1.25:14002".to_string(),
-        remote_session_id: "remote-session-1".to_string(),
-        remote_token: "relay-secret".to_string(),
-        selected_peer: RelayPeerMetadata {
-            instance_id: Some("peer-1".to_string()),
-            hostname: Some("media-box".to_string()),
-            ip: Some("192.168.1.25".to_string()),
-            version: Some("1.2.3".to_string()),
-            platform: Some("linux".to_string()),
-            gpu_ready: Some(true),
-            gpu_vendor: Some("nvidia".to_string()),
-            gpu_name: Some("RTX 4080".to_string()),
-        },
-    };
+    let remote = remote_target("http://192.168.1.25:14002");
 
     let error = build_remote_tmp_target_url(
         &remote,
@@ -393,6 +537,7 @@ async fn forward_remote_stream_start_sends_token_and_parses_response() {
                 "Bearer demo".to_string(),
             )])),
             content_kind: Some(SourceContentKind::Animated),
+            display_refresh_rate: Some(144.0),
         },
         &RelayControlTarget {
             base_url,
@@ -414,6 +559,8 @@ async fn forward_remote_stream_start_sends_token_and_parses_response() {
         seen[0].body.as_ref().unwrap()["headers"]["authorization"],
         "Bearer demo"
     );
+    // The processing peer matches the viewer's display, not its own.
+    assert_eq!(seen[0].body.as_ref().unwrap()["displayRefreshRate"], 144.0);
 
     handle.abort();
 }
@@ -496,14 +643,9 @@ async fn forward_remote_heartbeat_request_returns_false_for_missing_session() {
     })
     .await;
 
-    let heartbeat = forward_remote_heartbeat_request(&RemoteSessionBacking {
-        remote_base_url: base_url,
-        remote_session_id: "remote-session-1".to_string(),
-        remote_token: "relay-secret".to_string(),
-        selected_peer: RelayPeerMetadata::default(),
-    })
-    .await
-    .unwrap();
+    let heartbeat = forward_remote_heartbeat_request(&remote_target(&base_url))
+        .await
+        .unwrap();
 
     assert!(!heartbeat);
     let seen = requests.lock().unwrap();
@@ -530,40 +672,10 @@ async fn stop_tracked_session_for_remote_session_forwards_stop_and_cleans_up() {
     .await;
 
     let sessions = new_session_map();
-    sessions.insert(
-        "local-session-1".to_string(),
-        Session::new_remote(
-            SessionInfo {
-                id: "local-session-1".to_string(),
-                source_url: "https://example.com/live/master.m3u8".to_string(),
-                output_url: "http://localhost:14002/v1/tmp/local-session-1/index.m3u8".to_string(),
-                app_name: Some("Remote App".to_string()),
-                stream_title: Some("Remote Stream".to_string()),
-                source_content_kind: Some(SourceContentKind::Animated),
-                upscaler: Some("Anime4K2x".to_string()),
-                source_resolution: Some("1920x1080".to_string()),
-                output_resolution: "3840x2160".to_string(),
-                source_fps: Some(30.0),
-                target_fps: Some(60.0),
-                framegen_enabled: true,
-                hdr_enabled: true,
-                quality_level: 4,
-                executor: ExecutorKind::NvidiaSpecialized,
-                encoder_backend: Some("nvenc".to_string()),
-                startup_complete: true,
-                retrying_startup: false,
-                startup_stage: "ready".to_string(),
-            },
-            base_url,
-            "remote-session-1".to_string(),
-            "relay-secret".to_string(),
-            RelayPeerMetadata::default(),
-        ),
-    );
+    let _heartbeat_rx =
+        insert_remote_session(&sessions, "local-session-1", &base_url, "Remote App");
 
-    let stopped_app_name = stop_tracked_session("local-session-1", &sessions)
-        .await
-        .unwrap();
+    let stopped_app_name = stop_tracked_session("local-session-1", &sessions).await;
 
     assert_eq!(stopped_app_name.as_deref(), Some("Remote App"));
     assert!(sessions.is_empty());
@@ -605,6 +717,8 @@ async fn enriched_status_uses_remote_processing_stats_for_relay_session() {
             "amdAiAvailable": true,
             "encoderHasFramegen": false,
             "encoderHasTruehdr": true,
+            "encoderHasHdrTonemap": true,
+            "encoderHasNativeDouble": true,
             "encoderHasRife": true,
             "sessions": [
                 {
@@ -634,48 +748,21 @@ async fn enriched_status_uses_remote_processing_stats_for_relay_session() {
     })
     .await;
 
-    let sessions = new_session_map();
-    sessions.insert(
-        "local-session-1".to_string(),
-        Session::new_remote(
-            SessionInfo {
-                id: "local-session-1".to_string(),
-                source_url: "https://example.com/live/master.m3u8".to_string(),
-                output_url: "http://localhost:14002/v1/tmp/local-session-1/index.m3u8".to_string(),
-                app_name: Some("Stale App".to_string()),
-                stream_title: Some("Stale Stream".to_string()),
-                source_content_kind: Some(SourceContentKind::Animated),
-                upscaler: Some("Anime4K2x".to_string()),
-                source_resolution: Some("1920x1080".to_string()),
-                output_resolution: "3840x2160".to_string(),
-                source_fps: Some(30.0),
-                target_fps: Some(60.0),
-                framegen_enabled: true,
-                hdr_enabled: true,
-                quality_level: 4,
-                executor: ExecutorKind::NvidiaSpecialized,
-                encoder_backend: Some("nvenc".to_string()),
-                startup_complete: true,
-                retrying_startup: false,
-                startup_stage: "ready".to_string(),
-            },
-            base_url,
-            "remote-session-1".to_string(),
-            "relay-secret".to_string(),
-            RelayPeerMetadata::default(),
-        ),
-    );
+    let state = make_auth_state();
+    let _heartbeat_rx =
+        insert_remote_session(&state.sessions, "local-session-1", &base_url, "Stale App");
 
     let mut gpu = gpu_info();
     gpu.utilization = Some(4);
+    let settings = settings("3840x2160", true);
     let status = build_status(
         &gpu,
-        &settings("3840x2160", true),
-        &sessions,
+        &settings,
+        &state.sessions,
         Some(&encoder_capabilities()),
         true,
     );
-    let enriched = enrich_status_with_remote_processing_stats(status, &sessions).await;
+    let enriched = finalize_status(&state, status, &gpu, &settings, true).await;
 
     assert_eq!(enriched.gpu_ready, Some(true));
     assert_eq!(enriched.gpu_name.as_deref(), Some("Radeon RX 7900 XTX"));
@@ -687,6 +774,8 @@ async fn enriched_status_uses_remote_processing_stats_for_relay_session() {
     assert_eq!(enriched.amd_ai_available, Some(true));
     assert_eq!(enriched.encoder_has_framegen, Some(false));
     assert_eq!(enriched.encoder_has_truehdr, Some(true));
+    assert_eq!(enriched.encoder_has_hdr_tonemap, Some(true));
+    assert_eq!(enriched.encoder_has_native_double, Some(true));
     assert_eq!(enriched.encoder_has_rife, Some(true));
 
     let primary = enriched.primary_session.as_ref().unwrap();
@@ -738,54 +827,26 @@ fn status_uses_active_session_executor_over_idle_prediction() {
 #[tokio::test]
 async fn status_reports_not_ready_when_selected_relay_peer_is_offline() {
     let mut settings = settings("3840x2160", true);
-    settings.relay = crate::settings::RelaySettings {
-        enabled: true,
-        linked_peer_id: Some("peer-1".to_string()),
-        linked_peer_hostname: Some("media-box".to_string()),
-        linked_peer_ip: Some("0.0.0.0".to_string()),
-        remote_token: Some("relay-secret".to_string()),
-        last_known_peer: Some(RelayPeerMetadata {
-            instance_id: Some("peer-1".to_string()),
-            hostname: Some("media-box".to_string()),
-            ip: Some("0.0.0.0".to_string()),
-            version: Some("1.2.3".to_string()),
-            platform: Some("linux".to_string()),
-            gpu_ready: Some(true),
-            gpu_vendor: Some("nvidia".to_string()),
-            gpu_name: Some("RTX 4080".to_string()),
-        }),
-    };
+    settings.relay = linked_relay_settings(Some("0.0.0.0"));
     let gpu = gpu_info();
-    let sessions = new_session_map();
+    let state = make_auth_state();
 
-    let status = build_status(&gpu, &settings, &sessions, None, true);
-    let status = super::apply_status_readiness(status, &gpu, &settings, true).await;
+    let status = build_status(&gpu, &settings, &state.sessions, None, true);
+    let status = finalize_status(&state, status, &gpu, &settings, true).await;
+    assert_eq!(status.gpu_ready, Some(false));
 
+    // A second poll answers from the cached probe instead of re-probing.
+    let status = build_status(&gpu, &settings, &state.sessions, None, true);
+    let status = finalize_status(&state, status, &gpu, &settings, true).await;
     assert_eq!(status.gpu_ready, Some(false));
 }
 
 #[tokio::test]
 async fn active_relay_target_errors_when_selected_relay_peer_is_offline() {
-    let mut settings = settings("3840x2160", true);
-    settings.relay = crate::settings::RelaySettings {
-        enabled: true,
-        linked_peer_id: Some("peer-1".to_string()),
-        linked_peer_hostname: Some("media-box".to_string()),
-        linked_peer_ip: Some("0.0.0.0".to_string()),
-        remote_token: Some("relay-secret".to_string()),
-        last_known_peer: Some(RelayPeerMetadata {
-            instance_id: Some("peer-1".to_string()),
-            hostname: Some("media-box".to_string()),
-            ip: Some("0.0.0.0".to_string()),
-            version: Some("1.2.3".to_string()),
-            platform: Some("linux".to_string()),
-            gpu_ready: Some(true),
-            gpu_vendor: Some("nvidia".to_string()),
-            gpu_name: Some("RTX 4080".to_string()),
-        }),
-    };
+    let relay = linked_relay_settings(Some("0.0.0.0"));
+    let state = make_auth_state();
 
-    let error = super::resolve_active_relay_target(&settings.relay)
+    let error = super::resolve_active_relay_target(&state, &relay)
         .await
         .expect_err("offline relay peer must block relay stream starts");
 
@@ -798,33 +859,305 @@ async fn active_relay_target_errors_when_selected_relay_peer_is_offline() {
 #[tokio::test]
 async fn status_does_not_report_ready_when_selected_relay_peer_has_no_reachable_address() {
     let mut settings = settings("3840x2160", true);
-    settings.relay = crate::settings::RelaySettings {
-        enabled: true,
-        linked_peer_id: Some("peer-1".to_string()),
-        linked_peer_hostname: Some("media-box".to_string()),
-        linked_peer_ip: None,
-        remote_token: Some("relay-secret".to_string()),
-        last_known_peer: Some(RelayPeerMetadata {
-            instance_id: Some("peer-1".to_string()),
-            hostname: Some("media-box".to_string()),
-            ip: None,
-            version: Some("1.2.3".to_string()),
-            platform: Some("linux".to_string()),
-            gpu_ready: Some(false),
-            gpu_vendor: Some("nvidia".to_string()),
-            gpu_name: Some("RTX 4080".to_string()),
-        }),
-    };
+    settings.relay = linked_relay_settings(None);
     let gpu = GpuInfo {
         vendor: "intel".to_string(),
         name: Some("Intel UHD".to_string()),
         ..GpuInfo::default()
     };
+    let state = make_auth_state();
 
-    let status = build_status(&gpu, &settings, &new_session_map(), None, false);
-    let status = super::apply_status_readiness(status, &gpu, &settings, false).await;
+    let status = build_status(&gpu, &settings, &state.sessions, None, false);
+    let status = finalize_status(&state, status, &gpu, &settings, false).await;
 
     assert_eq!(status.gpu_ready, Some(false));
+}
+
+#[tokio::test]
+async fn heartbeat_for_relay_session_is_handed_to_its_keepalive_without_network() {
+    use tower::ServiceExt;
+
+    let state = make_auth_state();
+    // Nothing listens at the peer address: the handler must not depend on it.
+    let base_url = unreachable_base_url().await;
+    let mut heartbeat_rx =
+        insert_remote_session(&state.sessions, "local-session-1", &base_url, "Remote App");
+    let router = Router::new()
+        .route(
+            "/v1/stream/heartbeat/{session_id}",
+            post(super::handle_heartbeat),
+        )
+        .with_state(state);
+
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/stream/heartbeat/local-session-1")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert!(
+        heartbeat_rx.try_recv().is_ok(),
+        "client heartbeat should reach the relay keepalive channel"
+    );
+}
+
+#[tokio::test]
+async fn stop_tracked_session_cleans_up_relay_session_when_peer_is_unreachable() {
+    let sessions = new_session_map();
+    let base_url = unreachable_base_url().await;
+    let mut heartbeat_rx =
+        insert_remote_session(&sessions, "local-session-1", &base_url, "Remote App");
+
+    let stopped_app_name = stop_tracked_session("local-session-1", &sessions).await;
+
+    assert_eq!(stopped_app_name.as_deref(), Some("Remote App"));
+    assert!(
+        sessions.is_empty(),
+        "local record must not outlive the peer"
+    );
+    assert!(
+        heartbeat_rx.recv().await.is_none(),
+        "dropping the record must close the keepalive channel"
+    );
+}
+
+#[tokio::test]
+async fn relay_keepalive_heartbeats_peer_and_ends_session_when_remote_is_gone() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (base_url, handle) = spawn_relay_mock_server(RelayMockState {
+        requests: requests.clone(),
+        start_status: axum::http::StatusCode::OK,
+        start_body: json!({}),
+        stop_status: axum::http::StatusCode::OK,
+        stop_body: json!({ "status": "stopped" }),
+        heartbeat_status: axum::http::StatusCode::NOT_FOUND,
+        heartbeat_body: json!({ "code": "SESSION_NOT_FOUND", "error": "Session not found" }),
+        status_status: axum::http::StatusCode::OK,
+        status_body: json!({ "sessions": [], "primarySession": null }),
+    })
+    .await;
+
+    let state = make_auth_state();
+    let heartbeat_rx =
+        insert_remote_session(&state.sessions, "local-session-1", &base_url, "Remote App");
+    spawn_relay_session_keepalive(
+        state.clone(),
+        "local-session-1".to_string(),
+        remote_target(&base_url),
+        heartbeat_rx,
+    );
+
+    assert!(
+        wait_until(|| state.sessions.is_empty()).await,
+        "keepalive should drop the local record once the peer reports the session gone"
+    );
+    let seen = requests.lock().unwrap();
+    assert_eq!(seen[0].path, "/v1/stream/heartbeat/remote-session-1");
+    assert_eq!(seen[0].token.as_deref(), Some("relay-secret"));
+    assert!(
+        seen.iter().all(|request| request.path != "/v1/stream/stop"),
+        "a session the peer already ended needs no forwarded stop"
+    );
+
+    drop(seen);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn relay_keepalive_exits_when_local_record_is_removed() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (base_url, handle) = spawn_relay_mock_server(RelayMockState {
+        requests: requests.clone(),
+        start_status: axum::http::StatusCode::OK,
+        start_body: json!({}),
+        stop_status: axum::http::StatusCode::OK,
+        stop_body: json!({ "status": "stopped" }),
+        heartbeat_status: axum::http::StatusCode::OK,
+        heartbeat_body: json!({ "status": "ok" }),
+        status_status: axum::http::StatusCode::OK,
+        status_body: json!({ "sessions": [], "primarySession": null }),
+    })
+    .await;
+
+    let state = make_auth_state();
+    let heartbeat_rx =
+        insert_remote_session(&state.sessions, "local-session-1", &base_url, "Remote App");
+    spawn_relay_session_keepalive(
+        state.clone(),
+        "local-session-1".to_string(),
+        remote_target(&base_url),
+        heartbeat_rx,
+    );
+    assert!(
+        wait_until(|| !requests.lock().unwrap().is_empty()).await,
+        "keepalive should heartbeat the peer as soon as it starts"
+    );
+
+    crate::pipeline::cleanup_session("local-session-1", &state.sessions).await;
+    tokio::time::sleep(std::time::Duration::from_millis(
+        super::RELAY_KEEPALIVE_INTERVAL_MS + 500,
+    ))
+    .await;
+
+    let heartbeats = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.path.starts_with("/v1/stream/heartbeat/"))
+        .count();
+    assert_eq!(
+        heartbeats, 1,
+        "a removed session must stop heartbeating the peer"
+    );
+
+    handle.abort();
+}
+
+#[test]
+fn relay_client_expiry_mirrors_the_local_heartbeat_contract() {
+    use std::time::Duration;
+
+    let started_at = std::time::Instant::now();
+    let inactivity = Duration::from_millis(crate::pipeline::HEARTBEAT_TIMEOUT_MS);
+    let orphan = Duration::from_millis(crate::pipeline::ORPHAN_SESSION_TIMEOUT_MS);
+
+    assert_eq!(
+        relay_client_expiry(started_at, None, started_at + orphan / 2),
+        None
+    );
+    assert!(relay_client_expiry(started_at, None, started_at + orphan).is_some());
+
+    let last_heartbeat = started_at + Duration::from_secs(60);
+    assert_eq!(
+        relay_client_expiry(
+            started_at,
+            Some(last_heartbeat),
+            last_heartbeat + inactivity / 2
+        ),
+        None
+    );
+    assert!(relay_client_expiry(
+        started_at,
+        Some(last_heartbeat),
+        last_heartbeat + inactivity
+    )
+    .is_some());
+}
+
+#[test]
+fn remote_session_info_matches_by_id_only() {
+    let mut status: RemoteStatusResponse = serde_json::from_value(json!({
+        "sessions": [relay_session_info("someone-elses-session", "Other App")],
+        "primarySession": null
+    }))
+    .unwrap();
+
+    assert!(
+        take_remote_session_info(&mut status, "remote-session-1").is_none(),
+        "the peer's only session is not ours unless the ID matches"
+    );
+}
+
+#[test]
+fn moved_relay_peer_requires_a_consistent_instance_claim() {
+    let saved = scanned_peer("peer-1", "media-box", "192.168.1.25");
+
+    let moved = select_moved_relay_peer(
+        &saved,
+        vec![
+            scanned_peer("peer-2", "other-box", "192.168.1.30"),
+            scanned_peer("peer-1", "media-box", "192.168.1.47"),
+        ],
+    );
+    assert_eq!(
+        moved.and_then(|peer| peer.ip).as_deref(),
+        Some("192.168.1.47")
+    );
+
+    // One machine answering on two interfaces resolves to the lowest address.
+    let multi_homed = select_moved_relay_peer(
+        &saved,
+        vec![
+            scanned_peer("peer-1", "media-box", "192.168.1.60"),
+            scanned_peer("peer-1", "media-box", "192.168.1.47"),
+        ],
+    );
+    assert_eq!(
+        multi_homed.and_then(|peer| peer.ip).as_deref(),
+        Some("192.168.1.47")
+    );
+
+    // Different machines claiming one instance ID are not guessed between.
+    let conflicting = select_moved_relay_peer(
+        &saved,
+        vec![
+            scanned_peer("peer-1", "media-box", "192.168.1.47"),
+            scanned_peer("peer-1", "impostor", "192.168.1.48"),
+        ],
+    );
+    assert!(conflicting.is_none());
+
+    // Links without an instance ID cannot be rebound.
+    let mut legacy = saved.clone();
+    legacy.instance_id = None;
+    assert!(select_moved_relay_peer(
+        &legacy,
+        vec![scanned_peer("peer-1", "media-box", "192.168.1.47")]
+    )
+    .is_none());
+}
+
+#[test]
+fn retarget_relay_settings_only_moves_the_linked_instance() {
+    let moved = scanned_peer("peer-1", "media-box-renamed", "192.168.1.47");
+
+    let mut relay = linked_relay_settings(Some("192.168.1.25"));
+    assert!(retarget_relay_settings(&mut relay, &moved));
+    assert_eq!(relay.linked_peer_ip.as_deref(), Some("192.168.1.47"));
+    assert_eq!(
+        relay.linked_peer_hostname.as_deref(),
+        Some("media-box-renamed")
+    );
+    assert_eq!(
+        relay.last_known_peer.and_then(|peer| peer.ip).as_deref(),
+        Some("192.168.1.47")
+    );
+    assert_eq!(relay.remote_token.as_deref(), Some("relay-secret"));
+
+    let mut other_link = linked_relay_settings(Some("192.168.1.25"));
+    let stranger = scanned_peer("peer-2", "media-box", "192.168.1.47");
+    assert!(!retarget_relay_settings(&mut other_link, &stranger));
+    assert_eq!(other_link.linked_peer_ip.as_deref(), Some("192.168.1.25"));
+
+    let mut unlinked = linked_relay_settings(Some("192.168.1.25"));
+    unlinked.enabled = false;
+    assert!(!retarget_relay_settings(&mut unlinked, &moved));
+}
+
+#[tokio::test]
+async fn adopt_relay_peer_address_updates_the_live_relay_settings() {
+    let state = make_auth_state();
+    state.settings.write().await.relay = linked_relay_settings(Some("192.168.1.25"));
+
+    let moved = scanned_peer("peer-1", "media-box", "192.168.1.47");
+    assert!(adopt_relay_peer_address(&state, &moved).await);
+    assert_eq!(
+        state.settings.read().await.relay.linked_peer_ip.as_deref(),
+        Some("192.168.1.47")
+    );
+
+    let stranger = scanned_peer("peer-2", "media-box", "192.168.1.50");
+    assert!(!adopt_relay_peer_address(&state, &stranger).await);
+    assert_eq!(
+        state.settings.read().await.relay.linked_peer_ip.as_deref(),
+        Some("192.168.1.47")
+    );
 }
 
 #[test]
@@ -912,7 +1245,7 @@ fn startup_context_keeps_source_request_capabilities_and_plan_together() {
     assert_eq!(context.pipeline_request.upscale, UpscaleRequest::Quality(3));
     assert_eq!(
         context.pipeline_request.interpolation,
-        InterpolationRequest::To60
+        InterpolationRequest::TargetFps(60)
     );
     assert_eq!(context.pipeline_request.hdr, HdrRequest::Off);
     assert!(context.execution_plan.requires_local_hls_relay);
@@ -926,7 +1259,9 @@ fn startup_context_keeps_source_request_capabilities_and_plan_together() {
         .expect("interpolation decision");
     assert_eq!(
         interpolation.decision.realization,
-        InterpolationRealization::NativeBackend
+        InterpolationRealization::NativeBackend(
+            crate::graph::NativeInterpolationEngine::NvidiaFruc
+        )
     );
 }
 
@@ -1103,6 +1438,7 @@ fn make_auth_state() -> super::ServerState {
         rate_limit_stream: Arc::new(RateLimiter::new(3, 60)),
         pending_consent_ui: Arc::new(std::sync::Mutex::new(None)),
         setup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        relay_link: Arc::new(super::RelayLinkMonitor::without_rebind_scans()),
     }
 }
 
@@ -1182,6 +1518,7 @@ async fn auth_request_approved_origin_returns_token_without_consent_prompt() {
         rate_limit_stream: Arc::new(RateLimiter::new(3, 60)),
         pending_consent_ui: Arc::new(std::sync::Mutex::new(None)),
         setup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        relay_link: Arc::new(super::RelayLinkMonitor::without_rebind_scans()),
     };
 
     let req = axum::http::Request::builder()
@@ -1283,4 +1620,40 @@ async fn auth_request_unknown_origin_in_headless_mode_returns_403() {
     let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["code"], "HEADLESS_MODE");
+}
+
+#[test]
+fn startup_context_keeps_rife_on_ffmpeg_universal() {
+    let descriptor = source_descriptor(
+        SourceTransport::RemoteHttp,
+        SourceKind::Hls,
+        SourceContentKind::Unknown,
+        Some("1920x1080"),
+        Some(24.0),
+        Some(1920),
+        Some(1080),
+    );
+    let capabilities = BackendCapabilities {
+        executor: ExecutorKind::Universal,
+        resize: ResizeSupport::Basic,
+        interpolation: InterpolationSupport::Unsupported,
+        hdr: HdrSupport::default(),
+        upscale: UpscalePlanningCapabilities::temporary_universal_compatibility(None),
+    };
+    let pipeline_request = crate::graph::PipelineRequest {
+        interpolation: InterpolationRequest::RifeTargetFps(60),
+        ..build_pipeline_request(&settings("3840x2160", true), &descriptor, 3)
+    };
+
+    let context = assemble_startup_context(
+        runtime_backend(),
+        descriptor,
+        pipeline_request,
+        capabilities,
+        3,
+    );
+
+    assert!(context.framegen_enabled);
+    assert_eq!(context.target_fps, Some(60.0));
+    assert!(context.execution_plan.uses_rife());
 }

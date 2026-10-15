@@ -40,6 +40,7 @@ const DEV_ACTIVE_SESSION: Session = {
     sourceFps: 30,
     targetFps: 60,
     framegenEnabled: true,
+    framegenEngine: 'NVIDIA FRUC',
     hdrEnabled: true,
     qualityLevel: 3,
     executor: 'nvidiaSpecialized',
@@ -80,16 +81,23 @@ export const DEV_SIMULATIONS: Record<Exclude<DevUiSimulation, 'live'>, DevSimula
             encoderBackend: 'nvenc',
             selectedExecutor: 'nvidiaSpecialized',
             nvidiaAiAvailable: true,
+            amdAiAvailable: false,
             activeSessions: 0,
             sessions: [],
             primarySession: null,
             settings: {
+                resolution: '1920x1080',
                 quality: 2,
                 framegen: true,
+                framegenTarget: '60fps',
+                framegenEngine: 'opticalFlow',
                 hdr: true
             },
             encoderHasFramegen: true,
-            encoderHasTruehdr: true
+            encoderHasNativeDouble: true,
+            encoderHasTruehdr: true,
+            encoderHasHdrTonemap: false,
+            encoderHasRife: false
         },
         setupState: null
     },
@@ -105,6 +113,7 @@ export const DEV_SIMULATIONS: Record<Exclude<DevUiSimulation, 'live'>, DevSimula
             encoderBackend: 'nvenc',
             selectedExecutor: 'nvidiaSpecialized',
             nvidiaAiAvailable: true,
+            amdAiAvailable: false,
             activeSessions: 1,
             sessions: [DEV_ACTIVE_SESSION],
             primarySession: DEV_ACTIVE_SESSION,
@@ -112,10 +121,15 @@ export const DEV_SIMULATIONS: Record<Exclude<DevUiSimulation, 'live'>, DevSimula
                 resolution: '3840x2160',
                 quality: 3,
                 framegen: true,
+                framegenTarget: '60fps',
+                framegenEngine: 'opticalFlow',
                 hdr: true
             },
             encoderHasFramegen: true,
-            encoderHasTruehdr: true
+            encoderHasNativeDouble: true,
+            encoderHasTruehdr: true,
+            encoderHasHdrTonemap: false,
+            encoderHasRife: false
         },
         setupState: null
     }

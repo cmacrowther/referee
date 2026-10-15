@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::plan::{
     Anime4k2xPlan, Artcnn2xPlan, ExecutionPlan, ExecutorKind, HdrMetadataPlan, HdrPlan,
     HdrTransformPlan, InterpolationPlan, InterpolationRealization, InterpolationUnsupportedReason,
-    OpExecutionStage, ResizePlan, VideoOp,
+    NativeInterpolationEngine, OpExecutionStage, ResizePlan, VideoOp,
 };
 use super::request::LatencyMode;
 
@@ -41,8 +41,11 @@ pub enum IntermediateOpOwner {
 pub enum NativeAcceleratorKind {
     NvidiaNgxVsr,
     NvidiaFruc,
+    NvidiaFramegen,
     NvidiaTrueHdr,
     AmdVppResize,
+    AmdFrc,
+    AmdHdrTonemap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,43 +450,6 @@ impl IntermediateExecutionPlan {
                 .collect(),
         }
     }
-
-    /// Promotes eligible executor-owned resize operations to AMD-native resize bindings when AMD upscaling is supported.
-    ///
-    /// This refinement converts executor-stage resize operations that are currently
-    /// owned by the executor (and have no native accelerator assigned) into
-    /// executor-native work by setting their conceptual owner to `Executor` and
-    /// attaching an `AmdVppResize` native accelerator with a `SharedPreprocess` fallback.
-    /// The method is a no-op unless `native_upscale_supported` is `true` and the plan's
-    /// `executor` is `ExecutorKind::Universal`.
-    ///
-    /// # Examples
-    ///
-    pub fn with_amd_native_resize_bindings(mut self, native_upscale_supported: bool) -> Self {
-        if !native_upscale_supported || self.executor != ExecutorKind::Universal {
-            return self;
-        }
-
-        for operation in &mut self.operations {
-            let IntermediateOperation::Resize(resize) = operation else {
-                continue;
-            };
-
-            if resize.binding.owner != IntermediateOpOwner::Executor
-                || resize.binding.accelerator.is_some()
-            {
-                continue;
-            }
-
-            resize.binding.conceptual_owner = IntermediateOpOwner::Executor;
-            resize.binding.accelerator = Some(NativeAcceleratorPlan {
-                kind: NativeAcceleratorKind::AmdVppResize,
-                fallback_owner: IntermediateOpOwner::SharedPreprocess,
-            });
-        }
-
-        self
-    }
 }
 
 impl ExecutionPlan {
@@ -545,12 +511,16 @@ fn binding_for_stage(stage: OpExecutionStage) -> IntermediateOpBinding {
 fn resize_binding(executor: ExecutorKind, resize: &ResizePlan) -> IntermediateOpBinding {
     let mut binding = binding_for_stage(resize.stage);
 
-    if resize.stage == OpExecutionStage::Executor
-        && executor == ExecutorKind::NvidiaSpecialized
-        && resize.quality.is_some()
-    {
+    let native_kind = match executor {
+        ExecutorKind::NvidiaSpecialized if resize.quality.is_some() => {
+            Some(NativeAcceleratorKind::NvidiaNgxVsr)
+        }
+        ExecutorKind::AmdSpecialized => Some(NativeAcceleratorKind::AmdVppResize),
+        _ => None,
+    };
+    if let (OpExecutionStage::Executor, Some(kind)) = (resize.stage, native_kind) {
         binding.accelerator = Some(NativeAcceleratorPlan {
-            kind: NativeAcceleratorKind::NvidiaNgxVsr,
+            kind,
             fallback_owner: IntermediateOpOwner::SharedPreprocess,
         });
     } else if resize.stage == OpExecutionStage::Executor {
@@ -593,17 +563,29 @@ fn interpolation_binding(
                 .unsupported_reason
                 .map(UnresolvedOperationReason::InterpolationUnsupported),
         },
-        InterpolationRealization::NativeBackend => {
+        InterpolationRealization::NativeBackend(engine) => {
             let mut binding =
                 binding_for_stage(interpolation.stage().unwrap_or(OpExecutionStage::Deferred));
-            if executor == ExecutorKind::NvidiaSpecialized
+            if executor.is_specialized()
                 && interpolation.stage() == Some(OpExecutionStage::Executor)
             {
                 binding.accelerator = Some(NativeAcceleratorPlan {
-                    kind: NativeAcceleratorKind::NvidiaFruc,
+                    kind: match engine {
+                        NativeInterpolationEngine::NvidiaFruc => NativeAcceleratorKind::NvidiaFruc,
+                        NativeInterpolationEngine::NvidiaFramegen => {
+                            NativeAcceleratorKind::NvidiaFramegen
+                        }
+                        NativeInterpolationEngine::AmdFrc => NativeAcceleratorKind::AmdFrc,
+                    },
                     fallback_owner: IntermediateOpOwner::SharedPreprocess,
                 });
             }
+            binding
+        }
+        InterpolationRealization::Rife => {
+            let mut binding =
+                binding_for_stage(interpolation.stage().unwrap_or(OpExecutionStage::Deferred));
+            binding.conceptual_owner = IntermediateOpOwner::SharedPreprocess;
             binding
         }
         InterpolationRealization::PortableFallback => {
@@ -642,15 +624,19 @@ fn hdr_transform_binding(
 ) -> IntermediateOpBinding {
     let mut binding = binding_for_stage(transform.stage);
 
-    if executor == ExecutorKind::NvidiaSpecialized
-        && transform.stage == OpExecutionStage::Executor
-        && matches!(
-            transform.kind,
-            super::plan::HdrTransformKind::NvidiaTrueHdrTonemapToHdr10
-        )
-    {
+    let native_kind = match (executor, transform.kind) {
+        (
+            ExecutorKind::NvidiaSpecialized,
+            super::plan::HdrTransformKind::NvidiaTrueHdrTonemapToHdr10,
+        ) => Some(NativeAcceleratorKind::NvidiaTrueHdr),
+        (ExecutorKind::AmdSpecialized, super::plan::HdrTransformKind::AmdTonemapToHdr10) => {
+            Some(NativeAcceleratorKind::AmdHdrTonemap)
+        }
+        _ => None,
+    };
+    if let (OpExecutionStage::Executor, Some(kind)) = (transform.stage, native_kind) {
         binding.accelerator = Some(NativeAcceleratorPlan {
-            kind: NativeAcceleratorKind::NvidiaTrueHdr,
+            kind,
             fallback_owner: IntermediateOpOwner::SharedPreprocess,
         });
     } else if transform.stage == OpExecutionStage::Executor {
@@ -1008,9 +994,9 @@ mod tests {
     }
 
     #[test]
-    fn amd_native_resize_binding_promotes_executor_resize_out_of_shared_preprocess_fallback() {
+    fn amd_specialized_resize_binds_natively_and_drops_bindings_for_the_ffmpeg_fallback() {
         let plan = ExecutionPlan {
-            executor: ExecutorKind::Universal,
+            executor: ExecutorKind::AmdSpecialized,
             latency_mode: LatencyMode::Balanced,
             requires_local_hls_relay: true,
             video_ops: vec![
@@ -1023,9 +1009,7 @@ mod tests {
             ],
         };
 
-        let intermediate = plan
-            .to_intermediate_plan()
-            .with_amd_native_resize_bindings(true);
+        let intermediate = plan.to_intermediate_plan();
         let preprocess_plan = intermediate.shared_preprocess_plan();
 
         assert!(!intermediate.requires_shared_preprocess());
@@ -1043,6 +1027,14 @@ mod tests {
         assert_eq!(
             resize.binding().accelerator.as_ref().map(|plan| plan.kind),
             Some(NativeAcceleratorKind::AmdVppResize)
+        );
+
+        let fallback = plan.for_universal_fallback().to_intermediate_plan();
+        assert_eq!(fallback.executor, ExecutorKind::Universal);
+        assert_eq!(fallback.operations[1].binding().accelerator, None);
+        assert_eq!(
+            fallback.operations[1].binding().owner,
+            IntermediateOpOwner::Executor
         );
     }
 

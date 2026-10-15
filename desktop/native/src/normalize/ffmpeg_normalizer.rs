@@ -1,12 +1,11 @@
-use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
-use crate::graph::{LatencyMode, SharedNormalizationPlan};
+use crate::graph::LatencyMode;
 use crate::runtime::{
-    FrameTransport, Normalizer, PipelineStageId, PipelineStageReadinessPolicy, ProcessSpec,
-    StageRuntimeContext, StderrMode, StdinMode, StdoutMode,
+    FrameTransport, Normalizer, PipelineStageId, ProcessSpec, StageRuntimeContext, StderrMode,
 };
+use crate::source::ffmpeg_header_block;
 
 const LIVE_RECONNECT_DELAY_MAX_SECONDS: u32 = 2;
 const LIVE_RW_TIMEOUT_MICROS: u64 = 15_000_000;
@@ -49,43 +48,34 @@ impl LiveInputProfile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FfmpegNormalizerCommand {
-    pub program: PathBuf,
-    pub args: Vec<String>,
-    pub output_transport: FrameTransport,
-}
-
+/// Staged-path ingest: pulls the source and emits muxed NUT (rawvideo +
+/// PCM audio) on stdout for the preprocess or executor stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfmpegNormalizer {
     program: PathBuf,
-    output_transport: FrameTransport,
-    pixel_format: Option<String>,
+    pixel_format: String,
     output_resolution: Option<(u32, u32)>,
     denoise: bool,
+    preserve_stream_offsets: bool,
 }
 
 impl FfmpegNormalizer {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
-            output_transport: FrameTransport::StdoutPipe,
-            pixel_format: Some("yuv420p".to_string()),
+            pixel_format: "yuv420p".to_string(),
             output_resolution: None,
             denoise: false,
+            preserve_stream_offsets: false,
         }
     }
 
-    pub fn with_output_transport(mut self, output_transport: FrameTransport) -> Self {
-        self.output_transport = output_transport;
+    pub fn with_pixel_format(mut self, pixel_format: impl Into<String>) -> Self {
+        self.pixel_format = pixel_format.into();
         self
     }
 
-    pub fn with_pixel_format(mut self, pixel_format: Option<impl Into<String>>) -> Self {
-        self.pixel_format = pixel_format.map(Into::into);
-        self
-    }
-
+    /// Crops to the aspect ratio of this output resolution.
     pub fn with_output_resolution(mut self, resolution: Option<(u32, u32)>) -> Self {
         self.output_resolution = resolution;
         self
@@ -96,21 +86,21 @@ impl FfmpegNormalizer {
         self
     }
 
-    #[allow(dead_code)]
-    pub fn output_transport(&self) -> FrameTransport {
-        self.output_transport.clone()
+    /// Keeps the source's offset between its audio and video, shifting both
+    /// by the earliest stream's start instead of rebasing each stream to its
+    /// own first timestamp. Audio is still padded to start at 0. The
+    /// `rife-worker` stage relies on this to keep the streams in sync.
+    pub fn with_stream_offsets_preserved(mut self, preserve: bool) -> Self {
+        self.preserve_stream_offsets = preserve;
+        self
     }
 
-    pub fn build_command(
-        &self,
-        context: &StageRuntimeContext,
-    ) -> io::Result<FfmpegNormalizerCommand> {
-        self.validate_context(context)?;
-        let normalization_plan = self.planned_normalization(context);
-        let shared_preprocess_plan = context
-            .execution_plan
-            .to_intermediate_plan()
-            .shared_preprocess_plan();
+    pub fn build_command(&self, context: &StageRuntimeContext) -> io::Result<ProcessSpec> {
+        let stage = PipelineStageId::Normalizer;
+        if context.transport.input != FrameTransport::SourcePull {
+            return Err(context.transport.input.unsupported(stage, "input"));
+        }
+        let output_url = context.transport.output.ffmpeg_output_url(stage)?;
 
         let mut args = vec![
             "-hide_banner".to_string(),
@@ -151,45 +141,32 @@ impl FfmpegNormalizer {
         } else {
             if !context.source.runtime_headers.is_empty() {
                 args.push("-headers".to_string());
-                args.push(build_source_headers(&context.source.runtime_headers));
+                args.push(ffmpeg_header_block(None, &context.source.runtime_headers));
             }
             args.extend(["-i".to_string(), context.source.runtime_url.clone()]);
         }
 
-        args.extend([
-            "-map".to_string(),
-            "0:v:0".to_string(),
-            "-map".to_string(),
-            "0:a:0?".to_string(),
-            "-sn".to_string(),
-            "-dn".to_string(),
-            "-vf".to_string(),
-            {
-                let base = match self.output_resolution {
-                    Some((tw, th)) => format!(
-                        "crop=if(gt(iw*{th}\\,ih*{tw})\\,trunc(ih*{tw}/{th}/2)*2\\,iw):if(gt(iw*{th}\\,ih*{tw})\\,ih\\,trunc(iw*{th}/{tw}/2)*2),setpts=PTS-STARTPTS"
-                    ),
-                    None => "setpts=PTS-STARTPTS".to_string(),
-                };
-                if self.denoise {
-                    format!("{},hqdn3d", base)
-                } else {
-                    base
-                }
-            },
-            "-fps_mode".to_string(),
-            "passthrough".to_string(),
-            "-c:v".to_string(),
-            "rawvideo".to_string(),
-        ]);
-
-        if normalization_plan.requires_stage() {
-            // Keep the first stage limited to shared ingress normalization for now.
+        // Rebasing each stream to its own start drops the source's A/V offset;
+        // without it FFmpeg shifts both by the input's shared start time.
+        let rebase_streams = !self.preserve_stream_offsets;
+        let mut video_filters = Vec::new();
+        if let Some((tw, th)) = self.output_resolution {
+            video_filters.push(format!(
+                "crop=if(gt(iw*{th}\\,ih*{tw})\\,trunc(ih*{tw}/{th}/2)*2\\,iw):if(gt(iw*{th}\\,ih*{tw})\\,ih\\,trunc(iw*{th}/{tw}/2)*2)"
+            ));
         }
-
-        if let Some(pixel_format) = &self.pixel_format {
-            args.push("-pix_fmt".to_string());
-            args.push(pixel_format.clone());
+        if rebase_streams {
+            video_filters.push("setpts=PTS-STARTPTS".to_string());
+        }
+        let mut video_filter = video_filters.join(",");
+        if self.denoise {
+            if !video_filter.is_empty() {
+                video_filter.push(',');
+            }
+            video_filter.push_str("hqdn3d");
+        }
+        if video_filter.is_empty() {
+            video_filter.push_str("null");
         }
 
         let aresample_async = match (
@@ -201,9 +178,28 @@ impl FfmpegNormalizer {
         };
 
         args.extend([
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-map".to_string(),
+            "0:a:0?".to_string(),
+            "-sn".to_string(),
+            "-dn".to_string(),
+            "-vf".to_string(),
+            video_filter,
+            "-fps_mode".to_string(),
+            "passthrough".to_string(),
+            "-c:v".to_string(),
+            "rawvideo".to_string(),
+            "-pix_fmt".to_string(),
+            self.pixel_format.clone(),
             "-af".to_string(),
             format!(
-                "asetpts=PTS-STARTPTS,aresample=async={}:first_pts=0",
+                "{}aresample=async={}:first_pts=0",
+                if rebase_streams {
+                    "asetpts=PTS-STARTPTS,"
+                } else {
+                    ""
+                },
                 aresample_async
             ),
             "-c:a".to_string(),
@@ -212,122 +208,25 @@ impl FfmpegNormalizer {
             "1".to_string(),
             "-f".to_string(),
             "nut".to_string(),
-            self.output_sink()?,
+            output_url.to_string(),
         ]);
 
-        if shared_preprocess_plan.requires_stage()
-            || shared_preprocess_plan.has_temporary_executor_fallbacks()
-            || shared_preprocess_plan.has_unimplemented_portable_operations()
-        {
-            // Keep this stage normalize-only until downstream preprocess renders
-            // portable resize/interpolation/HDR/shader work.
-        }
-
-        Ok(FfmpegNormalizerCommand {
-            program: self.program.clone(),
+        Ok(ProcessSpec::new(
+            stage,
+            &self.program,
             args,
-            output_transport: self.output_transport.clone(),
-        })
+            context.transport.clone(),
+            "ffmpeg-normalizer",
+        )
+        .with_stderr_mode(StderrMode::Filtered {
+            suppress: &["Invalid timestamps stream="],
+        }))
     }
-
-    fn planned_normalization(&self, context: &StageRuntimeContext) -> SharedNormalizationPlan {
-        context
-            .execution_plan
-            .to_intermediate_plan()
-            .normalization_plan()
-    }
-
-    fn validate_context(&self, context: &StageRuntimeContext) -> io::Result<()> {
-        if context.transport.input != FrameTransport::SourcePull {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "FfmpegNormalizer requires {:?} input transport, got {:?}.",
-                    FrameTransport::SourcePull,
-                    context.transport.input
-                ),
-            ));
-        }
-
-        let expected_output = self.output_transport.clone();
-        if context.transport.output != expected_output {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "FfmpegNormalizer requires {:?} output transport, got {:?}.",
-                    expected_output, context.transport.output
-                ),
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn output_sink(&self) -> io::Result<String> {
-        match &self.output_transport {
-            FrameTransport::StdoutPipe => Ok("pipe:1".to_string()),
-            FrameTransport::NamedPipe(path) => Ok(path.to_string_lossy().to_string()),
-            FrameTransport::LocalSocket(path) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "FFmpeg local-socket output transport at {:?} is a future transport placeholder.",
-                    path
-                ),
-            )),
-            transport => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "FFmpeg normalizer cannot emit to {:?}; expected an explicit inter-stage transport.",
-                    transport
-                ),
-            )),
-        }
-    }
-}
-
-fn build_source_headers(headers: &HashMap<String, String>) -> String {
-    let mut header_str = String::new();
-    for (key, value) in headers {
-        header_str.push_str(&format!("{}: {}\r\n", key, value));
-    }
-    header_str
 }
 
 impl Normalizer for FfmpegNormalizer {
     fn build_normalizer_spec(&self, context: &StageRuntimeContext) -> io::Result<ProcessSpec> {
-        let command = self.build_command(context)?;
-        let stdout = match &command.output_transport {
-            FrameTransport::StdoutPipe => StdoutMode::Transport(FrameTransport::StdoutPipe),
-            FrameTransport::NamedPipe(_) | FrameTransport::LocalSocket(_) => StdoutMode::Null,
-            transport => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "FFmpeg normalizer cannot map {:?} to a process stdout mode.",
-                        transport
-                    ),
-                ))
-            }
-        };
-
-        Ok(ProcessSpec {
-            stage: PipelineStageId::Normalizer,
-            program: command.program,
-            args: command.args,
-            transport: context.transport.clone(),
-            stdin: StdinMode::Null,
-            stdout,
-            stderr_piped: true,
-            current_dir: None,
-            env: Vec::new(),
-            readiness_policy: PipelineStageReadinessPolicy::ReadyOnSpawn,
-            log_label: "ffmpeg-normalizer".to_string(),
-            stderr_mode: StderrMode::Filtered {
-                suppress: &["Invalid timestamps stream="],
-            },
-            kill_on_drop: true,
-            hidden_window: true,
-        })
+        self.build_command(context)
     }
 }
 
@@ -338,7 +237,8 @@ mod tests {
         ExecutionPlan, ExecutorKind, LatencyMode, SharedNormalizationOperation, VideoOp,
     };
     use crate::runtime::{
-        FrameTransport, Normalizer, SessionOutputPaths, StageRuntimeContext, TransportConfig,
+        FrameTransport, Normalizer, PipelineStageReadinessPolicy, SessionOutputPaths,
+        StageRuntimeContext, StderrMode, TransportConfig,
     };
     use crate::source::{
         RelayedSource, SourceClassification, SourceDescriptor, SourceKind, SourceTransport,
@@ -396,10 +296,44 @@ mod tests {
     }
 
     #[test]
+    fn preserving_stream_offsets_skips_per_stream_rebasing() {
+        let spec = FfmpegNormalizer::new("ffmpeg")
+            .with_stream_offsets_preserved(true)
+            .build_normalizer_spec(&context(LatencyMode::Low, FrameTransport::StdoutPipe))
+            .unwrap();
+
+        assert!(has_subsequence(&spec.args, &["-vf", "null"]));
+        assert!(has_subsequence(
+            &spec.args,
+            &["-af", "aresample=async=0:first_pts=0"]
+        ));
+        assert!(!spec.args.iter().any(|arg| arg.contains("STARTPTS")));
+
+        let cropped = FfmpegNormalizer::new("ffmpeg")
+            .with_stream_offsets_preserved(true)
+            .with_output_resolution(Some((1920, 1080)))
+            .with_denoise(true)
+            .build_normalizer_spec(&context(LatencyMode::Low, FrameTransport::StdoutPipe))
+            .unwrap();
+        let video_filter = cropped
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-vf")
+            .map(|pair| pair[1].clone())
+            .unwrap();
+        assert!(video_filter.starts_with("crop="));
+        assert!(video_filter.ends_with(",hqdn3d"));
+        assert!(!video_filter.contains("setpts"));
+    }
+
+    #[test]
     fn builds_low_latency_nut_pipe_command_for_relayed_live_input() {
         let normalizer = FfmpegNormalizer::new("ffmpeg");
         let context = context(LatencyMode::Low, FrameTransport::StdoutPipe);
-        let normalization_plan = normalizer.planned_normalization(&context);
+        let normalization_plan = context
+            .execution_plan
+            .to_intermediate_plan()
+            .normalization_plan();
         let command = normalizer.build_command(&context).unwrap();
 
         assert!(normalization_plan.requires_stage());
@@ -409,7 +343,7 @@ mod tests {
             SharedNormalizationOperation::NormalizeInput(_)
         ));
         assert_eq!(command.program, PathBuf::from("ffmpeg"));
-        assert_eq!(command.output_transport, FrameTransport::StdoutPipe);
+        assert_eq!(command.transport.output, FrameTransport::StdoutPipe);
         assert!(has_subsequence(
             &command.args,
             &["-fflags", "+genpts+nobuffer"]
@@ -438,43 +372,62 @@ mod tests {
     }
 
     #[test]
-    fn balanced_latency_relaxes_low_delay_flags_and_supports_named_pipe_output() {
-        let normalizer = FfmpegNormalizer::new("ffmpeg").with_output_transport(
-            FrameTransport::NamedPipe(PathBuf::from(r"\\.\pipe\referee-normalized-session-1")),
-        );
-        let command = normalizer
-            .build_command(&context(
-                LatencyMode::Balanced,
-                FrameTransport::NamedPipe(PathBuf::from(r"\\.\pipe\referee-normalized-session-1")),
-            ))
-            .unwrap();
+    fn balanced_latency_relaxes_low_delay_flags() {
+        let normalizer = FfmpegNormalizer::new("ffmpeg");
         let spec = normalizer
-            .build_normalizer_spec(&context(
-                LatencyMode::Balanced,
-                FrameTransport::NamedPipe(PathBuf::from(r"\\.\pipe\referee-normalized-session-1")),
-            ))
+            .build_normalizer_spec(&context(LatencyMode::Balanced, FrameTransport::StdoutPipe))
             .unwrap();
 
         assert!(!has_subsequence(
-            &command.args,
+            &spec.args,
             &["-fflags", "+genpts+nobuffer"]
         ));
-        assert!(!has_subsequence(&command.args, &["-flags", "low_delay"]));
-        assert!(!command.args.iter().any(|a| a == "-re"));
-        assert!(has_subsequence(&command.args, &["-fflags", "+genpts"]));
+        assert!(!has_subsequence(&spec.args, &["-flags", "low_delay"]));
+        assert!(!spec.args.iter().any(|a| a == "-re"));
+        assert!(has_subsequence(&spec.args, &["-fflags", "+genpts"]));
         assert!(has_subsequence(
-            &command.args,
-            &["-f", "nut", r"\\.\pipe\referee-normalized-session-1"]
-        ));
-        assert!(has_subsequence(
-            &command.args,
+            &spec.args,
             &["-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"]
         ));
         assert_eq!(
-            spec.transport.output,
-            FrameTransport::NamedPipe(PathBuf::from(r"\\.\pipe\referee-normalized-session-1"))
+            spec.readiness_policy,
+            PipelineStageReadinessPolicy::ReadyOnSpawn
         );
-        assert_eq!(spec.stdout, crate::runtime::StdoutMode::Null);
+        assert!(matches!(spec.stderr_mode, StderrMode::Filtered { .. }));
+    }
+
+    #[test]
+    fn rejects_transports_other_than_source_pull_to_pipe() {
+        let normalizer = FfmpegNormalizer::new("ffmpeg");
+        let mut hls_output = context(
+            LatencyMode::Low,
+            FrameTransport::HlsOutput {
+                playlist_path: PathBuf::from("session\\index.m3u8"),
+                segment_dir: PathBuf::from("session"),
+            },
+        );
+        assert!(normalizer.build_command(&hls_output).is_err());
+
+        hls_output.transport.output = FrameTransport::StdoutPipe;
+        hls_output.transport.input = FrameTransport::StdoutPipe;
+        assert!(normalizer.build_command(&hls_output).is_err());
+    }
+
+    #[test]
+    fn appends_crop_and_denoise_to_the_video_filter() {
+        let normalizer = FfmpegNormalizer::new("ffmpeg")
+            .with_pixel_format("nv12")
+            .with_output_resolution(Some((1920, 1080)))
+            .with_denoise(true);
+        let command = normalizer
+            .build_command(&context(LatencyMode::Low, FrameTransport::StdoutPipe))
+            .unwrap();
+
+        let filter_index = command.args.iter().position(|a| a == "-vf").unwrap();
+        let filter = &command.args[filter_index + 1];
+        assert!(filter.starts_with("crop="));
+        assert!(filter.ends_with(",setpts=PTS-STARTPTS,hqdn3d"));
+        assert!(has_subsequence(&command.args, &["-pix_fmt", "nv12"]));
     }
 
     fn direct_source_context(url: &str, headers: HashMap<String, String>) -> StageRuntimeContext {
@@ -529,7 +482,6 @@ mod tests {
         assert!(has_subsequence(&command.args, &["-pix_fmt", "yuv420p"]));
         assert!(has_subsequence(&command.args, &["-c:a", "pcm_s16le"]));
         assert!(has_subsequence(&command.args, &["-f", "nut", "pipe:1"]));
-        assert_eq!(command.output_transport, FrameTransport::StdoutPipe);
     }
 
     #[test]

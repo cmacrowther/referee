@@ -4,25 +4,13 @@ use super::capabilities::{
 use super::plan::{
     Anime4k2xPlan, Artcnn2xPlan, ColorPrimariesIntent, ExecutionPlan, HdrMetadataKind,
     HdrMetadataPlan, HdrPlan, HdrTransformKind, HdrTransformPlan, InterpolationDecision,
-    InterpolationPlan, InterpolationUnsupportedReason, MatrixCoefficientsIntent, OpExecutionStage,
-    OutputBitDepth, ResizePlan, TransferCharacteristicIntent, VideoOp,
+    InterpolationPlan, InterpolationUnsupportedReason, MatrixCoefficientsIntent,
+    NativeInterpolationEngine, OpExecutionStage, OutputBitDepth, ResizePlan,
+    TransferCharacteristicIntent, VideoOp,
 };
 use super::request::{HdrRequest, InterpolationRequest, PipelineRequest, UpscaleRequest};
 use super::ExecutorKind;
 use crate::source::SourceContentKind;
-
-const TARGET_INTERPOLATION_FPS: u32 = 60;
-
-fn derive_native_fruc_target_fps(source_fps: Option<f64>) -> u32 {
-    source_fps
-        .filter(|fps| *fps > 0.0)
-        .map(|fps| {
-            ((fps * 2.0).round() as u32)
-                .min(TARGET_INTERPOLATION_FPS)
-                .max(1)
-        })
-        .unwrap_or(TARGET_INTERPOLATION_FPS)
-}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GraphPlanner;
@@ -253,11 +241,11 @@ impl GraphPlanner {
 
     /// Plans frame-rate interpolation for the request, producing an `InterpolationPlan` when interpolation is enabled.
     ///
-    /// If the request disables interpolation, returns `None`. For a request to interpolate up to 60 fps:
-    /// - If the source FPS is present and already greater than or equal to 60, returns a plan with `decision` set to disabled with reason `SourceAlreadyAtOrAboveTargetFps`.
+    /// If the request disables interpolation, returns `None`. Otherwise the plan targets the requested frame rate:
+    /// - If the source FPS is known and already at the target, returns a plan with `decision` set to disabled with reason `SourceAlreadyAtOrAboveTargetFps`.
     /// - Otherwise selects a realization based on backend capabilities:
-    ///   - `InterpolationSupport::To60` → native backend at executor stage, targeting double the source FPS capped at 60.
-    ///   - `InterpolationSupport::Unsupported` → portable fallback at preprocess stage, targeting 60 fps.
+    ///   - `InterpolationSupport::Native` → native backend at executor stage.
+    ///   - `InterpolationSupport::Unsupported` → portable fallback at preprocess stage.
     ///
     /// # Examples
     ///
@@ -266,43 +254,47 @@ impl GraphPlanner {
         request: &PipelineRequest,
         capabilities: &BackendCapabilities,
     ) -> Option<InterpolationPlan> {
-        match request.interpolation {
-            InterpolationRequest::Off => None,
-            InterpolationRequest::To60 => {
-                if request
-                    .source_fps
-                    .map(|fps| fps >= TARGET_INTERPOLATION_FPS as f64)
-                    .unwrap_or(false)
-                {
-                    return Some(InterpolationPlan {
-                        target_fps: TARGET_INTERPOLATION_FPS,
-                        decision: InterpolationDecision::disabled(
-                            InterpolationUnsupportedReason::SourceAlreadyAtOrAboveTargetFps,
-                        ),
-                    });
-                }
+        let target_fps = request.interpolation.target_fps(request.source_fps)?;
 
-                let (target_fps, decision) = match capabilities.interpolation {
-                    InterpolationSupport::To60 => (
-                        derive_native_fruc_target_fps(request.source_fps),
-                        InterpolationDecision::native_backend(OpExecutionStage::Executor),
-                    ),
-                    // Route portable interpolation to the shared preprocess
-                    // stage. Runtime selection can realize this with external
-                    // RIFE or with FFmpeg minterpolate fallback without
-                    // changing the planner contract.
-                    InterpolationSupport::Unsupported => (
-                        TARGET_INTERPOLATION_FPS,
-                        InterpolationDecision::portable_fallback(OpExecutionStage::Preprocess),
-                    ),
-                };
-
-                Some(InterpolationPlan {
-                    target_fps,
-                    decision,
-                })
-            }
+        if !request.interpolation.raises_frame_rate(request.source_fps) {
+            return Some(InterpolationPlan {
+                target_fps,
+                decision: InterpolationDecision::disabled(
+                    InterpolationUnsupportedReason::SourceAlreadyAtOrAboveTargetFps,
+                ),
+            });
         }
+
+        let decision = match (&capabilities.interpolation, request.interpolation) {
+            // RIFE runs in its own preprocess stage whatever the executor.
+            (_, InterpolationRequest::RifeTargetFps(_)) => {
+                InterpolationDecision::rife(OpExecutionStage::Preprocess)
+            }
+            (
+                InterpolationSupport::NativeWithFramegen | InterpolationSupport::FramegenOnly,
+                InterpolationRequest::NativeDouble,
+            ) => InterpolationDecision::native_engine(
+                OpExecutionStage::Executor,
+                native_double_engine(capabilities.executor),
+            ),
+            // FRUC reaches any target, including double the source rate when
+            // NVIDIA frame generation is unavailable.
+            (InterpolationSupport::Native | InterpolationSupport::NativeWithFramegen, _) => {
+                InterpolationDecision::native_backend(OpExecutionStage::Executor)
+            }
+            // Route portable interpolation to the shared preprocess
+            // stage. Runtime selection can realize this with external
+            // RIFE or with FFmpeg minterpolate fallback without
+            // changing the planner contract.
+            (InterpolationSupport::Unsupported | InterpolationSupport::FramegenOnly, _) => {
+                InterpolationDecision::portable_fallback(OpExecutionStage::Preprocess)
+            }
+        };
+
+        Some(InterpolationPlan {
+            target_fps,
+            decision,
+        })
     }
 
     /// Plans HDR processing based on the pipeline's HDR intent and the backend's HDR capabilities.
@@ -398,11 +390,22 @@ fn preferred_hdr_metadata_stage(capabilities: &BackendCapabilities) -> OpExecuti
 }
 
 fn preferred_hdr_tonemap_transform_kind(capabilities: &BackendCapabilities) -> HdrTransformKind {
-    if capabilities.executor == ExecutorKind::NvidiaSpecialized && capabilities.hdr.tonemap_to_hdr10
-    {
-        HdrTransformKind::NvidiaTrueHdrTonemapToHdr10
-    } else {
-        HdrTransformKind::TonemapToHdr10
+    match capabilities.executor {
+        ExecutorKind::NvidiaSpecialized if capabilities.hdr.tonemap_to_hdr10 => {
+            HdrTransformKind::NvidiaTrueHdrTonemapToHdr10
+        }
+        ExecutorKind::AmdSpecialized if capabilities.hdr.tonemap_to_hdr10 => {
+            HdrTransformKind::AmdTonemapToHdr10
+        }
+        _ => HdrTransformKind::TonemapToHdr10,
+    }
+}
+
+/// The engine behind a specialized executor's native frame doubling.
+fn native_double_engine(executor: ExecutorKind) -> NativeInterpolationEngine {
+    match executor {
+        ExecutorKind::AmdSpecialized => NativeInterpolationEngine::AmdFrc,
+        _ => NativeInterpolationEngine::NvidiaFramegen,
     }
 }
 
@@ -428,9 +431,9 @@ mod tests {
         HdrTransformKind, HdrTransformPlan, InterpolationDecision, InterpolationPlan,
         InterpolationRealization, InterpolationRequest, InterpolationSupport,
         InterpolationUnsupportedReason, LatencyMode, MatrixCoefficientsIntent,
-        NativeUpscaleBackend, OpExecutionStage, OutputBitDepth, PipelineRequest, ResizePlan,
-        ResizeSupport, SelectedUpscalePath, TransferCharacteristicIntent,
-        UpscalePlanningCapabilities, UpscaleRequest, VideoOp,
+        NativeInterpolationEngine, NativeUpscaleBackend, OpExecutionStage, OutputBitDepth,
+        PipelineRequest, ResizePlan, ResizeSupport, SelectedUpscalePath,
+        TransferCharacteristicIntent, UpscalePlanningCapabilities, UpscaleRequest, VideoOp,
     };
     use crate::source::{SourceContentKind, SourceKind, SourceTransport};
 
@@ -449,7 +452,7 @@ mod tests {
             source_fps: Some(30.0),
             latency_mode: LatencyMode::Low,
             upscale: UpscaleRequest::Quality(3),
-            interpolation: InterpolationRequest::To60,
+            interpolation: InterpolationRequest::TargetFps(60),
             hdr: HdrRequest::TonemapToHdr10,
         };
         let capabilities = BackendCapabilities {
@@ -458,7 +461,7 @@ mod tests {
                 min_quality: 1,
                 max_quality: 4,
             },
-            interpolation: InterpolationSupport::To60,
+            interpolation: InterpolationSupport::Native,
             hdr: HdrSupport {
                 passthrough_10_bit: true,
                 tonemap_to_hdr10: true,
@@ -569,7 +572,7 @@ mod tests {
             source_fps: Some(30.0),
             latency_mode: LatencyMode::Balanced,
             upscale: UpscaleRequest::Quality(2),
-            interpolation: InterpolationRequest::To60,
+            interpolation: InterpolationRequest::TargetFps(60),
             hdr: HdrRequest::TonemapToHdr10,
         };
         let capabilities = BackendCapabilities {
@@ -682,13 +685,13 @@ mod tests {
             source_fps: Some(60.0),
             latency_mode: LatencyMode::Low,
             upscale: UpscaleRequest::Off,
-            interpolation: InterpolationRequest::To60,
+            interpolation: InterpolationRequest::TargetFps(60),
             hdr: HdrRequest::Off,
         };
         let capabilities = BackendCapabilities {
             executor: ExecutorKind::NvidiaSpecialized,
             resize: ResizeSupport::Unsupported,
-            interpolation: InterpolationSupport::To60,
+            interpolation: InterpolationSupport::Native,
             hdr: HdrSupport::default(),
             upscale: UpscalePlanningCapabilities::shared_preprocess(None),
         };
@@ -707,36 +710,146 @@ mod tests {
         assert_eq!(interpolation.decision.stage, None);
     }
 
-    #[test]
-    fn native_fruc_plan_doubles_source_fps_up_to_60() {
-        let request = PipelineRequest {
+    fn fps_request(source_fps: Option<f64>, target_fps: u32) -> PipelineRequest {
+        PipelineRequest {
             source_transport: SourceTransport::RemoteHttp,
             source_kind: SourceKind::Hls,
             source_content_kind: SourceContentKind::Unknown,
             source_resolution: Some("1920x1080".to_string()),
             output_resolution: "1920x1080".to_string(),
-            source_fps: Some(24.0),
+            source_fps,
             latency_mode: LatencyMode::Low,
             upscale: UpscaleRequest::Off,
-            interpolation: InterpolationRequest::To60,
+            interpolation: InterpolationRequest::TargetFps(target_fps),
             hdr: HdrRequest::Off,
-        };
-        let capabilities = BackendCapabilities {
+        }
+    }
+
+    fn native_fruc_capabilities() -> BackendCapabilities {
+        BackendCapabilities {
             executor: ExecutorKind::NvidiaSpecialized,
             resize: ResizeSupport::Unsupported,
-            interpolation: InterpolationSupport::To60,
+            interpolation: InterpolationSupport::Native,
             hdr: HdrSupport::default(),
             upscale: UpscalePlanningCapabilities::shared_preprocess(None),
+        }
+    }
+
+    #[test]
+    fn native_fruc_plan_targets_the_requested_fps() {
+        for (source_fps, target_fps) in [
+            (Some(24.0), 30),
+            (Some(24.0), 60),
+            (Some(50.0), 60),
+            (Some(30.0), 144),
+            (None, 60),
+        ] {
+            let plan = planner().plan(
+                &fps_request(source_fps, target_fps),
+                &native_fruc_capabilities(),
+            );
+            let interpolation = plan.interpolation_plan().expect("interpolation decision");
+
+            assert_eq!(interpolation.target_fps, target_fps, "{source_fps:?}");
+            assert_eq!(
+                interpolation.decision,
+                InterpolationDecision::native_backend(OpExecutionStage::Executor),
+                "{source_fps:?} -> {target_fps}"
+            );
+        }
+    }
+
+    #[test]
+    fn nvidia_framegen_doubling_uses_framegen_when_available_and_fruc_otherwise() {
+        let doubling = |source_fps| PipelineRequest {
+            interpolation: InterpolationRequest::NativeDouble,
+            ..fps_request(source_fps, 60)
+        };
+        let with_framegen = BackendCapabilities {
+            interpolation: InterpolationSupport::NativeWithFramegen,
+            ..native_fruc_capabilities()
         };
 
-        let plan = planner().plan(&request, &capabilities);
-        let interpolation = plan.interpolation_plan().expect("interpolation decision");
+        for (source_fps, target_fps) in [(Some(24.0), 48), (Some(30.0), 60), (None, 60)] {
+            let plan = planner().plan(&doubling(source_fps), &with_framegen);
+            let interpolation = plan.interpolation_plan().expect("interpolation decision");
+            assert_eq!(interpolation.target_fps, target_fps, "{source_fps:?}");
+            assert_eq!(
+                interpolation.decision,
+                InterpolationDecision::native_engine(
+                    OpExecutionStage::Executor,
+                    NativeInterpolationEngine::NvidiaFramegen
+                )
+            );
+        }
 
+        let plan = planner().plan(&doubling(Some(24.0)), &native_fruc_capabilities());
+        let interpolation = plan.interpolation_plan().expect("interpolation decision");
         assert_eq!(interpolation.target_fps, 48);
         assert_eq!(
             interpolation.decision,
             InterpolationDecision::native_backend(OpExecutionStage::Executor)
         );
+
+        let plan = planner().plan(&doubling(Some(59.94)), &with_framegen);
+        assert_eq!(
+            plan.interpolation_plan()
+                .unwrap()
+                .decision
+                .unsupported_reason,
+            Some(InterpolationUnsupportedReason::SourceAlreadyAtOrAboveTargetFps)
+        );
+    }
+
+    #[test]
+    fn rife_requests_plan_rife_in_the_preprocess_stage_on_any_executor() {
+        let rife = |source_fps| PipelineRequest {
+            interpolation: InterpolationRequest::RifeTargetFps(60),
+            ..fps_request(source_fps, 60)
+        };
+        let universal = BackendCapabilities {
+            executor: ExecutorKind::Universal,
+            interpolation: InterpolationSupport::Unsupported,
+            ..native_fruc_capabilities()
+        };
+
+        for capabilities in [native_fruc_capabilities(), universal] {
+            let plan = planner().plan(&rife(Some(24.0)), &capabilities);
+            let interpolation = plan.interpolation_plan().expect("interpolation decision");
+            assert_eq!(interpolation.target_fps, 60);
+            assert_eq!(
+                interpolation.decision,
+                InterpolationDecision::rife(OpExecutionStage::Preprocess)
+            );
+            assert!(plan.uses_rife());
+            assert_eq!(plan.framegen_label(), Some("RIFE"));
+            assert!(plan
+                .to_intermediate_plan()
+                .shared_preprocess_plan()
+                .requires_stage());
+        }
+
+        let at_target = planner().plan(&rife(Some(60.0)), &native_fruc_capabilities());
+        assert!(!at_target.uses_rife());
+        assert_eq!(at_target.framegen_label(), None);
+    }
+
+    #[test]
+    fn interpolation_is_disabled_for_ntsc_sources_at_the_target() {
+        for (source_fps, target_fps) in [(30000.0 / 1001.0, 30), (60000.0 / 1001.0, 60), (30.0, 30)]
+        {
+            let plan = planner().plan(
+                &fps_request(Some(source_fps), target_fps),
+                &native_fruc_capabilities(),
+            );
+            let interpolation = plan.interpolation_plan().expect("interpolation decision");
+
+            assert_eq!(
+                interpolation.decision.unsupported_reason,
+                Some(InterpolationUnsupportedReason::SourceAlreadyAtOrAboveTargetFps),
+                "{source_fps} -> {target_fps}"
+            );
+        }
     }
 
     #[test]

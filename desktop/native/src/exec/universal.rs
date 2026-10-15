@@ -1,27 +1,29 @@
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::graph::{
-    Anime4k2xPlan, Artcnn2xPlan, ColorPrimariesIntent, ExecutorKind, HdrRequest,
-    IntermediateExecutionPlan, IntermediateOpOwner, IntermediateOperation,
-    MatrixCoefficientsIntent, OutputBitDepth, TransferCharacteristicIntent,
+    Anime4k2xPlan, Artcnn2xPlan, ExecutorKind, HdrRequest, IntermediateExecutionPlan,
+    IntermediateOpOwner, IntermediateOperation, OutputBitDepth,
 };
 use crate::pipeline::EncodingProfile;
 use crate::runtime::{
-    BackendExecutor, ExecutorSpec, FrameTransport, LegacyStartupMode, PipelineStageId,
-    PipelineStageReadinessPolicy, ProcessSpec, StageRuntimeContext, StderrMode, StdinMode,
-    StdoutMode,
+    BackendExecutor, ExecutorSpec, FrameTransport, PipelineStageId, ProcessSpec,
+    StageRuntimeContext, StartupMode, StderrMode, HLS_SEGMENT_FILENAME_PATTERN,
 };
+use crate::source::{ffmpeg_header_block, BROWSER_USER_AGENT};
 
-use super::{resolve_encoder_input, EncoderInput};
+use super::libplacebo_filters::LibplaceboParams;
+use super::{
+    build_ffmpeg_hls_output_args, resolve_encoder_input, segment_aligned_gop, EncoderInput,
+};
 
 const DEFAULT_AUDIO_BITRATE_KBPS: u32 = 160;
 const DEFAULT_VAAPI_DEVICE: &str = "/dev/dri/renderD128";
-use super::REQUEST_USER_AGENT;
 const INPUT_ANALYZE_MICROS: u32 = 4_000_000;
 const INPUT_PROBESIZE_BYTES: u32 = 1_000_000;
+/// Output frame rate assumed for GOP length when the source rate is unknown.
+const UNKNOWN_OUTPUT_FPS_FALLBACK: f64 = 60.0;
 const GENERATED_RUNTIME_SHADER_NAME: &str = "referee-universal-runtime.glsl";
 const CAS_SHADER_STRENGTH_PLACEHOLDER: &str = "{{CAS_STRENGTH}}";
 const CAS_SHADER_TEMPLATE: &str = include_str!("../../shaders/cas/Referee_CAS.glsl");
@@ -43,12 +45,6 @@ impl RuntimePlatform {
             Self::Other
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct UniversalBackendSelectionContext<'a> {
-    pub platform: RuntimePlatform,
-    pub gpu_vendor: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,21 +76,10 @@ impl UniversalEncodeBackend {
     }
 
     fn pixel_format(self, output_bit_depth: OutputBitDepth) -> &'static str {
-        match self {
-            Self::Nvenc | Self::Vaapi | Self::Amf => {
-                if output_bit_depth == OutputBitDepth::Bit10 {
-                    "p010le"
-                } else {
-                    "nv12"
-                }
-            }
-            Self::CpuFallback => {
-                if output_bit_depth == OutputBitDepth::Bit10 {
-                    "yuv420p10le"
-                } else {
-                    "yuv420p"
-                }
-            }
+        match (self, output_bit_depth) {
+            (Self::Nvenc | Self::Vaapi | Self::Amf, OutputBitDepth::Bit10) => "p010le",
+            (Self::Nvenc | Self::Vaapi | Self::Amf, OutputBitDepth::Bit8) => "nv12",
+            (Self::CpuFallback, bit_depth) => bit_depth.planar_yuv_format(),
         }
     }
 }
@@ -108,12 +93,10 @@ impl UniversalEncodeBackend {
 /// Windows + AMD   -> AMF (hevc_amf)
 /// anything else   -> CPU fallback
 pub(crate) fn select_universal_encode_backend(
-    context: UniversalBackendSelectionContext<'_>,
+    platform: RuntimePlatform,
+    gpu_vendor: &str,
 ) -> UniversalEncodeBackend {
-    match (
-        context.platform,
-        context.gpu_vendor.trim().to_ascii_lowercase().as_str(),
-    ) {
+    match (platform, gpu_vendor.trim().to_ascii_lowercase().as_str()) {
         (RuntimePlatform::Linux, "nvidia") => UniversalEncodeBackend::Nvenc,
         (RuntimePlatform::Linux, "amd") => UniversalEncodeBackend::Vaapi,
         (RuntimePlatform::Windows, "nvidia") => UniversalEncodeBackend::Nvenc,
@@ -149,15 +132,6 @@ pub struct UniversalExecutorContext {
     pub cas_strength: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UniversalExecutorCommand {
-    pub program: PathBuf,
-    pub args: Vec<String>,
-    pub stdin: StdinMode,
-    pub stdout: StdoutMode,
-    pub current_dir: Option<PathBuf>,
-}
-
 pub struct UniversalExecutor {
     context: UniversalExecutorContext,
 }
@@ -168,15 +142,10 @@ struct ResolvedCustomShader {
     shader_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 struct UniversalFilterPlan {
-    output_resolution: Option<String>,
-    resize_quality: Option<u8>,
-    output_bit_depth: OutputBitDepth,
-    color_primaries: ColorPrimariesIntent,
-    transfer: TransferCharacteristicIntent,
-    matrix: MatrixCoefficientsIntent,
-    tone_map_to_hdr10: bool,
+    /// Executor-owned resize and color work.
+    libplacebo: LibplaceboParams,
     deferred_interpolation: bool,
     /// True when the HDR transform (bit-depth conversion + colour-space
     /// re-tagging) was assigned to the preprocess stage and has already been
@@ -196,53 +165,9 @@ struct UniversalFilterPlan {
     cas_strength: f32,
 }
 
-impl Default for UniversalFilterPlan {
-    /// Constructs a default UniversalFilterPlan with no filter or shader work requested and an 8-bit, source-preserving color intent.
-    ///
-    /// # Examples
-    ///
-    fn default() -> Self {
-        Self {
-            output_resolution: None,
-            resize_quality: None,
-            output_bit_depth: OutputBitDepth::Bit8,
-            color_primaries: ColorPrimariesIntent::PreserveSource,
-            transfer: TransferCharacteristicIntent::PreserveSource,
-            matrix: MatrixCoefficientsIntent::PreserveSource,
-            tone_map_to_hdr10: false,
-            deferred_interpolation: false,
-            hdr_preprocess_owned: false,
-            custom_shader_paths: Vec::new(),
-            denoise: false,
-            cas_strength: 0.0,
-        }
-    }
-}
-
 impl UniversalFilterPlan {
-    /// Builds a `UniversalFilterPlan` representing the executor-owned operations described
-    /// in an `IntermediateExecutionPlan`.
-    ///
-    /// The returned plan reflects only operations the Universal executor should perform
-    /// (executor-owned operations); preprocess-owned operations are not applied. This
-    /// function also asserts in debug builds that the intermediate plan targets the
-    /// Universal executor.
-    ///
-    /// # Parameters
-    ///
-    /// - `intermediate_plan`: Source intermediate execution plan to convert.
-    /// - `anime4k_shaders_dir`: Optional directory where Anime4k GLSL shaders live; used
-    ///   to resolve executor-owned Anime4k upscale shader paths.
-    /// - `artcnn_shaders_dir`: Optional directory where ArtCNN GLSL shaders live; used
-    ///   to resolve executor-owned ArtCNN upscale shader paths.
-    ///
-    /// # Returns
-    ///
-    /// A `UniversalFilterPlan` that encodes resize, HDR, color, and custom-shader intents
-    /// the Universal executor is responsible for.
-    ///
-    /// # Examples
-    ///
+    /// Builds the filter plan for the operations this executor owns.
+    /// Preprocess-owned operations are left to `FfmpegPreprocessor`.
     fn from_intermediate_plan(
         intermediate_plan: &IntermediateExecutionPlan,
         anime4k_shaders_dir: Option<&Path>,
@@ -250,7 +175,10 @@ impl UniversalFilterPlan {
     ) -> Self {
         let mut plan = Self::default();
 
-        debug_assert_eq!(intermediate_plan.executor, ExecutorKind::Universal);
+        debug_assert!(matches!(
+            intermediate_plan.executor,
+            ExecutorKind::Universal | ExecutorKind::Cpu
+        ));
 
         for operation in &intermediate_plan.operations {
             plan.apply_intermediate_operation(operation, anime4k_shaders_dir, artcnn_shaders_dir);
@@ -259,14 +187,8 @@ impl UniversalFilterPlan {
         plan
     }
 
-    /// Constructs a test-only `UniversalFilterPlan` from a legacy list of `VideoOp`s.
-    ///
-    /// This is a helper used in unit tests to convert a slice of `VideoOp` into an
-    /// `IntermediateExecutionPlan` and then into a `UniversalFilterPlan`, wiring the
-    /// provided optional shader directories for executor-owned upscales.
-    ///
-    /// # Examples
-    ///
+    /// Test helper: builds a filter plan from raw `VideoOp`s via the
+    /// intermediate plan.
     #[cfg(test)]
     fn from_video_ops(
         video_ops: &[crate::graph::VideoOp],
@@ -288,21 +210,7 @@ impl UniversalFilterPlan {
         )
     }
 
-    /// Incorporates a single intermediate operation into the current filter plan, honoring operation ownership.
-    ///
-    /// Applies only the parts of `operation` that the executor is responsible for and updates
-    /// internal flags such as `output_bit_depth`, `deferred_interpolation`, and `hdr_preprocess_owned`.
-    /// When an upscale operation owned by the executor is applied, the corresponding shader directory
-    /// (`anime4k_shaders_dir` or `artcnn_shaders_dir`) is used to resolve shader file paths.
-    ///
-    /// # Parameters
-    ///
-    /// - `operation`: the intermediate operation to apply; only executor-owned portions are acted on.
-    /// - `anime4k_shaders_dir`: directory containing Anime4k GLSL shaders; used when applying executor-owned Anime4k upscales.
-    /// - `artcnn_shaders_dir`: directory containing ArtCNN GLSL shaders; used when applying executor-owned ArtCNN upscales.
-    ///
-    /// # Examples
-    ///
+    /// Applies the executor-owned parts of one intermediate operation.
     fn apply_intermediate_operation(
         &mut self,
         operation: &IntermediateOperation,
@@ -313,7 +221,7 @@ impl UniversalFilterPlan {
             IntermediateOperation::NormalizeInput(_) => {}
             IntermediateOperation::Resize(resize) => {
                 if resize.binding.owner == IntermediateOpOwner::Executor {
-                    self.apply_resize_plan(&resize.plan);
+                    self.libplacebo.apply_resize(&resize.plan);
                 }
             }
             IntermediateOperation::Interpolate(interpolation) => {
@@ -325,15 +233,18 @@ impl UniversalFilterPlan {
             }
             IntermediateOperation::HdrMetadata(metadata) => {
                 // Metadata-only HDR requests still carry output-format intent
-                // through the split intermediate representation, so preserve
-                // the existing behaviour by applying the shared HDR request
-                // here unless a later preprocess-owned transform clears it.
+                // through the split intermediate representation, so apply the
+                // shared HDR request here unless a later preprocess-owned
+                // transform clears it.
                 self.apply_hdr_plan(&metadata.hdr);
             }
             IntermediateOperation::HdrTransform(transform) => {
-                self.output_bit_depth = transform.hdr.output_bit_depth;
                 if transform.binding.owner == IntermediateOpOwner::SharedPreprocess {
-                    self.mark_hdr_preprocess_owned(transform.hdr.output_bit_depth);
+                    // The preprocessor already converted the frames; keep the
+                    // bit depth but drop the color work.
+                    self.libplacebo.output_bit_depth = transform.hdr.output_bit_depth;
+                    self.libplacebo.preserve_source_color();
+                    self.hdr_preprocess_owned = true;
                 } else {
                     self.apply_hdr_plan(&transform.hdr);
                 }
@@ -351,85 +262,40 @@ impl UniversalFilterPlan {
         }
     }
 
-    fn apply_resize_plan(&mut self, resize: &crate::graph::ResizePlan) {
-        self.output_resolution = Some(resize.target_resolution.clone());
-        self.resize_quality = resize.quality;
-    }
-
     fn apply_anime4k_plan(&mut self, plan: &Anime4k2xPlan, shaders_dir: Option<&Path>) {
-        self.output_resolution = Some(plan.target_resolution.clone());
+        self.libplacebo.output_resolution = Some(plan.target_resolution.clone());
         if let Some(dir) = shaders_dir {
             self.custom_shader_paths = vec![dir.join("Anime4K_Upscale_CNN_x2_M.glsl")];
         }
     }
 
-    /// Applies an ArtCNN 2x upscale plan to the filter plan.
-    ///
-    /// Sets the plan's output resolution to the upscale target and, if a shader
-    /// directory is provided, records the resolved ArtCNN shader file path.
-    ///
-    /// # Examples
-    ///
     fn apply_artcnn_plan(&mut self, plan: &Artcnn2xPlan, shaders_dir: Option<&Path>) {
-        self.output_resolution = Some(plan.target_resolution.clone());
+        self.libplacebo.output_resolution = Some(plan.target_resolution.clone());
         if let Some(dir) = shaders_dir {
             self.custom_shader_paths = vec![dir.join("ArtCNN_C4F16.glsl")];
         }
     }
 
-    /// Apply an HDR transform plan to this filter plan.
-    ///
-    /// Updates the plan's output bit depth, color primaries, transfer, and matrix
-    /// to match the provided HDR plan, clears any `hdr_preprocess_owned` marker,
-    /// and sets `tone_map_to_hdr10` when the HDR plan requests tonemapping to HDR10.
-    ///
-    /// # Examples
-    ///
     fn apply_hdr_plan(&mut self, hdr: &crate::graph::HdrPlan) {
         self.hdr_preprocess_owned = false;
-        self.output_bit_depth = hdr.output_bit_depth;
-        self.color_primaries = hdr.color_primaries;
-        self.transfer = hdr.transfer;
-        self.matrix = hdr.matrix;
-        self.tone_map_to_hdr10 = matches!(hdr.request, HdrRequest::TonemapToHdr10);
+        self.libplacebo.apply_hdr_color(hdr);
+        self.libplacebo.tone_map_to_hdr10 = matches!(hdr.request, HdrRequest::TonemapToHdr10);
     }
 
-    /// Marks that HDR bit-depth conversion and related transforms were already applied in a shared preprocess stage.
-    ///
-    /// Sets the plan's output bit depth to `output_bit_depth`, resets color/transfer/matrix intents to
-    /// `PreserveSource`, disables HDR tonemapping, and records that HDR processing is owned by the preprocess stage.
-    ///
-    /// # Examples
-    ///
-    fn mark_hdr_preprocess_owned(&mut self, output_bit_depth: OutputBitDepth) {
-        self.output_bit_depth = output_bit_depth;
-        self.color_primaries = ColorPrimariesIntent::PreserveSource;
-        self.transfer = TransferCharacteristicIntent::PreserveSource;
-        self.matrix = MatrixCoefficientsIntent::PreserveSource;
-        self.tone_map_to_hdr10 = false;
-        self.hdr_preprocess_owned = true;
-    }
-
-    /// Determines whether the executor must perform libplacebo-based processing.
-    ///
-    /// Returns `true` when any executor-side libplacebo work is required: custom shader upscaling, CAS sharpening, an explicit output resolution/resize, tonemapping to HDR10, a required 10-bit conversion when the preprocess stage did not already produce 10-bit frames, or any color/transfer/matrix intent that is not `PreserveSource`. Returns `false` when none of these conditions apply.
-    ///
-    /// # Examples
-    ///
+    /// Whether the executor must run a libplacebo filter: shader upscale, CAS
+    /// sharpening, resize or color work, or a 10-bit conversion the
+    /// preprocessor did not already perform.
     fn has_libplacebo_processing(&self) -> bool {
         !self.custom_shader_paths.is_empty()
             || self.cas_strength > 0.0
-            || self.output_resolution.is_some()
-            || self.tone_map_to_hdr10
+            || self.libplacebo.has_resize_or_color_work()
             // When the preprocess stage already converted to 10-bit and
             // delivered the frames in the correct pixel format, the executor
             // does not need a libplacebo filter solely for bit-depth.  The
             // backend-tail `format=` conversion (e.g. `p010le` for NVENC) is
             // still emitted via `build_backend_filter_tail`.
-            || (self.output_bit_depth == OutputBitDepth::Bit10 && !self.hdr_preprocess_owned)
-            || !matches!(self.color_primaries, ColorPrimariesIntent::PreserveSource)
-            || !matches!(self.transfer, TransferCharacteristicIntent::PreserveSource)
-            || !matches!(self.matrix, MatrixCoefficientsIntent::PreserveSource)
+            || (self.libplacebo.output_bit_depth == OutputBitDepth::Bit10
+                && !self.hdr_preprocess_owned)
     }
 
     fn build_filter_graph(
@@ -437,7 +303,12 @@ impl UniversalFilterPlan {
         encode_backend: UniversalEncodeBackend,
         custom_shader: Option<&ResolvedCustomShader>,
     ) -> Option<String> {
-        let libplacebo_filter = build_libplacebo_filter(self, custom_shader);
+        let libplacebo_filter = self.has_libplacebo_processing().then(|| {
+            self.libplacebo.render(
+                !self.custom_shader_paths.is_empty(),
+                custom_shader.map(|shader| shader.shader_name.as_str()),
+            )
+        });
         let mut filters = Vec::new();
 
         if self.denoise {
@@ -450,7 +321,7 @@ impl UniversalFilterPlan {
 
         if let Some(tail) = Self::build_backend_filter_tail(
             encode_backend,
-            self.output_bit_depth,
+            self.libplacebo.output_bit_depth,
             libplacebo_filter.is_some(),
         ) {
             filters.push(tail);
@@ -498,25 +369,20 @@ impl UniversalExecutor {
         Self { context }
     }
 
-    /// Build the ffmpeg command and associated I/O modes for running the universal executor.
-    ///
-    /// The returned command contains the program path, argument vector, and configured stdin/stdout
-    /// transport ready to spawn an ffmpeg process that performs the executor's planned work
-    /// (encoding, optional libplacebo filter graph, audio encoding and chosen output transport).
+    /// Builds the FFmpeg process for this stage: optional Vulkan and hardware
+    /// decode setup, source or pipe input, the executor-owned filter graph,
+    /// video/audio encode, and output muxing for the stage transport.
     ///
     /// # Errors
     ///
-    /// Returns an `io::Error` if assembling the output transport arguments fails (for example when
-    /// the requested frame transport is unsupported or invalid).
-    ///
-    /// # Examples
-    ///
+    /// Fails when the stage transport is unsupported or a custom shader cannot
+    /// be read or written.
     pub fn build_command(
         &self,
         context: &StageRuntimeContext,
-        startup_mode: LegacyStartupMode,
-    ) -> io::Result<UniversalExecutorCommand> {
-        let (input, stdin) = resolve_encoder_input(context)?;
+        startup_mode: StartupMode,
+    ) -> io::Result<ProcessSpec> {
+        let input = resolve_encoder_input(context)?;
 
         // Plan filters now so we can conditionally inject Vulkan init flags
         // before the input args (FFmpeg requires global device options to
@@ -559,26 +425,20 @@ impl UniversalExecutor {
         // `-hwaccel_output_format nv12` copies decoded frames back to system
         // memory so all downstream filters (including libplacebo/Vulkan) can
         // consume them without requiring explicit device interop.
-        if matches!(input, EncoderInput::SourceUrl { .. }) {
-            match (RuntimePlatform::current(), self.context.encode_backend) {
+        if input.is_source_url() {
+            let hwaccel = match (RuntimePlatform::current(), self.context.encode_backend) {
                 (RuntimePlatform::Windows, UniversalEncodeBackend::Nvenc)
-                | (RuntimePlatform::Windows, UniversalEncodeBackend::Amf) => {
-                    args.extend([
-                        "-hwaccel".to_string(),
-                        "d3d11va".to_string(),
-                        "-hwaccel_output_format".to_string(),
-                        "nv12".to_string(),
-                    ]);
-                }
-                (RuntimePlatform::Linux, UniversalEncodeBackend::Nvenc) => {
-                    args.extend([
-                        "-hwaccel".to_string(),
-                        "cuda".to_string(),
-                        "-hwaccel_output_format".to_string(),
-                        "nv12".to_string(),
-                    ]);
-                }
-                _ => {}
+                | (RuntimePlatform::Windows, UniversalEncodeBackend::Amf) => Some("d3d11va"),
+                (RuntimePlatform::Linux, UniversalEncodeBackend::Nvenc) => Some("cuda"),
+                _ => None,
+            };
+            if let Some(hwaccel) = hwaccel {
+                args.extend([
+                    "-hwaccel".to_string(),
+                    hwaccel.to_string(),
+                    "-hwaccel_output_format".to_string(),
+                    "nv12".to_string(),
+                ]);
             }
         }
 
@@ -591,10 +451,14 @@ impl UniversalExecutor {
             self.context.intermediate_plan.executor,
             context.execution_plan.executor
         );
-        let output_bit_depth = filter_plan.output_bit_depth;
-        let filter_graph = self.build_filter_graph(&filter_plan, resolved_custom_shader.as_ref());
-        let gop_len = self.derive_gop_length(context);
-        let (output_args, stdout) = self.build_output_args(context)?;
+        let output_bit_depth = filter_plan.libplacebo.output_bit_depth;
+        let filter_graph = filter_plan
+            .build_filter_graph(self.context.encode_backend, resolved_custom_shader.as_ref());
+        let output_fps = context
+            .planned_output_fps()
+            .unwrap_or(UNKNOWN_OUTPUT_FPS_FALLBACK);
+        let gop_len = segment_aligned_gop(output_fps, self.context.profile.hls_time);
+        let output_args = self.build_output_args(context)?;
 
         if self.context.encode_backend == UniversalEncodeBackend::Vaapi {
             args.push("-vaapi_device".to_string());
@@ -631,25 +495,29 @@ impl UniversalExecutor {
         ]);
         args.extend(output_args);
 
-        Ok(UniversalExecutorCommand {
-            program: self.context.ffmpeg_program.clone(),
+        Ok(ProcessSpec::new(
+            PipelineStageId::Executor,
+            &self.context.ffmpeg_program,
             args,
-            stdin,
-            stdout,
-            current_dir: resolved_custom_shader.map(|shader| shader.working_dir),
-        })
+            context.transport.clone(),
+            self.context.encode_backend.log_label(),
+        )
+        // Filename-only `custom_shader_path` entries resolve against the
+        // working directory.
+        .with_current_dir(resolved_custom_shader.map(|shader| shader.working_dir))
+        .with_stderr_mode(StderrMode::FfmpegProgress {
+            gpu_vendor: match self.context.encode_backend {
+                UniversalEncodeBackend::Nvenc => Some("nvidia".to_string()),
+                UniversalEncodeBackend::Amf => Some("amd".to_string()),
+                _ => None,
+            },
+        }))
     }
 
-    /// Builds a UniversalFilterPlan from the executor's intermediate plan.
-    ///
-    /// This converts the ownership-aware IntermediateExecutionPlan into a UniversalFilterPlan that represents
-    /// only executor-owned filter work (e.g., executor-owned resizes, shader upscales, and tone-mapping).
-    /// Preprocess-owned operations are intentionally ignored here so they are not duplicated by the executor.
+    /// Builds the filter plan for executor-owned work. Denoise applies only
+    /// when this executor reads the source directly; the staged normalizer
+    /// denoises otherwise.
     fn plan_filters(&self, context: &StageRuntimeContext) -> UniversalFilterPlan {
-        // Consume the ownership-aware intermediate plan rather than raw
-        // graph ops so this executor behaves like a stage-owned renderer:
-        // only executor-owned work is interpreted here, while preprocess-owned
-        // work is left to `FfmpegPreprocessor`.
         let mut plan = UniversalFilterPlan::from_intermediate_plan(
             &self.context.intermediate_plan,
             self.context.anime4k_shaders_dir.as_deref(),
@@ -659,26 +527,6 @@ impl UniversalExecutor {
             self.context.denoise && matches!(&context.transport.input, FrameTransport::SourcePull);
         plan.cas_strength = self.context.cas_strength;
         plan
-    }
-
-    /// Builds the FFmpeg filter graph string for the provided `UniversalFilterPlan`.
-    ///
-    /// Calls the plan's builder with the executor's selected encode backend and returns
-    /// the composed filter graph if any processing is required by the plan.
-    ///
-    /// # Returns
-    ///
-    /// `Some` containing the filter graph string when filters are required, or `None` when
-    /// no filter graph should be applied.
-    ///
-    /// # Examples
-    ///
-    fn build_filter_graph(
-        &self,
-        plan: &UniversalFilterPlan,
-        custom_shader: Option<&ResolvedCustomShader>,
-    ) -> Option<String> {
-        plan.build_filter_graph(self.context.encode_backend, custom_shader)
     }
 
     fn materialize_custom_shader(
@@ -759,18 +607,6 @@ impl UniversalExecutor {
         }))
     }
 
-    fn derive_gop_length(&self, context: &StageRuntimeContext) -> u32 {
-        let source_fps = context
-            .source
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.source_fps);
-        let output_fps =
-            crate::pipeline::planned_target_frame_rate(source_fps, &context.execution_plan)
-                .unwrap_or(60.0);
-        (output_fps * self.context.profile.hls_time as f64).round() as u32
-    }
-
     fn build_video_encode_args(
         &self,
         output_bit_depth: OutputBitDepth,
@@ -843,121 +679,47 @@ impl UniversalExecutor {
         args
     }
 
-    fn build_output_args(
-        &self,
-        context: &StageRuntimeContext,
-    ) -> io::Result<(Vec<String>, StdoutMode)> {
+    fn build_output_args(&self, context: &StageRuntimeContext) -> io::Result<Vec<String>> {
         match &context.transport.output {
             FrameTransport::HlsOutput {
                 playlist_path,
                 segment_dir,
-            } => Ok((
-                vec![
-                    // HEVC in HLS requires the hvc1 codec tag for compatibility
-                    // with Apple devices, Safari, and HLS players that validate
-                    // the codec string. Without this, FFmpeg defaults to hev1.
-                    "-tag:v".to_string(),
-                    "hvc1".to_string(),
-                    "-f".to_string(),
-                    "hls".to_string(),
-                    "-hls_time".to_string(),
-                    self.context.profile.hls_time.to_string(),
-                    "-hls_list_size".to_string(),
-                    "8".to_string(),
-                    "-hls_segment_type".to_string(),
-                    "mpegts".to_string(),
-                    "-hls_flags".to_string(),
-                    "delete_segments".to_string(),
-                    "-hls_segment_filename".to_string(),
-                    segment_dir
-                        .join("segment_%06d.ts")
-                        .to_string_lossy()
-                        .to_string(),
-                    playlist_path.to_string_lossy().to_string(),
-                ],
-                StdoutMode::Null,
-            )),
-            FrameTransport::StdoutPipe => Ok((
-                vec![
-                    "-f".to_string(),
-                    "mpegts".to_string(),
-                    "-flush_packets".to_string(),
-                    "1".to_string(),
-                    "pipe:1".to_string(),
-                ],
-                StdoutMode::Transport(FrameTransport::StdoutPipe),
-            )),
-            FrameTransport::NamedPipe(path) => Ok((
-                vec![
-                    "-f".to_string(),
-                    "mpegts".to_string(),
-                    "-flush_packets".to_string(),
-                    "1".to_string(),
-                    path.to_string_lossy().to_string(),
-                ],
-                StdoutMode::Null,
-            )),
-            FrameTransport::LocalSocket(path) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "Universal FFmpeg executor does not yet support local-socket output at {:?}.",
-                    path
-                ),
-            )),
-            transport => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Universal FFmpeg executor cannot emit {:?} as its output transport.",
-                    transport
-                ),
-            )),
+            } => {
+                // HEVC in HLS requires the hvc1 codec tag for compatibility
+                // with Apple devices, Safari, and HLS players that validate
+                // the codec string. Without this, FFmpeg defaults to hev1.
+                let mut args = vec!["-tag:v".to_string(), "hvc1".to_string()];
+                args.extend(build_ffmpeg_hls_output_args(
+                    self.context.profile.hls_time,
+                    &segment_dir
+                        .join(HLS_SEGMENT_FILENAME_PATTERN)
+                        .to_string_lossy(),
+                    &playlist_path.to_string_lossy(),
+                ));
+                Ok(args)
+            }
+            FrameTransport::StdoutPipe => Ok(vec![
+                "-f".to_string(),
+                "mpegts".to_string(),
+                "-flush_packets".to_string(),
+                "1".to_string(),
+                "pipe:1".to_string(),
+            ]),
+            other => Err(other.unsupported(PipelineStageId::Executor, "output")),
         }
     }
 }
 
 impl BackendExecutor for UniversalExecutor {
-    /// Builds the ExecutorSpec for this universal executor configured for a given runtime stage and startup attempt.
-    ///
-    /// The returned ExecutorSpec contains the process command, transports, stdin/stdout modes, and execution metadata
-    /// required to spawn FFmpeg for the universal encoding path. If an executor-owned custom shader is present,
-    /// the spec's process `current_dir` is set so FFmpeg can resolve filename-only `custom_shader_path` entries.
-    /// The `stderr_mode` field is configured to signal NVENC-specific progress parsing when the selected backend is NVENC.
-    ///
-    /// # Examples
-    ///
     fn build_executor_spec(
         &self,
         context: &StageRuntimeContext,
         attempt_number: u32,
     ) -> io::Result<ExecutorSpec> {
-        let startup_mode = LegacyStartupMode::for_attempt(attempt_number);
-        let command = self.build_command(context, startup_mode)?;
-
+        let startup_mode = StartupMode::for_attempt(attempt_number);
         Ok(ExecutorSpec {
-            kind: ExecutorKind::Universal,
-            startup_label: Some(startup_mode.as_str().to_string()),
-            process: ProcessSpec {
-                stage: PipelineStageId::Executor,
-                program: command.program,
-                args: command.args,
-                transport: context.transport.clone(),
-                stdin: command.stdin,
-                stdout: command.stdout,
-                stderr_piped: true,
-                current_dir: command.current_dir,
-                env: Vec::new(),
-                readiness_policy: PipelineStageReadinessPolicy::ReadyOnHeartbeat,
-                log_label: self.context.encode_backend.log_label().to_string(),
-                stderr_mode: StderrMode::FfmpegProgress {
-                    gpu_vendor: match self.context.encode_backend {
-                        UniversalEncodeBackend::Nvenc => Some("nvidia".to_string()),
-                        UniversalEncodeBackend::Amf => Some("amd".to_string()),
-                        _ => None,
-                    },
-                },
-                kill_on_drop: true,
-                hidden_window: true,
-            },
+            process: self.build_command(context, startup_mode)?,
+            startup_mode,
         })
     }
 }
@@ -981,7 +743,7 @@ fn build_ffmpeg_input_args(input: &EncoderInput, low_latency: bool) -> Vec<Strin
                 "-reconnect_delay_max".to_string(),
                 "5".to_string(),
                 "-headers".to_string(),
-                build_input_headers(extra_headers),
+                ffmpeg_header_block(Some(BROWSER_USER_AGENT), extra_headers),
             ];
 
             if !low_latency {
@@ -1004,82 +766,8 @@ fn build_ffmpeg_input_args(input: &EncoderInput, low_latency: bool) -> Vec<Strin
             "-i".to_string(),
             "pipe:0".to_string(),
         ],
-        EncoderInput::NamedPipe(path) => vec![
-            "-fflags".to_string(),
-            "+discardcorrupt+nobuffer".to_string(),
-            "-f".to_string(),
-            "nut".to_string(),
-            "-i".to_string(),
-            path.to_string_lossy().to_string(),
-        ],
     }
 }
-
-fn build_input_headers(extra_headers: &HashMap<String, String>) -> String {
-    let mut header_str = format!("User-Agent: {}\r\n", REQUEST_USER_AGENT);
-    for (key, value) in extra_headers {
-        header_str.push_str(&format!("{}: {}\r\n", key, value));
-    }
-    header_str
-}
-
-fn build_libplacebo_filter(
-    plan: &UniversalFilterPlan,
-    custom_shader: Option<&ResolvedCustomShader>,
-) -> Option<String> {
-    if !plan.has_libplacebo_processing() {
-        return None;
-    }
-
-    let mut args = Vec::new();
-
-    if let Some((width, height)) = plan.output_resolution.as_deref().and_then(parse_resolution) {
-        if plan.custom_shader_paths.is_empty() {
-            push_aspect_preserving_resize_args(
-                &mut args,
-                width,
-                height,
-                map_quality_to_libplacebo_scaler(plan.resize_quality),
-            );
-        } else {
-            // When a custom upscale shader is active, let the shader handle
-            // spatial reconstruction instead of libplacebo's built-in scaler.
-            push_aspect_preserving_resize_args(&mut args, width, height, "none");
-        }
-    }
-
-    if let Some(shader) = custom_shader {
-        args.push(format!("custom_shader_path={}", shader.shader_name));
-    }
-
-    if plan.tone_map_to_hdr10 {
-        args.push("tonemapping=bt.2390".to_string());
-    }
-    if let Some(color_primaries) = map_color_primaries(plan.color_primaries) {
-        args.push(format!("color_primaries={}", color_primaries));
-    }
-    if let Some(color_trc) = map_transfer(plan.transfer) {
-        args.push(format!("color_trc={}", color_trc));
-    }
-    if let Some(colorspace) = map_matrix(plan.matrix) {
-        args.push(format!("colorspace={}", colorspace));
-    }
-    args.push(format!(
-        "format={}",
-        if plan.output_bit_depth == OutputBitDepth::Bit10 {
-            "yuv420p10le"
-        } else {
-            "yuv420p"
-        }
-    ));
-
-    Some(format!("libplacebo={}", args.join(":")))
-}
-
-use super::libplacebo_filters::{
-    map_color_primaries, map_matrix, map_quality_to_libplacebo_scaler, map_transfer,
-    parse_resolution, push_aspect_preserving_resize_args,
-};
 
 fn ffmpeg_hevc_profile(output_bit_depth: OutputBitDepth) -> &'static str {
     if output_bit_depth == OutputBitDepth::Bit10 {
@@ -1100,8 +788,8 @@ fn render_cas_shader(cas_strength: f32) -> String {
 mod tests {
     use super::{
         select_universal_encode_backend, ResolvedCustomShader, RuntimePlatform,
-        UniversalBackendSelectionContext, UniversalEncodeBackend, UniversalExecutor,
-        UniversalExecutorContext, UniversalFilterPlan, GENERATED_RUNTIME_SHADER_NAME,
+        UniversalEncodeBackend, UniversalExecutor, UniversalExecutorContext, UniversalFilterPlan,
+        GENERATED_RUNTIME_SHADER_NAME,
     };
     use crate::graph::{
         Artcnn2xPlan, ColorPrimariesIntent, ExecutionPlan, ExecutorKind, HdrMetadataKind,
@@ -1111,8 +799,8 @@ mod tests {
     };
     use crate::pipeline::EncodingProfile;
     use crate::runtime::{
-        BackendExecutor, FrameTransport, LegacyStartupMode, SessionOutputPaths,
-        StageRuntimeContext, StdinMode, StdoutMode, TransportConfig,
+        BackendExecutor, FrameTransport, SessionOutputPaths, StageRuntimeContext, StartupMode,
+        TransportConfig,
     };
     use crate::source::{SourceClassification, SourceDescriptor, SourceKind, SourceTransport};
     use std::collections::HashMap;
@@ -1274,8 +962,11 @@ mod tests {
             .build_filter_graph(UniversalEncodeBackend::Nvenc, None)
             .expect("resize filter graph");
 
-        assert_eq!(plan.output_resolution.as_deref(), Some("3840x2160"));
-        assert_eq!(plan.resize_quality, Some(3));
+        assert_eq!(
+            plan.libplacebo.output_resolution.as_deref(),
+            Some("3840x2160")
+        );
+        assert_eq!(plan.libplacebo.resize_quality, Some(3));
         assert!(filter_graph.contains("libplacebo="));
         assert!(filter_graph.contains("w=3840"));
         assert!(filter_graph.contains("h=2160"));
@@ -1323,8 +1014,8 @@ mod tests {
             .build_filter_graph(UniversalEncodeBackend::Nvenc, None)
             .expect("hdr filter graph");
 
-        assert_eq!(plan.output_bit_depth, OutputBitDepth::Bit10);
-        assert!(plan.tone_map_to_hdr10);
+        assert_eq!(plan.libplacebo.output_bit_depth, OutputBitDepth::Bit10);
+        assert!(plan.libplacebo.tone_map_to_hdr10);
         assert!(filter_graph.contains("tonemapping=bt.2390"));
         assert!(filter_graph.contains("color_primaries=bt2020"));
         assert!(filter_graph.contains("color_trc=smpte2084"));
@@ -1348,10 +1039,10 @@ mod tests {
         );
 
         assert!(
-            plan.output_resolution.is_none(),
+            plan.libplacebo.output_resolution.is_none(),
             "executor must not own resize when stage is Preprocess"
         );
-        assert!(plan.resize_quality.is_none());
+        assert!(plan.libplacebo.resize_quality.is_none());
         assert!(!plan.has_libplacebo_processing());
     }
 
@@ -1379,19 +1070,19 @@ mod tests {
         );
 
         // Bit depth preserved — encoder needs main10 profile.
-        assert_eq!(plan.output_bit_depth, OutputBitDepth::Bit10);
+        assert_eq!(plan.libplacebo.output_bit_depth, OutputBitDepth::Bit10);
         // Color/tone fields reset — no libplacebo HDR filter in the executor.
-        assert!(!plan.tone_map_to_hdr10);
+        assert!(!plan.libplacebo.tone_map_to_hdr10);
         assert!(matches!(
-            plan.color_primaries,
+            plan.libplacebo.color_primaries,
             ColorPrimariesIntent::PreserveSource
         ));
         assert!(matches!(
-            plan.transfer,
+            plan.libplacebo.transfer,
             TransferCharacteristicIntent::PreserveSource
         ));
         assert!(matches!(
-            plan.matrix,
+            plan.libplacebo.matrix,
             MatrixCoefficientsIntent::PreserveSource
         ));
         // has_libplacebo_processing is now false: the preprocess stage already
@@ -1434,14 +1125,20 @@ mod tests {
             None,
         );
 
-        assert!(plan.output_resolution.is_none(), "no resize in executor");
-        assert!(!plan.tone_map_to_hdr10, "no tonemap in executor");
         assert!(
-            matches!(plan.color_primaries, ColorPrimariesIntent::PreserveSource),
+            plan.libplacebo.output_resolution.is_none(),
+            "no resize in executor"
+        );
+        assert!(!plan.libplacebo.tone_map_to_hdr10, "no tonemap in executor");
+        assert!(
+            matches!(
+                plan.libplacebo.color_primaries,
+                ColorPrimariesIntent::PreserveSource
+            ),
             "no color primaries override in executor"
         );
         // Bit depth is still known so the encoder can select main10.
-        assert_eq!(plan.output_bit_depth, OutputBitDepth::Bit10);
+        assert_eq!(plan.libplacebo.output_bit_depth, OutputBitDepth::Bit10);
 
         // No libplacebo filter at all: preprocess already delivered the frames
         // in the correct pixel format.  The backend tail handles the explicit
@@ -1503,9 +1200,9 @@ mod tests {
             None,
         );
 
-        assert_eq!(plan.output_bit_depth, OutputBitDepth::Bit10);
+        assert_eq!(plan.libplacebo.output_bit_depth, OutputBitDepth::Bit10);
         // Passthrough10Bit does not tonemap, it just promotes pixel format.
-        assert!(!plan.tone_map_to_hdr10);
+        assert!(!plan.libplacebo.tone_map_to_hdr10);
         // has_libplacebo_processing is true because bit depth is 10-bit.
         assert!(plan.has_libplacebo_processing());
     }
@@ -1552,10 +1249,7 @@ mod tests {
     #[test]
     fn backend_selection_prefers_amf_for_windows_amd() {
         assert_eq!(
-            select_universal_encode_backend(UniversalBackendSelectionContext {
-                platform: RuntimePlatform::Windows,
-                gpu_vendor: "amd",
-            }),
+            select_universal_encode_backend(RuntimePlatform::Windows, "amd"),
             UniversalEncodeBackend::Amf
         );
     }
@@ -1563,10 +1257,7 @@ mod tests {
     #[test]
     fn backend_selection_prefers_nvenc_for_linux_nvidia() {
         assert_eq!(
-            select_universal_encode_backend(UniversalBackendSelectionContext {
-                platform: RuntimePlatform::Linux,
-                gpu_vendor: "nvidia",
-            }),
+            select_universal_encode_backend(RuntimePlatform::Linux, "nvidia"),
             UniversalEncodeBackend::Nvenc
         );
     }
@@ -1574,10 +1265,7 @@ mod tests {
     #[test]
     fn backend_selection_prefers_vaapi_for_linux_amd() {
         assert_eq!(
-            select_universal_encode_backend(UniversalBackendSelectionContext {
-                platform: RuntimePlatform::Linux,
-                gpu_vendor: "amd",
-            }),
+            select_universal_encode_backend(RuntimePlatform::Linux, "amd"),
             UniversalEncodeBackend::Vaapi
         );
     }
@@ -1585,24 +1273,15 @@ mod tests {
     #[test]
     fn backend_selection_uses_cpu_fallback_for_unknown_vendor() {
         assert_eq!(
-            select_universal_encode_backend(UniversalBackendSelectionContext {
-                platform: RuntimePlatform::Linux,
-                gpu_vendor: "unknown",
-            }),
+            select_universal_encode_backend(RuntimePlatform::Linux, "unknown"),
             UniversalEncodeBackend::CpuFallback
         );
     }
 
     #[test]
     fn linux_backend_selection_wires_to_expected_ffmpeg_hardware_encoders() {
-        let nvidia_backend = select_universal_encode_backend(UniversalBackendSelectionContext {
-            platform: RuntimePlatform::Linux,
-            gpu_vendor: "nvidia",
-        });
-        let amd_backend = select_universal_encode_backend(UniversalBackendSelectionContext {
-            platform: RuntimePlatform::Linux,
-            gpu_vendor: "amd",
-        });
+        let nvidia_backend = select_universal_encode_backend(RuntimePlatform::Linux, "nvidia");
+        let amd_backend = select_universal_encode_backend(RuntimePlatform::Linux, "amd");
 
         let nvidia_context = context(
             vec![VideoOp::NormalizeInput],
@@ -1615,10 +1294,10 @@ mod tests {
             FrameTransport::StdoutPipe,
         );
         let nvidia_command = universal_executor(nvidia_backend, &nvidia_context)
-            .build_command(&nvidia_context, LegacyStartupMode::LowLatency)
+            .build_command(&nvidia_context, StartupMode::LowLatency)
             .unwrap();
         let amd_command = universal_executor(amd_backend, &amd_context)
-            .build_command(&amd_context, LegacyStartupMode::LowLatency)
+            .build_command(&amd_context, StartupMode::LowLatency)
             .unwrap();
 
         assert_eq!(nvidia_backend, UniversalEncodeBackend::Nvenc);
@@ -1642,14 +1321,11 @@ mod tests {
             FrameTransport::StdoutPipe,
         );
         let executor = universal_executor(
-            select_universal_encode_backend(UniversalBackendSelectionContext {
-                platform: RuntimePlatform::Linux,
-                gpu_vendor: "unknown",
-            }),
+            select_universal_encode_backend(RuntimePlatform::Linux, "unknown"),
             &stage_context,
         );
         let command = executor
-            .build_command(&stage_context, LegacyStartupMode::LowLatency)
+            .build_command(&stage_context, StartupMode::LowLatency)
             .unwrap();
 
         assert!(has_subsequence(&command.args, &["-c:v", "libx265"]));
@@ -1690,12 +1366,10 @@ mod tests {
         );
         let executor = universal_executor(UniversalEncodeBackend::Nvenc, &stage_context);
         let command = executor
-            .build_command(&stage_context, LegacyStartupMode::Buffered)
+            .build_command(&stage_context, StartupMode::Buffered)
             .unwrap();
 
         let filter = filter_value(&command.args).expect("filter graph");
-        assert_eq!(command.stdin, StdinMode::Null);
-        assert_eq!(command.stdout, StdoutMode::Null);
         assert!(filter.contains("libplacebo="));
         assert!(filter.contains("w=3840"));
         assert!(filter.contains("h=2160"));
@@ -1729,18 +1403,10 @@ mod tests {
         );
         let executor = universal_executor(UniversalEncodeBackend::Vaapi, &stage_context);
         let command = executor
-            .build_command(&stage_context, LegacyStartupMode::LowLatency)
+            .build_command(&stage_context, StartupMode::LowLatency)
             .unwrap();
 
         let filter = filter_value(&command.args).expect("filter graph");
-        assert_eq!(
-            command.stdin,
-            StdinMode::Transport(FrameTransport::StdoutPipe)
-        );
-        assert_eq!(
-            command.stdout,
-            StdoutMode::Transport(FrameTransport::StdoutPipe)
-        );
         assert!(filter.contains("libplacebo="));
         assert!(filter.contains("format=nv12,hwupload"));
         assert!(has_subsequence(
@@ -1770,7 +1436,7 @@ mod tests {
         );
         let executor = universal_executor(UniversalEncodeBackend::Nvenc, &stage_context);
         let command = executor
-            .build_command(&stage_context, LegacyStartupMode::LowLatency)
+            .build_command(&stage_context, StartupMode::LowLatency)
             .unwrap();
 
         assert!(!command.args.iter().any(|arg| arg.contains("minterpolate")));
@@ -1792,7 +1458,7 @@ mod tests {
         executor_context.cas_strength = 0.5;
         let executor = UniversalExecutor::new(executor_context);
         let command = executor
-            .build_command(&stage_context, LegacyStartupMode::LowLatency)
+            .build_command(&stage_context, StartupMode::LowLatency)
             .unwrap();
 
         let filter = filter_value(&command.args).expect("cas filter graph");
@@ -1832,7 +1498,7 @@ mod tests {
         direct_executor_context.denoise = true;
         let direct_executor = UniversalExecutor::new(direct_executor_context);
         let direct_command = direct_executor
-            .build_command(&direct_context, LegacyStartupMode::LowLatency)
+            .build_command(&direct_context, StartupMode::LowLatency)
             .unwrap();
         let direct_filter = filter_value(&direct_command.args).expect("direct filter graph");
 
@@ -1848,7 +1514,7 @@ mod tests {
         staged_executor_context.denoise = true;
         let staged_executor = UniversalExecutor::new(staged_executor_context);
         let staged_command = staged_executor
-            .build_command(&staged_context, LegacyStartupMode::LowLatency)
+            .build_command(&staged_context, StartupMode::LowLatency)
             .unwrap();
         let staged_filter = filter_value(&staged_command.args).expect("staged filter graph");
 
@@ -1880,7 +1546,10 @@ mod tests {
             )
             .expect("artcnn filter graph");
 
-        assert_eq!(plan.output_resolution.as_deref(), Some("3840x2160"));
+        assert_eq!(
+            plan.libplacebo.output_resolution.as_deref(),
+            Some("3840x2160")
+        );
         assert!(filter_graph.contains("custom_shader_path=ArtCNN_C4F16.glsl"));
         assert!(filter_graph.contains("force_original_aspect_ratio=decrease"));
         assert!(filter_graph.contains("normalize_sar=true"));
@@ -1916,7 +1585,7 @@ mod tests {
         executor_context.cas_strength = 0.5;
         let executor = UniversalExecutor::new(executor_context);
         let command = executor
-            .build_command(&stage_context, LegacyStartupMode::LowLatency)
+            .build_command(&stage_context, StartupMode::LowLatency)
             .unwrap();
         let filter = filter_value(&command.args).expect("combined shader filter graph");
         let generated_shader = stage_context
@@ -1952,7 +1621,7 @@ mod tests {
             Some(std::path::Path::new("lib\\shaders\\artcnn")),
         );
 
-        assert!(plan.output_resolution.is_none());
+        assert!(plan.libplacebo.output_resolution.is_none());
         assert!(plan.custom_shader_paths.is_empty());
         assert!(!plan.has_libplacebo_processing());
     }
@@ -2026,7 +1695,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(plan.output_bit_depth, OutputBitDepth::Bit10);
+        assert_eq!(plan.libplacebo.output_bit_depth, OutputBitDepth::Bit10);
         assert!(plan.hdr_preprocess_owned);
         assert!(!plan.has_libplacebo_processing());
 
@@ -2115,7 +1784,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(plan.output_resolution.as_deref(), Some("3840x2160"));
+        assert_eq!(
+            plan.libplacebo.output_resolution.as_deref(),
+            Some("3840x2160")
+        );
         assert!(plan.hdr_preprocess_owned);
         // Resize causes libplacebo processing even though HDR is preprocess-owned.
         assert!(plan.has_libplacebo_processing());
@@ -2156,14 +1828,6 @@ mod tests {
         let executor = universal_executor(UniversalEncodeBackend::CpuFallback, &stage_context);
         let spec = executor.build_executor_spec(&stage_context, 1).unwrap();
 
-        assert_eq!(spec.kind, ExecutorKind::Universal);
-        assert_eq!(
-            spec.process.stdin,
-            StdinMode::Transport(FrameTransport::StdoutPipe)
-        );
-        assert_eq!(
-            spec.process.stdout,
-            StdoutMode::Transport(FrameTransport::StdoutPipe)
-        );
+        assert_eq!(spec.process.log_label, "ffmpeg-universal-cpu");
     }
 }

@@ -586,15 +586,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "combine"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3616,8 +3607,6 @@ name = "referee"
 version = "0.6.0"
 dependencies = [
  "axum",
- "cc",
- "cmake",
  "dashmap",
  "flate2",
  "open",
@@ -3626,6 +3615,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sevenz-rust",
+ "sha2",
  "sysinfo",
  "tar",
  "tauri",
@@ -3641,6 +3631,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.59.0",
  "xz2",
  "zip",
  "zstd",

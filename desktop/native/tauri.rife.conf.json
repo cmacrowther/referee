@@ -1,0 +1,13 @@
+{
+    "bundle": {
+        "externalBin": ["binaries/rife-worker"],
+        "linux": {
+            "deb": {
+                "depends": ["libvulkan1"]
+            },
+            "rpm": {
+                "depends": ["vulkan-loader"]
+            }
+        }
+    }
+}

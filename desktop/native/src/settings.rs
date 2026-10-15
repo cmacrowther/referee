@@ -1,4 +1,7 @@
-use crate::pipeline::{EncodingProfile, ExecutorPreference, MAX_VSR_QUALITY};
+use crate::pipeline::{
+    EncodingProfile, ExecutorPreference, FramegenEngine, FramegenTarget, MAX_VSR_QUALITY,
+};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -22,6 +25,27 @@ impl Default for PlayerSettings {
             selected_player: None,
             custom_path: None,
         }
+    }
+}
+
+/// Masks credentials in a top-level settings value before it is logged. Logs
+/// are shared for troubleshooting, and the API token and relay control token
+/// each grant control of a REFEREE instance.
+fn redact_setting_for_log(key: &str, value: &serde_json::Value) -> serde_json::Value {
+    const REDACTED: &str = "<redacted>";
+    match key {
+        "apiToken" if !value.is_null() => serde_json::Value::from(REDACTED),
+        "relay" => {
+            let mut relay = value.clone();
+            if let Some(token) = relay
+                .get_mut("remoteToken")
+                .filter(|token| !token.is_null())
+            {
+                *token = serde_json::Value::from(REDACTED);
+            }
+            relay
+        }
+        _ => value.clone(),
     }
 }
 
@@ -135,6 +159,18 @@ pub struct Settings {
     pub resolution: String,
     pub quality: u8,
     pub framegen: bool,
+    #[serde(
+        rename = "framegenTarget",
+        default,
+        deserialize_with = "deserialize_or_default"
+    )]
+    pub framegen_target: FramegenTarget,
+    #[serde(
+        rename = "framegenEngine",
+        default,
+        deserialize_with = "deserialize_or_default"
+    )]
+    pub framegen_engine: FramegenEngine,
     pub hdr: bool,
     #[serde(rename = "executorPreference", default)]
     pub executor_preference: ExecutorPreference,
@@ -169,6 +205,8 @@ impl Default for Settings {
             resolution: "1920x1080".to_string(),
             quality: 2,
             framegen: true,
+            framegen_target: FramegenTarget::default(),
+            framegen_engine: FramegenEngine::default(),
             hdr: true,
             executor_preference: ExecutorPreference::Auto,
             always_on_top: false,
@@ -183,6 +221,17 @@ impl Default for Settings {
             api_token: None,
         }
     }
+}
+
+/// Reads a field, falling back to its default for unknown values so one bad
+/// field does not fail the whole settings file.
+fn deserialize_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 impl Settings {
@@ -279,7 +328,11 @@ impl SettingsManager {
                     for (k, new_val) in new_map.iter() {
                         let prev_val = prev_map.get(k);
                         if prev_val != Some(new_val) {
-                            info!("[Settings]: Setting changed: {} = {}", k, new_val);
+                            info!(
+                                "[Settings]: Setting changed: {} = {}",
+                                k,
+                                redact_setting_for_log(k, new_val)
+                            );
                         }
                     }
                 }
@@ -334,6 +387,16 @@ impl SettingsManager {
             apply_str!(obj, "resolution", current.resolution);
             apply_u8!(obj, "quality", current.quality);
             apply_bool!(obj, "framegen", current.framegen);
+            if let Some(v) = obj.get("framegenTarget") {
+                if let Ok(target) = serde_json::from_value::<FramegenTarget>(v.clone()) {
+                    current.framegen_target = target;
+                }
+            }
+            if let Some(v) = obj.get("framegenEngine") {
+                if let Ok(engine) = serde_json::from_value::<FramegenEngine>(v.clone()) {
+                    current.framegen_engine = engine;
+                }
+            }
             apply_bool!(obj, "hdr", current.hdr);
 
             if let Some(v) = obj.get("executorPreference") {
@@ -420,7 +483,32 @@ impl SettingsManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApprovedOriginMeta, RelayPeerMetadata, RelaySettings, Settings, SettingsManager};
+    use super::{
+        ApprovedOriginMeta, FramegenEngine, FramegenTarget, RelayPeerMetadata, RelaySettings,
+        Settings, SettingsManager,
+    };
+
+    #[test]
+    fn setting_change_log_redacts_tokens() {
+        let relay = serde_json::json!({
+            "enabled": true,
+            "linkedPeerIp": "192.168.1.25",
+            "remoteToken": "relay-secret"
+        });
+        let logged = super::redact_setting_for_log("relay", &relay).to_string();
+        assert!(!logged.contains("relay-secret"));
+        assert!(logged.contains("192.168.1.25"));
+
+        let api_token = serde_json::json!("api-secret");
+        let logged = super::redact_setting_for_log("apiToken", &api_token).to_string();
+        assert!(!logged.contains("api-secret"));
+
+        let resolution = serde_json::json!("3840x2160");
+        assert_eq!(
+            super::redact_setting_for_log("resolution", &resolution),
+            resolution
+        );
+    }
 
     #[test]
     fn approved_origin_meta_serializes_with_camel_case_keys() {
@@ -509,6 +597,42 @@ mod tests {
         let path = std::env::temp_dir().join(format!("referee-test-{}.json", uuid::Uuid::new_v4()));
         let manager = SettingsManager::new(&path);
         assert!(manager.get().api_token.is_none());
+    }
+
+    #[test]
+    fn framegen_target_defaults_and_tolerates_unknown_values() {
+        let mut json = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(json["framegenTarget"], "60fps");
+        assert_eq!(json["framegenEngine"], "opticalFlow");
+
+        // A config written before the field existed, or with a bad value,
+        // still loads instead of resetting every setting.
+        json.as_object_mut().unwrap().remove("framegenTarget");
+        let parsed: Settings = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(parsed.framegen_target, FramegenTarget::Fps60);
+        json["framegenTarget"] = serde_json::json!("999fps");
+        json["quality"] = serde_json::json!(3);
+        let parsed: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.framegen_target, FramegenTarget::Fps60);
+        assert_eq!(parsed.quality, 3);
+    }
+
+    #[test]
+    fn settings_manager_merge_and_update_applies_framegen_target() {
+        let path = std::env::temp_dir().join(format!("referee-test-{}.json", uuid::Uuid::new_v4()));
+        let manager = SettingsManager::new(&path);
+
+        let updated = manager.merge_and_update(serde_json::json!({
+            "framegenTarget": "matchDisplay",
+            "framegenEngine": "nvidiaFramegen"
+        }));
+        assert_eq!(updated.framegen_target, FramegenTarget::MatchDisplay);
+        assert_eq!(updated.framegen_engine, FramegenEngine::NativeDouble);
+
+        // Unknown values leave the current target in place.
+        let updated = manager.merge_and_update(serde_json::json!({ "framegenTarget": "999fps" }));
+        assert_eq!(updated.framegen_target, FramegenTarget::MatchDisplay);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

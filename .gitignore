@@ -5,6 +5,9 @@ node_modules/
 dist/
 lib/
 desktop/native/target/
+desktop/native/rife-worker/target/
+desktop/native/rife-worker/vendor/
+desktop/native/binaries/
 desktop/native/gen/
 !desktop/ui/src/lib/
 !desktop/ui/src/lib/**

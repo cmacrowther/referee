@@ -23,6 +23,7 @@ import {
     hasLiveSession,
     hasPendingSession,
     getStandbyFrameRateLabel,
+    getFramegenEngineOptions,
     getFrameRateTone,
     getGpuTone,
     getActiveStreamBody,
@@ -45,6 +46,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
         sourceFps: null,
         targetFps: null,
         framegenEnabled: false,
+        framegenEngine: null,
         hdrEnabled: false,
         qualityLevel: null,
         executor: null,
@@ -818,6 +820,78 @@ describe('getStandbyFrameRateLabel', () => {
     it('returns "Native" when framegen is off', () => {
         expect(getStandbyFrameRateLabel({ ...DEFAULT_SETTINGS, framegen: false })).toBe('Native')
     })
+
+    it('reflects the frame generation target and engine', () => {
+        expect(getStandbyFrameRateLabel({ ...DEFAULT_SETTINGS, framegenTarget: '30fps' })).toBe('Up to 30 FPS')
+        expect(getStandbyFrameRateLabel({ ...DEFAULT_SETTINGS, framegenTarget: 'matchDisplay' })).toBe('Match Display')
+        expect(
+            getStandbyFrameRateLabel({ ...DEFAULT_SETTINGS, framegenTarget: '30fps', framegenEngine: 'nativeDouble' })
+        ).toBe('2x Source')
+    })
+})
+
+describe('frame generation settings', () => {
+    it('normalizes unknown targets and engines to the defaults', () => {
+        const settings = normalizeSettings({
+            framegenTarget: '120fps' as never,
+            framegenEngine: 'magic' as never,
+        })
+        expect(settings.framegenTarget).toBe('60fps')
+        expect(settings.framegenEngine).toBe('opticalFlow')
+        expect(normalizeSettings({ framegenTarget: 'matchDisplay', framegenEngine: 'nativeDouble' })).toMatchObject({
+            framegenTarget: 'matchDisplay',
+            framegenEngine: 'nativeDouble',
+        })
+        // Saved before AMD Fluid Motion, when doubling was NVIDIA-only.
+        expect(normalizeSettings({ framegenEngine: 'nvidiaFramegen' as never }).framegenEngine).toBe('nativeDouble')
+    })
+
+    it('offers native doubling on the vendor paths when the encoder reports it', () => {
+        const available = (status: Status, path: 'nvidiaNative' | 'amdNative') =>
+            Object.fromEntries(getFramegenEngineOptions(status, path).map(option => [option.value, option.available]))
+        const doubleLabel = (path: 'nvidiaNative' | 'amdNative') =>
+            getFramegenEngineOptions(DEFAULT_STATUS, path).find(option => option.value === 'nativeDouble')?.label
+
+        expect(available({ ...DEFAULT_STATUS, encoderHasNativeDouble: true, encoderHasRife: true }, 'nvidiaNative')).toEqual({
+            opticalFlow: true,
+            rife: true,
+            nativeDouble: true,
+        })
+        expect(available({ ...DEFAULT_STATUS, encoderHasNativeDouble: false }, 'nvidiaNative').nativeDouble).toBe(false)
+        expect(doubleLabel('nvidiaNative')).toBe('Double via NVIDIA Framegen')
+
+        expect(available({ ...DEFAULT_STATUS, gpuVendor: 'amd', encoderHasNativeDouble: true }, 'amdNative').nativeDouble).toBe(true)
+        expect(available({ ...DEFAULT_STATUS, gpuVendor: 'amd', encoderHasNativeDouble: false }, 'amdNative').nativeDouble).toBe(false)
+        expect(doubleLabel('amdNative')).toBe('Double via AMD Fluid Motion')
+
+        expect(
+            getFramegenEngineOptions({ ...DEFAULT_STATUS, encoderHasNativeDouble: true }, 'universal').map(option => option.value)
+        ).not.toContain('nativeDouble')
+    })
+
+    it('offers RIFE on every path when rife-worker and a model are present', () => {
+        const options = (status: Status, path: 'amdNative' | 'universal') =>
+            getFramegenEngineOptions(status, path).map(option => [option.value, option.label, option.available])
+
+        expect(options({ ...DEFAULT_STATUS, gpuVendor: 'amd', encoderHasRife: true }, 'amdNative')).toEqual([
+            ['opticalFlow', 'FFmpeg Motion Interpolation', true],
+            ['rife', 'RIFE', true],
+            ['nativeDouble', 'Double via AMD Fluid Motion', false],
+        ])
+        expect(options({ ...DEFAULT_STATUS, gpuVendor: 'amd', encoderHasRife: true }, 'universal')).toEqual([
+            ['opticalFlow', 'FFmpeg Motion Interpolation', true],
+            ['rife', 'RIFE', true],
+        ])
+        expect(options({ ...DEFAULT_STATUS, gpuVendor: 'nvidia', encoderHasRife: true }, 'universal')).toEqual([
+            ['opticalFlow', 'Optical Flow (FRUC)', false],
+            ['rife', 'RIFE', true],
+        ])
+        expect(options({ ...DEFAULT_STATUS, gpuVendor: 'amd', encoderHasRife: false }, 'amdNative')[1]).toEqual([
+            'rife',
+            'RIFE',
+            false,
+        ])
+    })
 })
 
 // ─── getFrameRateTone ─────────────────────────────────────────────────────────
@@ -941,6 +1015,45 @@ describe('deriveSettingsUiCapabilities', () => {
         expect(caps.resolvedPath.kind).toBe('amdNative')
         expect(caps.features.upscale.support).toBe('native')
         expect(caps.advancedEncoding.profileShape).toBe('generic')
+    })
+
+    it('resolves the backend AmdSpecialized executor to the AMD path with native FRC and HDR', () => {
+        const status = makeStatus({
+            gpuName: 'RX 7900',
+            gpuVendor: 'amd',
+            selectedExecutor: 'amdSpecialized',
+            amdAiAvailable: true,
+            encoderHasNativeDouble: true,
+            encoderHasHdrTonemap: true,
+        })
+        const caps = deriveSettingsUiCapabilities(DEFAULT_SETTINGS, status, false)
+        expect(caps.resolvedPath).toMatchObject({ kind: 'amdNative', label: 'AMD® Native' })
+        expect(caps.features.upscale.sourceLabel).toBe('AMD® FSR upscale')
+        expect(caps.features.framegen).toMatchObject({ support: 'native', sourceLabel: 'AMD® Fluid Motion' })
+        expect(caps.features.hdr).toMatchObject({ support: 'native', sourceLabel: 'AMD® HDR mapping' })
+    })
+
+    it('keeps AMD on fallback motion and HDR without FRC or VCEEncC tonemapping', () => {
+        const status = makeStatus({
+            gpuVendor: 'amd',
+            selectedExecutor: 'amdSpecialized',
+            amdAiAvailable: true,
+            encoderHasNativeDouble: false,
+            encoderHasHdrTonemap: false,
+            encoderHasRife: false,
+        })
+        const caps = deriveSettingsUiCapabilities(DEFAULT_SETTINGS, status, false)
+        expect(caps.features.framegen).toMatchObject({ support: 'fallback', sourceLabel: 'FFmpeg motion interpolation' })
+        expect(caps.features.hdr).toMatchObject({ support: 'fallback', sourceLabel: 'REFEREE HDR mapping' })
+    })
+
+    it('treats a Universal executor on an AMD GPU as the Universal path', () => {
+        const status = makeStatus({
+            gpuVendor: 'amd',
+            selectedExecutor: 'universal',
+            amdAiAvailable: true,
+        })
+        expect(deriveSettingsUiCapabilities(DEFAULT_SETTINGS, status, false).resolvedPath.kind).toBe('universal')
     })
 
     it('resolves universal path when selectedExecutor is universal', () => {

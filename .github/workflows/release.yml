@@ -77,7 +77,9 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: desktop/native -> target
+          workspaces: |
+            desktop/native -> target
+            desktop/native/rife-worker -> target
 
       - name: Install Linux system dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -94,6 +96,12 @@ jobs:
       - name: Run Rust unit tests
         working-directory: desktop/native
         run: cargo test --features headless --no-default-features
+
+      # Frame scheduling, NUT sniffing, and FFmpeg arguments; the ncnn engine
+      # is built by the release build.
+      - name: Run rife-worker unit tests
+        working-directory: desktop/native/rife-worker
+        run: cargo test --no-default-features --locked
 
   test-ui:
     needs: check-version
@@ -153,7 +161,9 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: desktop/native -> target
+          workspaces: |
+            desktop/native -> target
+            desktop/native/rife-worker -> target
 
       - name: Install Linux system dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -166,6 +176,7 @@ jobs:
             patchelf \
             libssl-dev \
             build-essential \
+            cmake \
             rpm
 
       - name: Install dependencies

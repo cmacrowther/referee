@@ -3,15 +3,17 @@
 
 #include "rife_c.h"
 
-// Pull in the RIFE C++ class from the vendored submodule.
-#include "../vendor/vs-rife/RIFE/rife.h"
+#include "rife.h"  // vendor/vs-rife/RIFE
 
 // ncnn GPU lifecycle.
+#include "gpu.h"
 #include "net.h"
 
 #include <string>
-#include <cstring>
-#include <stdexcept>
+
+#if _WIN32
+#include <windows.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // Internal helpers: derive RIFE constructor parameters from model path
@@ -19,7 +21,7 @@
 
 static bool detect_rife_v4(const std::string& path)
 {
-    // Matches VapourSynth plugin logic (plugin.cpp ~line 527-537).
+    // Matches VapourSynth plugin logic.
     if (path.find("rife-v2")   != std::string::npos) return false;
     if (path.find("rife-v3.9") != std::string::npos) return true;   // 3.9 uses v4 flow
     if (path.find("rife-v3")   != std::string::npos) return false;
@@ -53,7 +55,7 @@ extern "C" {
 
 int rife_init_gpu(void)
 {
-    return ncnn::create_gpu_instance() ? 1 : 0;
+    return ncnn::create_gpu_instance() == 0 ? 0 : 1;
 }
 
 void rife_cleanup_gpu(void)
@@ -63,12 +65,24 @@ void rife_cleanup_gpu(void)
 
 int rife_gpu_count(void)
 {
-    return static_cast<int>(ncnn::get_gpu_count());
+    return ncnn::get_gpu_count();
+}
+
+int rife_default_gpu(void)
+{
+    return ncnn::get_default_gpu_index();
+}
+
+const char* rife_gpu_name(int gpuid)
+{
+    if (gpuid < 0 || gpuid >= ncnn::get_gpu_count()) return nullptr;
+    return ncnn::get_gpu_info(gpuid).device_name();
 }
 
 RifeHandle rife_create(int gpuid, const char* model_dir)
 {
     if (!model_dir) return nullptr;
+    if (gpuid < 0) gpuid = ncnn::get_default_gpu_index();
 
     std::string modelPath(model_dir);
     bool rv4     = detect_rife_v4(modelPath);
@@ -80,10 +94,7 @@ RifeHandle rife_create(int gpuid, const char* model_dir)
         rife = new RIFE(gpuid, /*tta_mode=*/false, /*uhd_mode=*/false,
                         /*num_threads=*/1, rv2, rv4, padding);
 #if _WIN32
-        // Windows path: wstring required by RIFE::load() on Windows.
-        // The path coming from Rust is already a UTF-8 absolute path; convert
-        // to wstring via std::mbstowcs for the ASCII-safe fast path or use the
-        // MultiByteToWideChar Win32 API for correct UTF-8 → UTF-16 conversion.
+        // RIFE::load takes a wide path on Windows.
         int wlen = MultiByteToWideChar(CP_UTF8, 0, model_dir, -1, nullptr, 0);
         if (wlen <= 0) { delete rife; return nullptr; }
         std::wstring wmodelPath(static_cast<size_t>(wlen - 1), L'\0');
@@ -109,7 +120,7 @@ int rife_process_v4(
     float timestep)
 {
     if (!handle) return -1;
-    RIFE* rife = static_cast<RIFE*>(handle);
+    const RIFE* rife = static_cast<const RIFE*>(handle);
     return rife->process_v4(
         src0R, src0G, src0B,
         src1R, src1G, src1B,

@@ -11,21 +11,38 @@ use tracing::{info, trace, warn};
 const STDERR_TAIL_LIMIT: usize = 64_000;
 const STDERR_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Read size for stage-to-stage bridges. Rawvideo NUT between the normalizer,
+/// preprocessor, and executor runs at hundreds of MB/s (1080p60 yuv420p is
+/// about 187 MB/s). On Windows every child-pipe read and write is a
+/// blocking-pool round trip, so `tokio::io::copy`'s 8 KiB buffer meant tens of
+/// thousands of hops per second per bridge. Reads still return as soon as any
+/// bytes are available, so the larger buffer adds no latency.
+const BRIDGE_BUFFER_BYTES: usize = 1024 * 1024;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PipelineStageId {
-    Relay,
     Normalizer,
     Preprocess,
     Executor,
     Packager,
 }
 
+impl PipelineStageId {
+    /// Executors are ready once the client heartbeats; every other stage is
+    /// ready as soon as it spawns. Readiness is diagnostic only.
+    pub fn default_readiness_policy(self) -> PipelineStageReadinessPolicy {
+        match self {
+            Self::Executor => PipelineStageReadinessPolicy::ReadyOnHeartbeat,
+            Self::Normalizer | Self::Preprocess | Self::Packager => {
+                PipelineStageReadinessPolicy::ReadyOnSpawn
+            }
+        }
+    }
+}
+
 impl fmt::Display for PipelineStageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
-            Self::Relay => "relay",
             Self::Normalizer => "normalizer",
             Self::Preprocess => "preprocess",
             Self::Executor => "executor",
@@ -68,7 +85,6 @@ pub struct PipelineStageReport {
     pub stage: PipelineStageId,
     pub state: PipelineStageState,
     pub readiness: PipelineStageReadiness,
-    pub exit_code: Option<i32>,
     pub stderr_tail: String,
 }
 
@@ -118,12 +134,25 @@ fn is_ffmpeg_progress_field(line: &str) -> bool {
 /// Retains only the trailing `STDERR_TAIL_LIMIT` bytes of a stderr capture buffer.
 ///
 /// Called after every append to keep memory bounded without losing the most recent output,
-/// which is the part most useful for diagnosing failures.
+/// which is the part most useful for diagnosing failures. The cut is moved forward to a
+/// character boundary: slicing mid-character panicked the reader task, which stopped
+/// draining the child's stderr pipe and eventually blocked the child.
 fn truncate_stderr_buffer(buf: &mut String) {
     if buf.len() > STDERR_TAIL_LIMIT {
-        let tail = buf[buf.len() - STDERR_TAIL_LIMIT..].to_string();
-        *buf = tail;
+        let mut cut = buf.len() - STDERR_TAIL_LIMIT;
+        while !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        buf.drain(..cut);
     }
+}
+
+/// Appends one stderr line to the tail buffer.
+fn append_stderr_line(buffer: &Mutex<String>, line: &str) {
+    let mut output = buffer.lock().unwrap();
+    output.push_str(line);
+    output.push('\n');
+    truncate_stderr_buffer(&mut output);
 }
 
 impl StageStderrHandle {
@@ -188,10 +217,7 @@ impl StageStderrHandle {
                                                     stage, label, trimmed
                                                 );
                                             }
-                                            let mut output = buffer.lock().unwrap();
-                                            output.push_str(trimmed);
-                                            output.push('\n');
-                                            truncate_stderr_buffer(&mut output);
+                                            append_stderr_line(&buffer, trimmed);
                                         }
                                         if let Some(tx) = sentinel_tx.take() {
                                             if trimmed.contains(sentinel_str.as_str()) {
@@ -253,10 +279,7 @@ impl StageStderrHandle {
                                         if !suppressed {
                                             info!("[Pipeline:{}:{}]: {}", stage, label, trimmed);
                                         }
-                                        let mut output = buffer.lock().unwrap();
-                                        output.push_str(trimmed);
-                                        output.push('\n');
-                                        truncate_stderr_buffer(&mut output);
+                                        append_stderr_line(&buffer, trimmed);
                                     }
                                     // Filtered mode still honours readiness sentinels so it can
                                     // be used on sentinel-gated stages without special-casing.
@@ -357,15 +380,13 @@ impl StageStderrHandle {
                                                 );
                                                 let cpu_pct = sys.global_cpu_usage().round() as u8;
 
-                                                // Query GPU utilisation for NVIDIA backends.
+                                                // GPU utilisation for NVIDIA backends comes from
+                                                // the shared background sampler. Awaiting
+                                                // nvidia-smi here stopped this task draining
+                                                // stderr, which can block FFmpeg on a full pipe.
                                                 let gpu_pct: Option<u8> =
                                                     if gpu_vendor.as_deref() == Some("nvidia") {
-                                                        tokio::task::spawn_blocking(|| {
-                                                            crate::gpu::read_utilization("nvidia")
-                                                        })
-                                                        .await
-                                                        .ok()
-                                                        .flatten()
+                                                        crate::gpu::latest_utilization("nvidia")
                                                     } else {
                                                         None
                                                     };
@@ -380,10 +401,7 @@ impl StageStderrHandle {
                                                 msg.push_str(&format!(", CPU {}%", cpu_pct));
 
                                                 info!("[Pipeline:{}:{}]: {}", stage, label, msg);
-                                                let mut output = buffer.lock().unwrap();
-                                                output.push_str(&msg);
-                                                output.push('\n');
-                                                truncate_stderr_buffer(&mut output);
+                                                append_stderr_line(&buffer, &msg);
                                             }
                                         }
                                         // Other known fields (speed, dup_frames, drop_frames,
@@ -391,10 +409,7 @@ impl StageStderrHandle {
                                     } else if !trimmed.is_empty() {
                                         // Regular log line (FFmpeg warnings/errors) — log as-is.
                                         info!("[Pipeline:{}:{}]: {}", stage, label, trimmed);
-                                        let mut output = buffer.lock().unwrap();
-                                        output.push_str(trimmed);
-                                        output.push('\n');
-                                        truncate_stderr_buffer(&mut output);
+                                        append_stderr_line(&buffer, trimmed);
                                     }
                                 }
                                 Ok(None) | Err(_) => break,
@@ -428,7 +443,6 @@ impl StageStderrHandle {
 pub struct PipelineChildHandle {
     child: Child,
     stderr: StageStderrHandle,
-    exit_code: Option<i32>,
 }
 
 impl PipelineChildHandle {
@@ -452,12 +466,7 @@ impl PipelineChildHandle {
         Self {
             child,
             stderr: StageStderrHandle::spawn(stage, label.into(), stderr, mode, sentinel),
-            exit_code: None,
         }
-    }
-
-    fn exit_code(&self) -> Option<i32> {
-        self.exit_code
     }
 
     fn stderr_tail(&self) -> String {
@@ -465,13 +474,9 @@ impl PipelineChildHandle {
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<Option<i32>>> {
-        self.child.try_wait().map(|status| {
-            status.map(|status| {
-                let exit_code = status.code();
-                self.exit_code = exit_code;
-                exit_code
-            })
-        })
+        self.child
+            .try_wait()
+            .map(|status| status.map(|status| status.code()))
     }
 
     async fn kill(&mut self) {
@@ -636,13 +641,8 @@ impl PipelineStageHandle {
         }
     }
 
-    /// Mark the stage as exited and store its process exit code.
-    ///
-    /// # Examples
-    ///
-    fn mark_exited(&mut self, exit_code: Option<i32>) {
+    fn mark_exited(&mut self) {
         self.state = PipelineStageState::Exited;
-        self.child.exit_code = exit_code;
     }
 
     fn mark_timed_out(&mut self) {
@@ -658,7 +658,6 @@ impl PipelineStageHandle {
             stage: self.stage,
             state: self.state,
             readiness: self.readiness,
-            exit_code: self.child.exit_code(),
             stderr_tail: self.child.stderr_tail(),
         }
     }
@@ -711,11 +710,12 @@ impl PipelineStageConnection {
     fn spawn(
         upstream: PipelineStageId,
         downstream: PipelineStageId,
-        mut stdout: ChildStdout,
+        stdout: ChildStdout,
         mut stdin: ChildStdin,
     ) -> Self {
         let task = tokio::spawn(async move {
-            match tokio::io::copy(&mut stdout, &mut stdin).await {
+            let mut stdout = BufReader::with_capacity(BRIDGE_BUFFER_BYTES, stdout);
+            match tokio::io::copy_buf(&mut stdout, &mut stdin).await {
                 Ok(bytes) => {
                     trace!(
                         "[Pipeline:{}->{}]: forwarded {} bytes before closing the bridge.",
@@ -847,7 +847,7 @@ impl PipelineSupervisor {
         loop {
             if let Some((stage_index, exit_code)) = self.poll_exited_stage() {
                 let stage = self.stages[stage_index].stage();
-                self.stages[stage_index].mark_exited(exit_code);
+                self.stages[stage_index].mark_exited();
                 self.kill_other_stages(stage_index).await;
                 self.abort_all_connections().await;
                 self.stages[stage_index].child.flush_stderr().await;

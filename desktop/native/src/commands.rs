@@ -510,7 +510,7 @@ async fn probe_relay_peer_at_url(
 }
 
 async fn resolve_linked_relay_status(
-    client: &reqwest::Client,
+    server_state: &crate::server::ServerState,
     settings: &Settings,
 ) -> LinkedRelayStatus {
     let linked = relay_link_is_configured(settings);
@@ -532,43 +532,30 @@ async fn resolve_linked_relay_status(
         };
     }
 
-    let Some(ip) = saved_peer.ip.clone() else {
+    if saved_peer.ip.is_none() {
         return LinkedRelayStatus {
             linked: true,
             available: Some(false),
             peer: Some(saved_peer),
             reason: Some("Linked relay peer is missing an IP address.".to_string()),
         };
-    };
+    }
 
-    match probe_relay_peer(
-        client,
-        &ip,
-        std::time::Duration::from_millis(RELAY_STATUS_TIMEOUT_MS),
+    // Shares the server's cached link probe with status polling, which also
+    // rebinds the link when the peer has moved to a new address.
+    match crate::server::linked_relay_peer(
+        server_state,
+        &settings.relay,
+        crate::server::RelayLinkFreshness::Cached,
     )
     .await
     {
-        Ok(live_peer) => {
-            let live_metadata = relay_peer_metadata(&live_peer);
-
-            if !relay_identity_matches_link(&saved_peer, &live_peer) {
-                return LinkedRelayStatus {
-                    linked: true,
-                    available: Some(false),
-                    peer: Some(live_metadata),
-                    reason: Some(
-                        "A different REFEREE instance responded at the linked address.".to_string(),
-                    ),
-                };
-            }
-
-            LinkedRelayStatus {
-                linked: true,
-                available: Some(true),
-                peer: Some(live_metadata),
-                reason: None,
-            }
-        }
+        Ok(live_peer) => LinkedRelayStatus {
+            linked: true,
+            available: Some(true),
+            peer: Some(live_peer),
+            reason: None,
+        },
         Err(error) => LinkedRelayStatus {
             linked: true,
             available: Some(false),
@@ -689,6 +676,8 @@ fn stream_settings_patch(settings: &serde_json::Value) -> serde_json::Value {
         "resolution",
         "quality",
         "framegen",
+        "framegenTarget",
+        "framegenEngine",
         "hdr",
         "executorPreference",
         "encodingProfiles",
@@ -827,6 +816,14 @@ pub async fn discover_lan_peers(state: State<'_, AppState>) -> Result<Vec<RelayP
         }
     }
 
+    // A scan that finds the linked peer at a new address (a DHCP move) repoints
+    // the relay link now instead of waiting for a failed probe to rescan.
+    crate::server::adopt_moved_relay_peer(
+        &state.server_state,
+        peers.iter().map(relay_peer_metadata).collect(),
+    )
+    .await;
+
     Ok(dedupe_and_filter_relay_peers(peers, local_instance_id))
 }
 
@@ -835,7 +832,7 @@ pub async fn get_linked_relay_status(
     state: State<'_, AppState>,
 ) -> Result<LinkedRelayStatus, String> {
     let settings = state.settings_manager.get();
-    Ok(resolve_linked_relay_status(&state.http_client, &settings).await)
+    Ok(resolve_linked_relay_status(&state.server_state, &settings).await)
 }
 
 #[tauri::command]
@@ -898,7 +895,7 @@ pub async fn stop_stream(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    server::stop_tracked_session(&session_id, &state.server_state.sessions).await?;
+    server::stop_tracked_session(&session_id, &state.server_state.sessions).await;
 
     if state.server_state.sessions.is_empty() {
         if let Some(window) = app.get_webview_window(crate::tray::STREAM_PLAYER_WINDOW_LABEL) {
@@ -920,7 +917,8 @@ pub async fn stop_stream(
         caps.as_ref(),
         setup_complete,
     );
-    let status = server::apply_status_readiness(status, &gpu, &settings, setup_complete).await;
+    let status =
+        server::finalize_status(&state.server_state, status, &gpu, &settings, setup_complete).await;
     serde_json::to_value(status).map_err(|e| e.to_string())
 }
 
@@ -963,6 +961,17 @@ pub async fn retry_setup(app: AppHandle, state: State<'_, AppState>) -> Result<(
     let setup_done = state.setup_done.clone();
     let setup_state = state.setup_state.clone();
     let http_client = state.http_client.clone();
+
+    if !server_state.sessions.is_empty() {
+        return Err("Stop active streams before updating video dependencies".to_string());
+    }
+    {
+        let mut lifecycle = setup_state.lock().expect("setup state poisoned");
+        if lifecycle.in_progress {
+            return Ok(());
+        }
+        lifecycle.in_progress = true;
+    }
 
     run_setup_download(
         app,
@@ -1145,9 +1154,9 @@ async fn build_setup_response(state: &AppState) -> RendererReadyResponse {
 ///
 fn initial_setup_progress(gpu_vendor: &str) -> deps::SetupProgress {
     let detail = match gpu_vendor {
-        "nvidia" => "Preparing NVEncC download...",
-        "amd" => "Preparing VCEEncC download...",
-        _ => "Preparing required binaries...",
+        "nvidia" => "Checking NVEncC and video dependency updates...",
+        "amd" => "Checking VCEEncC and video dependency updates...",
+        _ => "Checking video dependency updates...",
     };
 
     deps::SetupProgress {
@@ -1185,6 +1194,9 @@ async fn run_setup_download(
     http_client: reqwest::Client,
 ) -> Result<(), String> {
     let initial_progress = initial_setup_progress(&gpu_vendor);
+    server_state
+        .setup_complete
+        .store(false, std::sync::atomic::Ordering::Release);
 
     {
         let mut state = setup_state.lock().expect("setup state poisoned");
@@ -1207,7 +1219,7 @@ async fn run_setup_download(
         {
             let mut state = progress_state.lock().expect("setup state poisoned");
             state.progress = Some(progress.clone());
-            state.complete = progress.phase == "done";
+            state.complete = false;
             state.error = None;
         }
         let _ = progress_app.emit("setup-progress", &progress);
@@ -1226,24 +1238,16 @@ async fn run_setup_download(
             *server_state.gpu_info.write().await = new_gpu;
 
             // Detect and cache encoder capabilities now that the binary is present.
-            let (backend, enc_path, rife_worker_path) = {
+            let (backend, enc_path, rife) = {
                 let g = server_state.gpu_info.read().await;
-                (
-                    g.backend.clone(),
-                    g.encoder_path.clone(),
-                    g.rife_worker_path.clone(),
-                )
+                (g.backend.clone(), g.encoder_path.clone(), g.has_rife())
             };
             if let (Some(backend), Some(enc_path)) = (backend, enc_path) {
-                let rife = rife_worker_path
-                    .as_deref()
-                    .map(crate::pipeline::detect_rife_capability)
-                    .unwrap_or(false);
                 let caps = crate::pipeline::detect_encoder_capabilities(&enc_path, &backend)
                     .with_rife(rife);
                 info!(
-                    "[Setup]: Encoder capabilities — fruc={}, truehdr={}, rife={}",
-                    caps.has_fruc, caps.has_truehdr, caps.has_rife
+                    "[Setup]: Encoder capabilities — fruc={}, native-double={}, truehdr={}, rife={}",
+                    caps.has_fruc, caps.has_native_double, caps.has_truehdr, caps.has_rife
                 );
                 *server_state.encoder_capabilities.write().await = Some(caps);
             }
@@ -1260,10 +1264,10 @@ async fn run_setup_download(
                 });
             }
 
-            setup_done.notify_one();
             server_state
                 .setup_complete
                 .store(true, std::sync::atomic::Ordering::Release);
+            setup_done.notify_one();
             let _ = app.emit("setup-complete", ());
             Ok(())
         }
@@ -1291,10 +1295,10 @@ pub async fn get_setup_state(state: State<'_, AppState>) -> Result<RendererReady
     Ok(build_setup_response(state.inner()).await)
 }
 
-/// Handle the renderer's "ready" signal and ensure setup is started when required.
+/// Handle the renderer's "ready" signal and start the launch dependency check once.
 ///
-/// This inspects whether required binaries are present for the detected GPU, updates the shared
-/// setup lifecycle state, spawns the background setup task if setup is needed and hasn't started,
+/// This updates the shared setup lifecycle state and spawns the dependency update
+/// task for supported hardware if the launch check has not started,
 /// and returns a snapshot describing current setup and GPU readiness.
 ///
 /// # Returns
@@ -1314,15 +1318,13 @@ pub async fn renderer_ready(
         let _ = window.show();
     }
 
-    let lib_dir = state.lib_dir.clone();
     let gpu = state.server_state.gpu_info.read().await.clone();
-    let setup_needed =
-        is_supported_setup_vendor(&gpu.vendor) && !deps::binaries_ready(&lib_dir, &gpu.vendor);
+    let supported = is_supported_setup_vendor(&gpu.vendor);
     let mut should_spawn_setup = false;
-    let setup_snapshot = {
+    {
         let mut setup_state = state.setup_state.lock().expect("setup state poisoned");
 
-        if setup_needed {
+        if supported {
             if !setup_state.has_started && !setup_state.in_progress {
                 setup_state.has_started = true;
                 setup_state.in_progress = true;
@@ -1346,11 +1348,9 @@ pub async fn renderer_ready(
                 },
             });
         }
+    }
 
-        setup_state.clone()
-    };
-
-    if setup_needed && should_spawn_setup {
+    if should_spawn_setup {
         let app_clone = app.clone();
         let server_state = state.server_state.clone();
         let lib_dir = state.lib_dir.clone();
@@ -1373,15 +1373,13 @@ pub async fn renderer_ready(
             )
             .await;
         });
-    } else if !setup_needed {
+    } else if !supported {
         state
             .server_state
             .setup_complete
             .store(true, std::sync::atomic::Ordering::Release);
         state.setup_done.notify_one();
     }
-
-    let _ = (setup_needed, setup_snapshot);
 
     Ok(build_setup_response(state.inner()).await)
 }

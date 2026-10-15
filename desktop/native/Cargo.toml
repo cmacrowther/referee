@@ -8,9 +8,6 @@ edition = "2021"
 
 [features]
 headless = []
-# Enable at build time when a Vulkan SDK + C++ toolchain are present and the
-# rife-worker binary should be compiled (e.g. in release CI).
-rife-ffi = []
 
 [lib]
 name = "referee_lib"
@@ -22,19 +19,8 @@ name = "referee-server"
 path = "src/server_main.rs"
 required-features = ["headless"]
 
-[[bin]]
-name = "rife-worker"
-path = "src/rife_worker_main.rs"
-required-features = ["rife-ffi"]
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-# cmake and cc are always available as build-dependencies; they are only
-# actually *used* (incurring a compile + link invocation) when the
-# `rife-ffi` feature is enabled.  The crates themselves are tiny wrappers
-# that add no overhead when unused.
-cmake = "0.1"
-cc    = { version = "1", features = ["parallel"] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
@@ -62,6 +48,11 @@ sevenz-rust = "0.6"
 zstd = "0.13"
 zip = "2"
 sysinfo = "0.33"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# Primary display refresh rate for the Match Display frame generation target.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

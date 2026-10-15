@@ -13,6 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libwebkit2gtk-4.1-dev \
     libayatana-appindicator3-dev \
     librsvg2-dev \
+    # rife-worker: CMake builds ncnn; git and Node fetch its pinned sources
+    cmake \
+    git \
+    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace/desktop/native
@@ -21,8 +25,13 @@ WORKDIR /workspace/desktop/native
 # ../../assets/icons/... during headless Cargo builds.
 COPY desktop/native/ /workspace/desktop/native/
 COPY assets/ /workspace/assets/
+COPY scripts/fetch-rife-vendor.js /workspace/scripts/
 
 RUN cargo build --features headless --bin referee-server --release
+
+# RIFE frame generation stage (Vulkan, any GPU vendor).
+RUN node /workspace/scripts/fetch-rife-vendor.js \
+    && cd rife-worker && cargo build --release --locked
 
 # =============================================================================
 # Stage 2 — AMD runtime
@@ -48,6 +57,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /workspace/desktop/native/target/release/referee-server /usr/local/bin/referee-server
+# Found on PATH by deps::resolve_rife_worker_path; RIFE models download at first run.
+COPY --from=builder /workspace/desktop/native/rife-worker/target/release/rife-worker /usr/local/bin/rife-worker
 
 # Run as a non-root user to limit the blast radius of a container escape.
 # Pre-create the data/log directory and own it so the named volume is

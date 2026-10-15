@@ -1,5 +1,9 @@
 # Rust build artifacts — can be several GB
 desktop/native/target/
+desktop/native/rife-worker/target/
+# Fetched inside the image at the pinned versions
+desktop/native/rife-worker/vendor/
+desktop/native/binaries/
 
 # Node dependencies and build output
 node_modules/

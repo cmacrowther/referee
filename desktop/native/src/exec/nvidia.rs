@@ -1,20 +1,20 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 
 use crate::graph::{
-    ExecutorKind, HdrPlan, IntermediateExecutionPlan, IntermediateOpOwner, IntermediateOperation,
-    NativeAcceleratorKind, OutputBitDepth,
+    parse_resolution, ExecutorKind, HdrPlan, IntermediateExecutionPlan, IntermediateOpOwner,
+    IntermediateOperation, NativeAcceleratorKind,
 };
 use crate::pipeline::{EncoderCapabilities, EncodingProfile};
 use crate::runtime::{
-    BackendExecutor, ExecutorSpec, FrameTransport, LegacyStartupMode, PipelineStageId,
-    PipelineStageReadinessPolicy, ProcessSpec, StageRuntimeContext, StderrMode, StdinMode,
-    StdoutMode,
+    BackendExecutor, ExecutorSpec, PipelineStageId, ProcessSpec, StageRuntimeContext, StartupMode,
 };
 
 use super::{
-    append_rigaya_denoise_args, build_rigaya_input_args, resolve_encoder_input, EncoderInput,
+    append_rigaya_denoise_args, build_rigaya_input_args, build_rigaya_output_args,
+    push_rigaya_hdr_color_args, resolve_encoder_input, rigaya_aspect_crop_args,
+    rigaya_prefers_buffered_ingest, rigaya_processing_fps_cap, rigaya_startup_mode,
+    segment_aligned_gop, RigayaInlineHls, UNKNOWN_SOURCE_FPS_FALLBACK,
 };
 
 /// Premium backend-native executor for the specialized Windows + NVIDIA path.
@@ -26,8 +26,6 @@ use super::{
 pub struct NvidiaSpecializedExecutorContext {
     pub profile: EncodingProfile,
     pub encoder_path: PathBuf,
-    #[allow(dead_code)]
-    pub capabilities: EncoderCapabilities,
     pub intermediate_plan: IntermediateExecutionPlan,
     /// Apply GPU-side denoising equivalent to FFmpeg `hqdn3d` when this
     /// executor reads from the source directly rather than a staged normalizer.
@@ -36,22 +34,31 @@ pub struct NvidiaSpecializedExecutorContext {
     pub cas_strength: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NvidiaSpecializedExecutorCommand {
-    pub program: PathBuf,
-    pub args: Vec<String>,
-    pub stdin: StdinMode,
-    pub stdout: StdoutMode,
-}
-
 pub struct NvidiaSpecializedExecutor {
     context: NvidiaSpecializedExecutorContext,
 }
 
-const INLINE_HLS_LIST_SIZE: u32 = 8;
-const INLINE_HLS_DELETE_THRESHOLD: u32 = INLINE_HLS_LIST_SIZE;
-const UNKNOWN_SOURCE_FPS_FALLBACK: f64 = 30.0;
-const UNKNOWN_FRUC_OUTPUT_FPS_FALLBACK: f64 = 60.0;
+/// NVIDIA frame generation multiplies the frame rate by this whole number.
+const FRAMEGEN_MULTIPLIER: u32 = 2;
+/// NVIDIA frame generation quality. `high` costs about 1.5x `medium`: it runs
+/// in real time below 4K on RTX 40-class GPUs but leaves little headroom at 4K.
+fn framegen_mode(output_height: Option<u32>) -> &'static str {
+    match output_height {
+        Some(height) if height < 2160 => "high",
+        _ => "medium",
+    }
+}
+
+/// Inline HLS keeps a short playlist window for latency but retains recently
+/// evicted segments, so slower live players such as VLC can still fetch them
+/// if they drift a few seconds behind the live edge.
+fn inline_hls(hls_time: u32) -> RigayaInlineHls {
+    RigayaInlineHls {
+        hls_time,
+        strict_gop: true,
+        retain_evicted_segments: true,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlannedOutputResolution {
@@ -75,6 +82,7 @@ struct PlannedNvencOptions {
     resize_filter: Option<String>,
     hdr_args: Vec<String>,
     enable_fruc: bool,
+    enable_framegen: bool,
     profile: &'static str,
     cas_strength: f32,
 }
@@ -86,6 +94,7 @@ impl Default for PlannedNvencOptions {
             resize_filter: None,
             hdr_args: Vec::new(),
             enable_fruc: false,
+            enable_framegen: false,
             profile: "main",
             cas_strength: 0.0,
         }
@@ -97,86 +106,45 @@ impl NvidiaSpecializedExecutor {
         Self { context }
     }
 
-    fn should_prefer_buffered_source_ingest(context: &StageRuntimeContext) -> bool {
-        matches!(context.transport.input, FrameTransport::SourcePull)
-            && context.source.classification.is_hls_like()
-    }
-
-    fn should_force_cfr_for_direct_source(context: &StageRuntimeContext) -> bool {
-        matches!(context.transport.input, FrameTransport::SourcePull)
-    }
-
-    fn effective_startup_mode(
-        &self,
-        context: &StageRuntimeContext,
-        attempt_number: u32,
-    ) -> LegacyStartupMode {
-        if Self::should_prefer_buffered_source_ingest(context) {
-            LegacyStartupMode::Buffered
-        } else {
-            LegacyStartupMode::for_attempt(attempt_number)
-        }
-    }
-
-    /// Builds the NVEncC/Rigaya command line and its stdin/stdout configuration for this executor.
+    /// Builds the NVEncC process for this stage: source ingest, the NVEncC
+    /// options derived from the intermediate plan (resize, FRUC, HDR, profile,
+    /// GOP, pacing), and output muxing for the stage transport.
     ///
-    /// This constructs encoder input args, planned NVEncC options derived from the intermediate plan
-    /// (resize, FRUC, HDR, profile, single-pass mode, cu sizing, GOP length, etc.), and output/mux
-    /// flags based on the stage transport, returning a fully populated `NvidiaSpecializedExecutorCommand`.
+    /// # Errors
     ///
-    /// Errors if resolver/map/build steps fail (for example, resolving encoder input, mapping the
-    /// intermediate plan, or translating output transport into muxing arguments).
-    ///
-    /// # Returns
-    ///
-    /// `NvidiaSpecializedExecutorCommand` on success.
-    ///
-    /// # Examples
-    ///
+    /// Fails when the plan contains an operation NVEncC cannot render, or the
+    /// stage transport is not supported.
     pub fn build_command(
         &self,
         context: &StageRuntimeContext,
-        startup_mode: LegacyStartupMode,
-    ) -> io::Result<NvidiaSpecializedExecutorCommand> {
-        let (input, stdin) = resolve_encoder_input(context)?;
+        startup_mode: StartupMode,
+    ) -> io::Result<ProcessSpec> {
+        let input = resolve_encoder_input(context)?;
         let planned = self.map_intermediate_plan()?;
-        // Direct HLS source-pull inputs are sensitive to Rigaya's no-buffer
-        // ingest mode: it keeps the stream close to the live edge, but will
-        // happily discard late packets and surface that as visible timeline
-        // jumps. Prefer the buffered/probed ingest profile on this path so
-        // playback stays smooth instead of skipping forward under jitter.
-        let low_latency_input = startup_mode.uses_low_latency_input()
-            && !Self::should_prefer_buffered_source_ingest(context);
+        let low_latency_input =
+            startup_mode.uses_low_latency_input() && !rigaya_prefers_buffered_ingest(context);
         let mut args = build_rigaya_input_args(&input, low_latency_input);
-        let (output_args, stdout) = self.build_output_args(context)?;
-        let force_cfr_for_staged_input =
-            !matches!(context.transport.input, FrameTransport::SourcePull);
-        let force_cfr_for_direct_source = Self::should_force_cfr_for_direct_source(context);
-        // Derive output FPS from the source metadata and execution plan once
-        // so FRUC, GOP cadence, and HLS pacing all target the same cadence.
-        let output_fps = self.derive_output_fps(context, planned.enable_fruc);
-        let rounded_output_fps = output_fps.round().max(1.0) as u32;
-        // NVEncC's transcode-speed cap applies before FRUC generates the
-        // interpolated frames. Pace FRUC jobs at half the planned output rate
-        // so a 24->48 job stays near 48 fps on the wire rather than running
-        // the pre-FRUC pipeline at 48 fps and overshooting downstream.
-        let processing_fps_cap = if planned.enable_fruc {
-            (output_fps / 2.0).round().max(1.0) as u32
-        } else {
-            rounded_output_fps
-        };
-
-        if self.context.denoise && matches!(&input, EncoderInput::SourceUrl { .. }) {
-            append_rigaya_denoise_args(&mut args);
-        }
-
-        if matches!(&input, EncoderInput::SourceUrl { .. }) {
-            if let Some((left, top, right, bottom)) =
-                derive_aspect_crop(context, planned.output_resolution.as_ref())
-            {
-                args.push("--crop".to_string());
-                args.push(format!("{},{},{},{}", left, top, right, bottom));
+        let output_args = build_rigaya_output_args(
+            &context.transport.output,
+            inline_hls(self.context.profile.hls_time),
+        )?;
+        // Derive output FPS from the execution plan once so FRUC, GOP cadence,
+        // and HLS pacing all target the same cadence. With FRUC this is the
+        // interpolation target, which is known even when the source rate is not.
+        let output_fps = context
+            .planned_output_fps()
+            .unwrap_or(UNKNOWN_SOURCE_FPS_FALLBACK);
+        if input.is_source_url() {
+            if self.context.denoise {
+                append_rigaya_denoise_args(&mut args);
             }
+            args.extend(rigaya_aspect_crop_args(
+                context,
+                planned
+                    .output_resolution
+                    .as_ref()
+                    .map(PlannedOutputResolution::as_str),
+            ));
         }
 
         if let Some(output_resolution) = planned.output_resolution.as_ref() {
@@ -191,20 +159,38 @@ impl NvidiaSpecializedExecutor {
 
         if planned.enable_fruc {
             args.push("--vpp-fruc".to_string());
-            args.push(format!("fps={}/1", rounded_output_fps));
+            args.push(format!("fps={}/1", output_fps.round().max(1.0) as u32));
         }
 
-        // Direct source-pull inputs hand container timestamps straight to
-        // NVEncC because they bypass the FFmpeg normalizer. Keep CFR
-        // reconciliation enabled there so minor timestamp wobble or VFR
-        // irregularity does not surface as visible forward jumps. The staged
-        // path also keeps CFR smoothing because its FFmpeg normalizer already
-        // rebases both audio and video to a shared zero point before the
-        // handoff.
-        if planned.enable_fruc || force_cfr_for_staged_input || force_cfr_for_direct_source {
-            args.push("--avsync".to_string());
-            args.push("forcecfr".to_string());
+        if planned.enable_framegen {
+            let output_height = planned
+                .output_resolution
+                .as_ref()
+                .map(|resolution| resolution.as_str().to_string())
+                .or_else(|| {
+                    context
+                        .source
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.source_resolution.clone())
+                })
+                .and_then(|resolution| parse_resolution(&resolution))
+                .map(|(_, height)| height);
+            args.push("--vpp-nvvfx-framegen".to_string());
+            args.push(format!(
+                "multiplier={},mode={}",
+                FRAMEGEN_MULTIPLIER,
+                framegen_mode(output_height)
+            ));
         }
+
+        // Always reconcile to CFR. Direct source pulls hand container
+        // timestamps straight to NVEncC, so minor wobble or VFR irregularity
+        // would otherwise surface as visible forward jumps; staged input has
+        // already been rebased by the FFmpeg normalizer; and FRUC needs a
+        // constant input cadence.
+        args.push("--avsync".to_string());
+        args.push("forcecfr".to_string());
 
         args.extend(planned.hdr_args);
 
@@ -227,20 +213,12 @@ impl NvidiaSpecializedExecutor {
         if planned
             .output_resolution
             .as_ref()
-            .map(|r| {
-                r.as_str().starts_with("2560x1440")
-                    || r.as_str().starts_with("3840x2160")
-                    || r.as_str().starts_with("7680x4320")
-            })
-            .unwrap_or(false)
+            .and_then(|resolution| parse_resolution(resolution.as_str()))
+            .is_some_and(|(_, height)| height >= 1440)
         {
             args.push("--cu-max".to_string());
             args.push("64".to_string());
         }
-
-        let gop_len = (output_fps * self.context.profile.hls_time as f64)
-            .round()
-            .max(1.0) as u32;
 
         args.extend([
             "-c".to_string(),
@@ -256,123 +234,26 @@ impl NvidiaSpecializedExecutor {
             "--lookahead".to_string(),
             self.context.profile.lookahead.to_string(),
             "--gop-len".to_string(),
-            gop_len.to_string(),
+            segment_aligned_gop(output_fps, self.context.profile.hls_time).to_string(),
             "--aq".to_string(),
             "--aq-temporal".to_string(),
         ]);
 
-        if matches!(context.transport.output, FrameTransport::HlsOutput { .. }) {
+        // Paces input frames (24 fps for a 24->60 FRUC job), see
+        // `rigaya_processing_fps_cap`.
+        if let Some(processing_fps_cap) = rigaya_processing_fps_cap(context) {
             args.push("--max-procfps".to_string());
             args.push(processing_fps_cap.to_string());
         }
         args.extend(output_args);
 
-        Ok(NvidiaSpecializedExecutorCommand {
-            program: self.context.encoder_path.clone(),
+        Ok(ProcessSpec::new(
+            PipelineStageId::Executor,
+            &self.context.encoder_path,
             args,
-            stdin,
-            stdout,
-        })
-    }
-
-    /// Build NVEncC output/mux arguments and determine the stdout handling based on the
-    /// stage transport configured in `context`.
-    ///
-    /// This maps supported `FrameTransport` variants to the corresponding NVEncC
-    /// muxing flags and the `StdoutMode` the executor should use:
-    /// - `HlsOutput` -> HLS mux flags, `StdoutMode::Null`
-    /// - `StdoutPipe` -> MPEG-TS to stdout (`-o -`), `StdoutMode::Transport(FrameTransport::StdoutPipe)`
-    /// - `NamedPipe(path)` -> MPEG-TS to the named pipe path, `StdoutMode::Null`
-    /// - `LocalSocket(path)` -> returns `io::ErrorKind::Unsupported`
-    /// - any other transport -> returns `io::ErrorKind::InvalidInput`
-    ///
-    /// # Returns
-    ///
-    /// A tuple containing the list of NVEncC command-line arguments for muxing/output
-    /// and the `StdoutMode` describing how the executor should wire its stdout.
-    ///
-    /// # Examples
-    ///
-    fn build_output_args(
-        &self,
-        context: &StageRuntimeContext,
-    ) -> io::Result<(Vec<String>, StdoutMode)> {
-        match &context.transport.output {
-            FrameTransport::HlsOutput { playlist_path, .. } => Ok((
-                // Compatibility path only: staged launches should hand MPEG-TS
-                // off to the common FFmpeg packager instead of muxing inline.
-                // Keep a short playlist window for latency, but retain recently
-                // evicted segments a bit longer so slower live players such as
-                // VLC can continue fetching them without stalling if they drift
-                // a few seconds behind the live edge.
-                vec![
-                    "--audio-codec".to_string(),
-                    "aac".to_string(),
-                    "--format".to_string(),
-                    "hls".to_string(),
-                    "--strict-gop".to_string(),
-                    "--mux-option".to_string(),
-                    format!("hls_time:{}", self.context.profile.hls_time),
-                    "--mux-option".to_string(),
-                    format!("hls_list_size:{}", INLINE_HLS_LIST_SIZE),
-                    "--mux-option".to_string(),
-                    format!("hls_delete_threshold:{}", INLINE_HLS_DELETE_THRESHOLD),
-                    "--mux-option".to_string(),
-                    "hls_flags:delete_segments".to_string(),
-                    "-o".to_string(),
-                    playlist_path.to_string_lossy().to_string(),
-                ],
-                StdoutMode::Null,
-            )),
-            FrameTransport::StdoutPipe => Ok((
-                vec![
-                    "--audio-codec".to_string(),
-                    "aac".to_string(),
-                    "--format".to_string(),
-                    "mpegts".to_string(),
-                    "-o".to_string(),
-                    "-".to_string(),
-                ],
-                StdoutMode::Transport(FrameTransport::StdoutPipe),
-            )),
-            FrameTransport::NamedPipe(path) => Ok((
-                vec![
-                    "--audio-codec".to_string(),
-                    "aac".to_string(),
-                    "--format".to_string(),
-                    "mpegts".to_string(),
-                    "-o".to_string(),
-                    path.to_string_lossy().to_string(),
-                ],
-                StdoutMode::Null,
-            )),
-            FrameTransport::LocalSocket(path) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "NVEnc executor does not yet support local-socket output at {:?}.",
-                    path
-                ),
-            )),
-            transport => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "NVEnc executor cannot emit {:?} as its output transport.",
-                    transport
-                ),
-            )),
-        }
-    }
-
-    fn derive_output_fps(&self, context: &StageRuntimeContext, enable_fruc: bool) -> f64 {
-        let source_fps = context.source.metadata.as_ref().and_then(|m| m.source_fps);
-        crate::pipeline::planned_target_frame_rate(source_fps, &context.execution_plan)
-            .unwrap_or_else(|| {
-                if enable_fruc {
-                    UNKNOWN_FRUC_OUTPUT_FPS_FALLBACK
-                } else {
-                    UNKNOWN_SOURCE_FPS_FALLBACK
-                }
-            })
+            context.transport.clone(),
+            "nvenc",
+        ))
     }
 
     /// Converts the executor's intermediate operation plan into NVEncC-specific options used when building the encoder command.
@@ -423,15 +304,19 @@ impl NvidiaSpecializedExecutor {
                     }
                 }
                 IntermediateOperation::Interpolate(interpolation) => {
-                    if interpolation.binding.owner == IntermediateOpOwner::Executor
-                        && interpolation
+                    if interpolation.binding.owner == IntermediateOpOwner::Executor {
+                        match interpolation
                             .binding
                             .accelerator
                             .as_ref()
                             .map(|plan| plan.kind)
-                            == Some(NativeAcceleratorKind::NvidiaFruc)
-                    {
-                        planned.enable_fruc = true;
+                        {
+                            Some(NativeAcceleratorKind::NvidiaFruc) => planned.enable_fruc = true,
+                            Some(NativeAcceleratorKind::NvidiaFramegen) => {
+                                planned.enable_framegen = true
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 IntermediateOperation::HdrMetadata(metadata) => {
@@ -477,59 +362,6 @@ impl NvidiaSpecializedExecutor {
     }
 }
 
-fn derive_aspect_crop(
-    context: &StageRuntimeContext,
-    output_resolution: Option<&PlannedOutputResolution>,
-) -> Option<(u32, u32, u32, u32)> {
-    let (target_w, target_h) = parse_resolution(output_resolution?.as_str())?;
-    let (source_w, source_h) = source_dimensions(context)?;
-
-    let source_ratio = source_w as u64 * target_h as u64;
-    let target_ratio = source_h as u64 * target_w as u64;
-
-    if source_ratio == target_ratio {
-        return None;
-    }
-
-    if source_ratio > target_ratio {
-        let crop_w = ((source_h as u64 * target_w as u64 / target_h as u64) as u32 / 2) * 2;
-        if crop_w == 0 || crop_w >= source_w {
-            return None;
-        }
-        let total_crop = source_w - crop_w;
-        let left = total_crop / 2;
-        let right = total_crop - left;
-        Some((left, 0, right, 0))
-    } else {
-        let crop_h = ((source_w as u64 * target_h as u64 / target_w as u64) as u32 / 2) * 2;
-        if crop_h == 0 || crop_h >= source_h {
-            return None;
-        }
-        let total_crop = source_h - crop_h;
-        let top = total_crop / 2;
-        let bottom = total_crop - top;
-        Some((0, top, 0, bottom))
-    }
-}
-
-fn source_dimensions(context: &StageRuntimeContext) -> Option<(u32, u32)> {
-    let metadata = context.source.metadata.as_ref()?;
-    match (metadata.width, metadata.height) {
-        (Some(width), Some(height)) if width > 0 && height > 0 => Some((width, height)),
-        _ => metadata
-            .source_resolution
-            .as_deref()
-            .and_then(parse_resolution),
-    }
-}
-
-fn parse_resolution(value: &str) -> Option<(u32, u32)> {
-    let (width, height) = value.split_once('x')?;
-    let width = width.trim().parse::<u32>().ok()?;
-    let height = height.trim().parse::<u32>().ok()?;
-    (width > 0 && height > 0).then_some((width, height))
-}
-
 impl PlannedNvencOptions {
     /// Apply HDR output intent to the planned NVEnc options.
     ///
@@ -540,27 +372,8 @@ impl PlannedNvencOptions {
     /// # Examples
     ///
     fn apply_hdr_intent(&mut self, hdr: &HdrPlan) {
-        if hdr.output_bit_depth == OutputBitDepth::Bit10 {
+        if push_rigaya_hdr_color_args(&mut self.hdr_args, hdr) {
             self.profile = "main10";
-        }
-
-        if matches!(
-            hdr.color_primaries,
-            crate::graph::ColorPrimariesIntent::Bt2020
-        ) {
-            self.push_hdr_pair_once("--colorprim", "bt2020");
-        }
-        if matches!(
-            hdr.transfer,
-            crate::graph::TransferCharacteristicIntent::Smpte2084
-        ) {
-            self.push_hdr_pair_once("--transfer", "smpte2084");
-        }
-        if matches!(hdr.matrix, crate::graph::MatrixCoefficientsIntent::Bt2020Nc) {
-            self.push_hdr_pair_once("--colormatrix", "bt2020nc");
-        }
-        if hdr.metadata.is_some() {
-            self.push_hdr_pair_once("--colorrange", "limited");
         }
     }
 
@@ -575,23 +388,6 @@ impl PlannedNvencOptions {
             self.hdr_args.push(flag.to_string());
         }
     }
-
-    /// Append an adjacent key/value pair to `hdr_args` only if that exact pair does not already exist.
-    ///
-    /// This ensures the given `key` and `value` are added as consecutive entries (key then value)
-    /// and avoids inserting a duplicate adjacent pair.
-    ///
-    /// # Examples
-    ///
-    fn push_hdr_pair_once(&mut self, key: &str, value: &str) {
-        if !self
-            .hdr_args
-            .windows(2)
-            .any(|window| window[0] == key && window[1] == value)
-        {
-            self.hdr_args.extend([key.to_string(), value.to_string()]);
-        }
-    }
 }
 
 impl BackendExecutor for NvidiaSpecializedExecutor {
@@ -600,28 +396,10 @@ impl BackendExecutor for NvidiaSpecializedExecutor {
         context: &StageRuntimeContext,
         attempt_number: u32,
     ) -> io::Result<ExecutorSpec> {
-        let startup_mode = self.effective_startup_mode(context, attempt_number);
-        let command = self.build_command(context, startup_mode)?;
-
+        let startup_mode = rigaya_startup_mode(context, attempt_number);
         Ok(ExecutorSpec {
-            kind: ExecutorKind::NvidiaSpecialized,
-            startup_label: Some(startup_mode.as_str().to_string()),
-            process: ProcessSpec {
-                stage: PipelineStageId::Executor,
-                program: command.program,
-                args: command.args,
-                transport: context.transport.clone(),
-                stdin: command.stdin,
-                stdout: command.stdout,
-                stderr_piped: true,
-                current_dir: None,
-                env: Vec::new(),
-                readiness_policy: PipelineStageReadinessPolicy::ReadyOnHeartbeat,
-                log_label: "nvenc".to_string(),
-                stderr_mode: StderrMode::Raw,
-                kill_on_drop: true,
-                hidden_window: true,
-            },
+            process: self.build_command(context, startup_mode)?,
+            startup_mode,
         })
     }
 }
@@ -654,12 +432,16 @@ pub(crate) fn parse_nvenc_capabilities(help_text: &str) -> EncoderCapabilities {
         Some(false) => false,
         _ => help_text.contains("--vpp-ngx-truehdr"),
     };
+    let has_native_double = help_feature_enabled(help_text, "nvvfx") != Some(false)
+        && help_text.contains("--vpp-nvvfx-framegen");
 
     EncoderCapabilities {
         has_vpp_resize,
         has_fruc,
         has_truehdr,
         has_rife: false,
+        has_native_double,
+        has_hdr_tonemap: false,
     }
 }
 
@@ -685,7 +467,9 @@ fn help_feature_enabled(help_text: &str, feature_name: &str) -> Option<bool> {
 
 /// Detects which NVEncC single-pass mode string the encoder supports by probing its `--help` output.
 ///
-/// This spawns the encoder with `--help` and inspects stdout/stderr for known single-pass mode markers.
+/// This reads the encoder's `--help` output (shared with capability detection through the probe
+/// cache, so it is spawned at most once per binary) and inspects stdout/stderr for known
+/// single-pass mode markers.
 ///
 /// # Returns
 ///
@@ -694,29 +478,17 @@ fn help_feature_enabled(help_text: &str, feature_name: &str) -> Option<bool> {
 /// # Examples
 ///
 fn detect_nvenc_single_pass_mode(encoder_path: &Path) -> &'static str {
-    #[cfg(target_os = "windows")]
-    use std::os::windows::process::CommandExt;
-    let mut cmd = StdCommand::new(encoder_path);
-    cmd.arg("--help");
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(0x08000000);
-    let output = cmd.output();
-
-    match output {
-        Ok(out) => {
-            let check = |pattern: &[u8]| {
-                out.stdout.windows(pattern.len()).any(|w| w == pattern)
-                    || out.stderr.windows(pattern.len()).any(|w| w == pattern)
-            };
-            if check(b"none, 2pass-quarter, 2pass-full") {
-                "none"
-            } else if check(b"1pass") {
-                "1pass"
-            } else {
-                "none"
-            }
-        }
-        Err(_) => "none",
+    let Ok(out) = crate::process::cached_probe_output(encoder_path, &["--help"]) else {
+        return "none";
+    };
+    let check = |pattern: &[u8]| {
+        out.stdout.windows(pattern.len()).any(|w| w == pattern)
+            || out.stderr.windows(pattern.len()).any(|w| w == pattern)
+    };
+    if check(b"none, 2pass-quarter, 2pass-full") || !check(b"1pass") {
+        "none"
+    } else {
+        "1pass"
     }
 }
 
@@ -729,13 +501,13 @@ mod tests {
         Anime4k2xPlan, ColorPrimariesIntent, ExecutionPlan, ExecutorKind, HdrMetadataKind,
         HdrMetadataPlan, HdrPlan, HdrRequest, HdrTransformKind, HdrTransformPlan,
         IntermediateOpOwner, InterpolationDecision, InterpolationPlan, LatencyMode,
-        MatrixCoefficientsIntent, OpExecutionStage, OutputBitDepth, ResizePlan,
-        TransferCharacteristicIntent, VideoOp,
+        MatrixCoefficientsIntent, NativeInterpolationEngine, OpExecutionStage, OutputBitDepth,
+        ResizePlan, TransferCharacteristicIntent, VideoOp,
     };
-    use crate::pipeline::{EncoderCapabilities, EncodingProfile};
+    use crate::pipeline::EncodingProfile;
     use crate::runtime::{
-        BackendExecutor, FrameTransport, LegacyStartupMode, SessionOutputPaths,
-        StageRuntimeContext, StdinMode, StdoutMode, TransportConfig,
+        BackendExecutor, FrameTransport, SessionOutputPaths, StageRuntimeContext, StartupMode,
+        TransportConfig,
     };
     use crate::source::{
         SourceClassification, SourceDescriptor, SourceKind, SourceMetadata, SourceTransport,
@@ -817,12 +589,6 @@ mod tests {
                 hls_time: 1,
             },
             encoder_path: PathBuf::from("missing-nvencc.exe"),
-            capabilities: EncoderCapabilities {
-                has_vpp_resize: true,
-                has_fruc: true,
-                has_truehdr: true,
-                has_rife: false,
-            },
             intermediate_plan: plan.to_intermediate_plan(),
             denoise: false,
             cas_strength: 0.0,
@@ -843,12 +609,6 @@ mod tests {
                 hls_time: 1,
             },
             encoder_path: PathBuf::from("missing-nvencc.exe"),
-            capabilities: EncoderCapabilities {
-                has_vpp_resize: true,
-                has_fruc: true,
-                has_truehdr: true,
-                has_rife: false,
-            },
             intermediate_plan: plan.to_intermediate_plan(),
             denoise,
             cas_strength: 0.0,
@@ -878,12 +638,6 @@ mod tests {
                 hls_time: 1,
             },
             encoder_path: PathBuf::from("missing-nvencc.exe"),
-            capabilities: EncoderCapabilities {
-                has_vpp_resize: true,
-                has_fruc: true,
-                has_truehdr: true,
-                has_rife: false,
-            },
             intermediate_plan,
             denoise: false,
             cas_strength: 0.0,
@@ -972,6 +726,65 @@ NVEnc (x64) 9.14
     }
 
     #[test]
+    fn parse_nvenc_capabilities_reads_nvidia_framegen_from_banner_and_flag() {
+        let help = |nvvfx: &str| {
+            format!(
+                "NVEncC (x64) 9.38\n others\n  nvvfx      : {nvvfx}\n   --vpp-nvvfx-framegen [<param1>=<value>]\n"
+            )
+        };
+
+        assert!(parse_nvenc_capabilities(&help("yes")).has_native_double);
+        assert!(!parse_nvenc_capabilities(&help("no")).has_native_double);
+        assert!(!parse_nvenc_capabilities("  nvvfx      : yes\n").has_native_double);
+    }
+
+    #[test]
+    fn build_command_renders_nvidia_framegen_doubling() {
+        for (output_resolution, mode) in [("1920x1080", "high"), ("3840x2160", "medium")] {
+            let (executor, mut context) = executor_context(
+                vec![
+                    VideoOp::NormalizeInput,
+                    VideoOp::Resize(ResizePlan {
+                        target_resolution: output_resolution.to_string(),
+                        quality: Some(2),
+                        stage: OpExecutionStage::Executor,
+                    }),
+                    VideoOp::Interpolate(InterpolationPlan {
+                        target_fps: 48,
+                        decision: InterpolationDecision::native_engine(
+                            OpExecutionStage::Executor,
+                            NativeInterpolationEngine::NvidiaFramegen,
+                        ),
+                    }),
+                ],
+                FrameTransport::SourcePull,
+                FrameTransport::HlsOutput {
+                    playlist_path: PathBuf::from("session\\index.m3u8"),
+                    segment_dir: PathBuf::from("session"),
+                },
+            );
+            context.source.metadata = Some(SourceMetadata {
+                source_fps: Some(24.0),
+                source_resolution: Some("1280x720".to_string()),
+                ..SourceMetadata::default()
+            });
+
+            let command = executor
+                .build_command(&context, StartupMode::Buffered)
+                .unwrap();
+
+            let framegen = format!("multiplier=2,mode={mode}");
+            assert!(has_subsequence(
+                &command.args,
+                &["--vpp-nvvfx-framegen", framegen.as_str()]
+            ));
+            assert!(!command.args.iter().any(|arg| arg == "--vpp-fruc"));
+            assert!(has_subsequence(&command.args, &["--gop-len", "48"]));
+            assert!(has_subsequence(&command.args, &["--max-procfps", "26"]));
+        }
+    }
+
+    #[test]
     fn parse_nvenc_capabilities_does_not_assume_ngx_resize_from_generic_flag_alone() {
         let help = r#"
 NVEnc (x64) 9.14
@@ -1021,14 +834,9 @@ NVEnc (x64) 9.14
             },
         );
         let command = executor
-            .build_command(&context, LegacyStartupMode::LowLatency)
+            .build_command(&context, StartupMode::LowLatency)
             .unwrap();
 
-        assert_eq!(
-            command.stdin,
-            StdinMode::Transport(FrameTransport::StdoutPipe)
-        );
-        assert_eq!(command.stdout, StdoutMode::Null);
         assert!(has_subsequence(&command.args, &["--avsw", "-i", "-"]));
         assert!(has_subsequence(
             &command.args,
@@ -1047,23 +855,16 @@ NVEnc (x64) 9.14
         assert!(has_subsequence(&command.args, &["--format", "hls"]));
         assert!(command.args.iter().any(|arg| arg == "--strict-gop"));
         assert!(has_subsequence(&command.args, &["--gop-len", "60"]));
-        assert!(has_subsequence(&command.args, &["--max-procfps", "30"]));
+        // No source metadata, so no pacing cap (see
+        // build_command_skips_transcode_speed_cap_when_source_fps_is_unknown).
+        assert!(!command.args.iter().any(|arg| arg == "--max-procfps"));
         assert!(has_subsequence(
             &command.args,
-            &[
-                "--mux-option",
-                &format!("hls_list_size:{}", super::INLINE_HLS_LIST_SIZE)
-            ]
+            &["--mux-option", "hls_list_size:8"]
         ));
         assert!(has_subsequence(
             &command.args,
-            &[
-                "--mux-option",
-                &format!(
-                    "hls_delete_threshold:{}",
-                    super::INLINE_HLS_DELETE_THRESHOLD
-                )
-            ]
+            &["--mux-option", "hls_delete_threshold:8"]
         ));
         assert!(has_subsequence(
             &command.args,
@@ -1089,10 +890,9 @@ NVEnc (x64) 9.14
             },
         );
         let command = executor
-            .build_command(&context, LegacyStartupMode::Buffered)
+            .build_command(&context, StartupMode::Buffered)
             .unwrap();
 
-        assert_eq!(command.stdin, StdinMode::Null);
         assert!(has_subsequence(
             &command.args,
             &[
@@ -1117,17 +917,9 @@ NVEnc (x64) 9.14
             FrameTransport::StdoutPipe,
         );
         let command = executor
-            .build_command(&context, LegacyStartupMode::LowLatency)
+            .build_command(&context, StartupMode::LowLatency)
             .unwrap();
 
-        assert_eq!(
-            command.stdin,
-            StdinMode::Transport(FrameTransport::StdoutPipe)
-        );
-        assert_eq!(
-            command.stdout,
-            StdoutMode::Transport(FrameTransport::StdoutPipe)
-        );
         assert!(has_subsequence(&command.args, &["--format", "mpegts"]));
         assert!(has_subsequence(&command.args, &["-o", "-"]));
         assert!(has_subsequence(&command.args, &["--avsw", "-i", "-"]));
@@ -1146,7 +938,7 @@ NVEnc (x64) 9.14
             },
         );
         let command = executor
-            .build_command(&context, LegacyStartupMode::LowLatency)
+            .build_command(&context, StartupMode::LowLatency)
             .unwrap();
 
         assert!(
@@ -1164,11 +956,10 @@ NVEnc (x64) 9.14
         ));
         assert!(has_subsequence(&command.args, &["--avsync", "forcecfr"]));
         assert!(has_subsequence(&command.args, &["--gop-len", "30"]));
-        assert!(has_subsequence(&command.args, &["--max-procfps", "30"]));
         assert!(command.args.iter().any(|arg| arg == "--strict-gop"));
 
         let spec = executor.build_executor_spec(&context, 1).unwrap();
-        assert_eq!(spec.startup_label.as_deref(), Some("buffered"));
+        assert_eq!(spec.startup_mode, StartupMode::Buffered);
     }
 
     #[test]
@@ -1186,7 +977,7 @@ NVEnc (x64) 9.14
         context.source.runtime_url = "https://example.com/video.mp4".to_string();
 
         let command = executor
-            .build_command(&context, LegacyStartupMode::LowLatency)
+            .build_command(&context, StartupMode::LowLatency)
             .unwrap();
 
         assert!(has_subsequence(&command.args, &["--avsync", "forcecfr"]));
@@ -1208,20 +999,21 @@ NVEnc (x64) 9.14
         });
 
         let command = executor
-            .build_command(&context, LegacyStartupMode::Buffered)
+            .build_command(&context, StartupMode::Buffered)
             .unwrap();
 
         assert!(has_subsequence(&command.args, &["--gop-len", "24"]));
-        assert!(has_subsequence(&command.args, &["--max-procfps", "24"]));
+        // ceil(24 * 1.05): enough headroom to recover from stalls.
+        assert!(has_subsequence(&command.args, &["--max-procfps", "26"]));
     }
 
     #[test]
-    fn build_command_limits_fruc_hls_transcode_speed_to_double_source_fps() {
-        let (executor, mut context) = executor_context(
+    fn build_command_skips_transcode_speed_cap_when_source_fps_is_unknown() {
+        let (executor, context) = executor_context(
             vec![
                 VideoOp::NormalizeInput,
                 VideoOp::Interpolate(InterpolationPlan {
-                    target_fps: 48,
+                    target_fps: 60,
                     decision: InterpolationDecision::native_backend(OpExecutionStage::Executor),
                 }),
             ],
@@ -1231,18 +1023,58 @@ NVEnc (x64) 9.14
                 segment_dir: PathBuf::from("session"),
             },
         );
-        context.source.metadata = Some(SourceMetadata {
-            source_fps: Some(24.0),
-            ..SourceMetadata::default()
-        });
+        assert!(context.source.metadata.is_none());
 
         let command = executor
-            .build_command(&context, LegacyStartupMode::Buffered)
+            .build_command(&context, StartupMode::Buffered)
             .unwrap();
 
-        assert!(has_subsequence(&command.args, &["--vpp-fruc", "fps=48/1"]));
-        assert!(has_subsequence(&command.args, &["--gop-len", "48"]));
-        assert!(has_subsequence(&command.args, &["--max-procfps", "24"]));
+        // The fallback cadence still drives FRUC and GOP length, but it must
+        // not pace the encode: a 60 fps source capped at 30 runs at half speed.
+        assert!(has_subsequence(&command.args, &["--vpp-fruc", "fps=60/1"]));
+        assert!(has_subsequence(&command.args, &["--gop-len", "60"]));
+        assert!(
+            !command.args.iter().any(|arg| arg == "--max-procfps"),
+            "unknown source fps must not cap transcode speed: {:?}",
+            command.args
+        );
+    }
+
+    #[test]
+    fn build_command_paces_fruc_hls_transcode_at_source_fps_for_any_target() {
+        for (target_fps, gop) in [(30, "30"), (60, "60"), (144, "144")] {
+            let (executor, mut context) = executor_context(
+                vec![
+                    VideoOp::NormalizeInput,
+                    VideoOp::Interpolate(InterpolationPlan {
+                        target_fps,
+                        decision: InterpolationDecision::native_backend(OpExecutionStage::Executor),
+                    }),
+                ],
+                FrameTransport::SourcePull,
+                FrameTransport::HlsOutput {
+                    playlist_path: PathBuf::from("session\\index.m3u8"),
+                    segment_dir: PathBuf::from("session"),
+                },
+            );
+            context.source.metadata = Some(SourceMetadata {
+                source_fps: Some(24.0),
+                ..SourceMetadata::default()
+            });
+
+            let command = executor
+                .build_command(&context, StartupMode::Buffered)
+                .unwrap();
+
+            let fruc = format!("fps={target_fps}/1");
+            assert!(has_subsequence(
+                &command.args,
+                &["--vpp-fruc", fruc.as_str()]
+            ));
+            assert!(has_subsequence(&command.args, &["--gop-len", gop]));
+            // ceil(24 * 1.05): the cap counts input frames, before FRUC.
+            assert!(has_subsequence(&command.args, &["--max-procfps", "26"]));
+        }
     }
 
     #[test]
@@ -1272,7 +1104,7 @@ NVEnc (x64) 9.14
 
         let executor = executor_for_plan(&context.execution_plan);
         let command = executor
-            .build_command(&context, LegacyStartupMode::LowLatency)
+            .build_command(&context, StartupMode::LowLatency)
             .unwrap();
 
         assert!(has_subsequence(&command.args, &["--crop", "320,0,320,0"]));
@@ -1294,7 +1126,7 @@ NVEnc (x64) 9.14
         );
         let direct_executor = executor_for_plan_with_denoise(&direct_context.execution_plan, true);
         let direct_command = direct_executor
-            .build_command(&direct_context, LegacyStartupMode::LowLatency)
+            .build_command(&direct_context, StartupMode::LowLatency)
             .unwrap();
 
         assert!(has_subsequence(
@@ -1312,7 +1144,7 @@ NVEnc (x64) 9.14
         );
         let staged_executor = executor_for_plan_with_denoise(&staged_context.execution_plan, true);
         let staged_command = staged_executor
-            .build_command(&staged_context, LegacyStartupMode::LowLatency)
+            .build_command(&staged_context, StartupMode::LowLatency)
             .unwrap();
 
         assert!(
@@ -1334,18 +1166,9 @@ NVEnc (x64) 9.14
         );
         let spec = executor.build_executor_spec(&context, 1).unwrap();
 
-        assert_eq!(spec.kind, ExecutorKind::NvidiaSpecialized);
         assert_eq!(
             spec.process.stage,
             crate::runtime::PipelineStageId::Executor
-        );
-        assert_eq!(
-            spec.process.stdin,
-            StdinMode::Transport(FrameTransport::StdoutPipe)
-        );
-        assert_eq!(
-            spec.process.stdout,
-            StdoutMode::Transport(FrameTransport::StdoutPipe)
         );
     }
 
@@ -1412,7 +1235,7 @@ NVEnc (x64) 9.14
             intermediate_plan,
         );
         let command = executor
-            .build_command(&context, LegacyStartupMode::LowLatency)
+            .build_command(&context, StartupMode::LowLatency)
             .unwrap();
 
         assert!(has_subsequence(
@@ -1441,7 +1264,7 @@ NVEnc (x64) 9.14
         );
 
         let error = executor
-            .build_command(&context, LegacyStartupMode::LowLatency)
+            .build_command(&context, StartupMode::LowLatency)
             .expect_err("shader ops must not be silently dropped by the NVIDIA executor");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

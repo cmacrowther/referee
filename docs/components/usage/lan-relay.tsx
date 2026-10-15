@@ -65,8 +65,9 @@ export function LanRelay() {
               <p className="text-muted-foreground">
                 Streams are handed off to the linked device for processing. A status pill shows whether the
                 peer is <strong className="text-emerald-400">Online</strong> or{" "}
-                <strong className="text-red-400">Offline</strong>. Stream settings on this device become
-                read-only; they&apos;re managed by the relay device.
+                <strong className="text-red-400">Offline</strong>. If the peer&apos;s IP address changes (for
+                example, after a router restart), REFEREE finds it again on the local network automatically.
+                Stream settings on this device become read-only; they&apos;re managed by the relay device.
               </p>
             </div>
           </div>

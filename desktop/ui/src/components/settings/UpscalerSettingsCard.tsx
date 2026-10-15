@@ -1,7 +1,15 @@
 import { ChevronDown, LockKeyhole, Sparkles } from 'lucide-react';
 import { useState } from 'react';
 
-import { deriveSettingsUiCapabilities, formatResolutionLabel, getMaxQualityForResolution } from '@/lib/stream';
+import {
+    deriveSettingsUiCapabilities,
+    formatResolutionLabel,
+    FRAMEGEN_TARGET_OPTIONS,
+    getFramegenEngineOptions,
+    getMaxQualityForResolution,
+    normalizeFramegenEngine,
+    normalizeFramegenTarget,
+} from '@/lib/stream';
 import {
     DEFAULT_ENCODING_PROFILES,
     type EncodingProfile,
@@ -53,6 +61,56 @@ function ToggleField({
         </label>
     );
 }
+
+const SELECT_CLASS =
+    'cursor-pointer appearance-none rounded border border-transparent bg-[#282828] py-1.5 pl-3 pr-7 text-xs font-medium text-white transition-colors hover:border-white/10 hover:bg-[#333333] focus:border-referee-green focus:outline-none focus:ring-1 focus:ring-referee-green disabled:cursor-not-allowed disabled:opacity-40';
+
+/**
+ * A compact labelled select row used for the Motion Boost sub-settings.
+ */
+function SubSettingSelect({
+    label,
+    description,
+    value,
+    disabled,
+    onChange,
+    children,
+}: {
+    label: string;
+    description: string | null;
+    value: string;
+    disabled: boolean;
+    onChange: (value: string) => void;
+    children: React.ReactNode;
+}) {
+    return (
+        <div className="group flex items-center justify-between gap-3 pl-3">
+            <div className="flex min-w-0 flex-col pr-2">
+                <span className="text-[12px] font-medium text-white/90">{label}</span>
+                {description && <span className="text-[11px] text-referee-muted">{description}</span>}
+            </div>
+            <div className="relative shrink-0">
+                <select
+                    aria-label={label}
+                    value={value}
+                    disabled={disabled}
+                    onChange={event => {
+                        onChange(event.currentTarget.value);
+                    }}
+                    className={SELECT_CLASS}
+                >
+                    {children}
+                </select>
+                <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2 text-referee-muted group-hover:text-white">
+                    <ChevronDown className="size-3" />
+                </div>
+            </div>
+        </div>
+    );
+}
+
+/** Frame Rate select value for native doubling (NVIDIA Framegen or AMD Fluid Motion), which doubles instead of targeting a rate. */
+const FRAMEGEN_DOUBLE_OPTION = 'nativeDouble';
 
 const NVENC_PRESETS = ['p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7'] as const;
 const ENCODING_PROFILE_RESOLUTIONS = Object.keys(DEFAULT_ENCODING_PROFILES);
@@ -193,6 +251,10 @@ function getEffectiveSettingsStatus({
             selectedExecutor: status.selectedExecutor ?? 'NvidiaSpecialized',
             nvidiaAiAvailable: true,
             encoderHasFramegen: true,
+            // The peer's GPU generation is unknown here; a peer without NVIDIA
+            // Framegen uses optical flow instead.
+            encoderHasNativeDouble: status.encoderHasNativeDouble ?? true,
+            encoderHasRife: status.encoderHasRife ?? true,
         };
     }
 
@@ -204,6 +266,9 @@ function getEffectiveSettingsStatus({
             gpuVendor: 'amd',
             selectedExecutor: status.selectedExecutor ?? 'amdAi',
             amdAiAvailable: true,
+            // As above: a peer without AMF FRC interpolates instead.
+            encoderHasNativeDouble: status.encoderHasNativeDouble ?? true,
+            encoderHasRife: status.encoderHasRife ?? true,
         };
     }
 
@@ -242,6 +307,15 @@ export function UpscalerSettingsCard({
     const uiCapabilities = deriveSettingsUiCapabilities(settings, effectiveStatus, locked);
     const maxQuality = uiCapabilities.quality.max;
     const framegenFeature = uiCapabilities.features.framegen;
+    const framegenEngineOptions = getFramegenEngineOptions(effectiveStatus, uiCapabilities.resolvedPath.kind);
+    const nativeDoubleOption = framegenEngineOptions.find(option => option.value === 'nativeDouble');
+    const interpolatorOptions = framegenEngineOptions.filter(option => option.value !== 'nativeDouble');
+    const selectedInterpolator = interpolatorOptions.find(option => option.value === settings.framegenEngine);
+    const fallbackInterpolator = interpolatorOptions.find(option => option.available && option !== selectedInterpolator);
+    const unavailableNote = (option: { reason: string | null } | undefined) =>
+        `${option?.reason ?? ''} ${fallbackInterpolator ? `Using ${fallbackInterpolator.label} instead.` : ''}`.trim();
+    const framegenDoubling = nativeDoubleOption !== undefined && settings.framegenEngine === 'nativeDouble';
+    const showFramegenOptions = settings.framegen && framegenFeature.available;
     const hdrFeature = uiCapabilities.features.hdr;
     const controlsLocked = locked || relayLocked || relayRemoteOffline;
     const resolvedPathCapabilities: CapabilityState[] = [
@@ -365,7 +439,7 @@ export function UpscalerSettingsCard({
                                 {uiCapabilities.resolvedPath.kind === 'nvidiaNative'
                                     ? 'Target for NVIDIA® AI-based upscaling'
                                     : uiCapabilities.resolvedPath.kind === 'amdNative'
-                                        ? 'Target for AMD® AI-based upscaling'
+                                        ? 'Target for AMD® FSR upscaling'
                                         : uiCapabilities.resolvedPath.kind === 'pending'
                                             ? 'Target output resolution'
                                             : 'Target for REFEREE upscaling'}
@@ -445,6 +519,79 @@ export function UpscalerSettingsCard({
                             }}
                         />
                     </div>
+
+                    {showFramegenOptions && (
+                        <div className="-mt-1 flex flex-col gap-2">
+                            <SubSettingSelect
+                                label="Frame Rate"
+                                description={
+                                    framegenDoubling
+                                        ? nativeDoubleOption?.available
+                                            ? 'Doubles the source frame rate'
+                                            : unavailableNote(nativeDoubleOption)
+                                        : settings.framegenTarget === 'matchDisplay'
+                                            ? "Matches the viewer's display refresh rate"
+                                            : null
+                                }
+                                value={framegenDoubling ? FRAMEGEN_DOUBLE_OPTION : settings.framegenTarget}
+                                disabled={framegenFeature.disabled}
+                                onChange={value => {
+                                    if (value === FRAMEGEN_DOUBLE_OPTION) {
+                                        onChange({ framegenEngine: 'nativeDouble' });
+                                        return;
+                                    }
+                                    // Picking a rate leaves native doubling, which only doubles.
+                                    onChange({
+                                        framegenTarget: normalizeFramegenTarget(value),
+                                        ...(settings.framegenEngine === 'nativeDouble'
+                                            ? { framegenEngine: 'opticalFlow' as const }
+                                            : {}),
+                                    });
+                                }}
+                            >
+                                {FRAMEGEN_TARGET_OPTIONS.map(option => (
+                                    <option key={option.value} value={option.value}>
+                                        {option.label}
+                                    </option>
+                                ))}
+                                {nativeDoubleOption && (
+                                    <option
+                                        value={FRAMEGEN_DOUBLE_OPTION}
+                                        disabled={!nativeDoubleOption.available && !framegenDoubling}
+                                    >
+                                        {nativeDoubleOption.available
+                                            ? nativeDoubleOption.label
+                                            : `${nativeDoubleOption.label} (unavailable)`}
+                                    </option>
+                                )}
+                            </SubSettingSelect>
+                            {!framegenDoubling && (
+                                <SubSettingSelect
+                                    label="Interpolator"
+                                    description={
+                                        selectedInterpolator && !selectedInterpolator.available
+                                            ? unavailableNote(selectedInterpolator)
+                                            : null
+                                    }
+                                    value={settings.framegenEngine}
+                                    disabled={framegenFeature.disabled}
+                                    onChange={value => {
+                                        onChange({ framegenEngine: normalizeFramegenEngine(value) });
+                                    }}
+                                >
+                                    {interpolatorOptions.map(option => (
+                                        <option
+                                            key={option.value}
+                                            value={option.value}
+                                            disabled={!option.available && option.value !== settings.framegenEngine}
+                                        >
+                                            {option.available ? option.label : `${option.label} (unavailable)`}
+                                        </option>
+                                    ))}
+                                </SubSettingSelect>
+                            )}
+                        </div>
+                    )}
 
                     <div className="flex items-center justify-between gap-3">
                         <div className="flex min-w-0 flex-col pr-2">

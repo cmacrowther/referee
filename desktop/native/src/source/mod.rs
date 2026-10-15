@@ -6,12 +6,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::{info, warn};
 
-const REQUEST_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+use crate::graph::round_frame_rate;
+
+/// User-Agent sent with source requests. Some CDNs reject FFmpeg's default
+/// `Lavf` agent, so source pulls identify as a desktop browser.
+pub(crate) const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 const STREAM_PROBE_TIMEOUT_SECS: u64 = 12;
 
 static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     reqwest::Client::builder()
-        .user_agent(REQUEST_USER_AGENT)
+        .user_agent(BROWSER_USER_AGENT)
         .timeout(std::time::Duration::from_secs(STREAM_PROBE_TIMEOUT_SECS))
         .build()
         .expect("Failed to build HTTP client")
@@ -97,6 +101,20 @@ pub struct SourceMetadata {
     #[serde(default)]
     pub content_kind: SourceContentKind,
     pub content_kind_confidence: Option<f32>,
+}
+
+impl SourceMetadata {
+    /// Source frame size from the probed width and height, falling back to
+    /// the `WxH` resolution string.
+    pub fn dimensions(&self) -> Option<(u32, u32)> {
+        match (self.width, self.height) {
+            (Some(width), Some(height)) if width > 0 && height > 0 => Some((width, height)),
+            _ => self
+                .source_resolution
+                .as_deref()
+                .and_then(crate::graph::parse_resolution),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -298,19 +316,64 @@ async fn probe_source_metadata_with_classification(
     };
 
     // Fast path: manifest probe works for master playlists with STREAM-INF attributes.
-    let metadata = if let Some(metadata) = parse_hls_manifest(&body) {
-        Some(metadata)
-    } else {
-        // Fallback: variant/media playlists have no RESOLUTION/FRAME-RATE tags.
-        // Use ffprobe to interrogate the stream directly.
-        info!("[Metadata Probe]: HLS manifest has no stream-inf entries; falling back to ffprobe.");
-        probe_with_ffprobe(source_url, headers, ffprobe_path).await
+    let manifest_metadata = parse_hls_manifest(&body);
+    // Media playlists have no RESOLUTION/FRAME-RATE tags, and FRAME-RATE is
+    // optional even on master playlists. Without a source frame rate the
+    // executors fall back to a guessed cadence for GOP length and pacing, so
+    // ask ffprobe whenever the manifest leaves it out.
+    let needs_ffprobe = match &manifest_metadata {
+        None => {
+            info!("[Metadata Probe]: HLS manifest has no stream-inf entries; falling back to ffprobe.");
+            true
+        }
+        Some(metadata) if metadata.source_fps.is_none() => {
+            info!("[Metadata Probe]: HLS manifest has no FRAME-RATE; probing frame rate with ffprobe.");
+            true
+        }
+        Some(_) => false,
+    };
+    let preferred_dimensions = manifest_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.width.zip(metadata.height));
+    let ffprobe = async {
+        if needs_ffprobe {
+            probe_with_ffprobe(source_url, headers, ffprobe_path, preferred_dimensions).await
+        } else {
+            None
+        }
     };
 
+    // Both probes open the source independently; run them side by side so
+    // stream start waits for the slower one rather than their sum.
+    let (ffprobe_metadata, content_probe) = tokio::join!(
+        ffprobe,
+        probe_source_content_kind(source_url, headers, ffprobe_path)
+    );
+
     attach_content_probe(
-        metadata,
-        probe_source_content_kind(source_url, headers, ffprobe_path).await,
+        merge_probed_metadata(manifest_metadata, ffprobe_metadata),
+        content_probe,
     )
+}
+
+/// Fills gaps in manifest-derived metadata from an ffprobe result. Manifest
+/// values win because they describe the variant the input proxy pins.
+fn merge_probed_metadata(
+    manifest: Option<SourceMetadata>,
+    probed: Option<SourceMetadata>,
+) -> Option<SourceMetadata> {
+    match (manifest, probed) {
+        (Some(mut manifest), Some(probed)) => {
+            if manifest.width.is_none() && manifest.height.is_none() {
+                manifest.width = probed.width;
+                manifest.height = probed.height;
+                manifest.source_resolution = probed.source_resolution;
+            }
+            manifest.source_fps = manifest.source_fps.or(probed.source_fps);
+            Some(manifest)
+        }
+        (manifest, probed) => manifest.or(probed),
+    }
 }
 
 fn is_hls_like_input(source_url: &str) -> bool {
@@ -370,10 +433,6 @@ fn parse_hls_manifest(body: &str) -> Option<SourceMetadata> {
     })
 }
 
-fn round_frame_rate(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
-}
-
 fn parse_rational_fps(value: &str) -> Option<f64> {
     let (num_str, den_str) = value.split_once('/')?;
     let num: f64 = num_str.trim().parse().ok()?;
@@ -388,6 +447,7 @@ async fn probe_with_ffprobe(
     source_url: &str,
     headers: &HashMap<String, String>,
     ffprobe_path: Option<&std::path::Path>,
+    preferred_dimensions: Option<(u32, u32)>,
 ) -> Option<SourceMetadata> {
     let ffprobe_bin: &std::ffi::OsStr = ffprobe_path
         .map(|p| p.as_os_str())
@@ -396,15 +456,25 @@ async fn probe_with_ffprobe(
     command.args([
         "-v",
         "error",
+        // Same probe budget as the content probe this runs beside, so it does
+        // not extend stream start. Frame rate usually comes from the SPS of the
+        // first keyframe.
+        "-analyzeduration",
+        "1000000",
+        "-probesize",
+        "1000000",
+        // All video streams: a master playlist exposes every variant.
         "-select_streams",
-        "v:0",
+        "v",
         "-show_entries",
         "stream=width,height,r_frame_rate",
         "-of",
-        "default=noprint_wrappers=1",
+        "json",
     ]);
     if !headers.is_empty() {
-        command.arg("-headers").arg(build_input_headers(headers));
+        command
+            .arg("-headers")
+            .arg(ffmpeg_header_block(Some(BROWSER_USER_AGENT), headers));
     }
     command.arg(source_url);
     crate::process::hide_tokio_command_window(&mut command);
@@ -429,23 +499,11 @@ async fn probe_with_ffprobe(
         }
     };
 
-    let mut width: Option<u32> = None;
-    let mut height: Option<u32> = None;
-    let mut source_fps: Option<f64> = None;
-
-    for line in stdout.lines() {
-        if let Some(val) = line.strip_prefix("width=") {
-            width = val.parse().ok();
-        } else if let Some(val) = line.strip_prefix("height=") {
-            height = val.parse().ok();
-        } else if let Some(val) = line.strip_prefix("r_frame_rate=") {
-            source_fps = parse_rational_fps(val);
-        }
-    }
-
-    if width.is_none() && height.is_none() && source_fps.is_none() {
-        return None;
-    }
+    let ProbedVideoStream {
+        width,
+        height,
+        source_fps,
+    } = select_ffprobe_video_stream(&stdout, preferred_dimensions)?;
 
     let source_resolution = match (width, height) {
         (Some(w), Some(h)) => Some(format!("{}x{}", w, h)),
@@ -465,6 +523,75 @@ async fn probe_with_ffprobe(
         source_fps,
         content_kind: SourceContentKind::Unknown,
         content_kind_confidence: None,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ProbedVideoStream {
+    width: Option<u32>,
+    height: Option<u32>,
+    source_fps: Option<f64>,
+}
+
+/// Picks the video stream the pipeline will ingest from ffprobe JSON output.
+///
+/// A master playlist exposes the streams of every variant, and lower variants
+/// often run at a lower frame rate (720p30 next to 1080p60). The input proxy
+/// pins the top variant, so prefer streams matching the manifest's selected
+/// resolution, then the largest frame, then the highest frame rate.
+fn select_ffprobe_video_stream(
+    json: &str,
+    preferred_dimensions: Option<(u32, u32)>,
+) -> Option<ProbedVideoStream> {
+    let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
+    let dimension = |stream: &serde_json::Value, key: &str| {
+        stream
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+    };
+    let streams: Vec<ProbedVideoStream> = parsed
+        .get("streams")?
+        .as_array()?
+        .iter()
+        .map(|stream| ProbedVideoStream {
+            width: dimension(stream, "width"),
+            height: dimension(stream, "height"),
+            source_fps: stream
+                .get("r_frame_rate")
+                .and_then(serde_json::Value::as_str)
+                .and_then(parse_rational_fps),
+        })
+        .filter(|stream| {
+            stream.width.is_some() || stream.height.is_some() || stream.source_fps.is_some()
+        })
+        .collect();
+
+    let matching: Vec<ProbedVideoStream> = preferred_dimensions
+        .map(|(width, height)| {
+            streams
+                .iter()
+                .copied()
+                .filter(|stream| stream.width == Some(width) && stream.height == Some(height))
+                .collect()
+        })
+        .unwrap_or_default();
+    let candidates = if matching.is_empty() {
+        streams
+    } else {
+        matching
+    };
+
+    let pixels = |stream: &ProbedVideoStream| {
+        u64::from(stream.width.unwrap_or(0)) * u64::from(stream.height.unwrap_or(0))
+    };
+    candidates.into_iter().max_by(|a, b| {
+        pixels(a).cmp(&pixels(b)).then_with(|| {
+            a.source_fps
+                .unwrap_or(0.0)
+                .total_cmp(&b.source_fps.unwrap_or(0.0))
+        })
     })
 }
 
@@ -532,7 +659,9 @@ async fn probe_source_content_kind(
         "5",
     ]);
     if !headers.is_empty() {
-        command.arg("-headers").arg(build_input_headers(headers));
+        command
+            .arg("-headers")
+            .arg(ffmpeg_header_block(Some(BROWSER_USER_AGENT), headers));
     }
     command
         .arg("-i")
@@ -730,19 +859,28 @@ fn classify_rgb24_frames(
     Some(SourceContentProbe { kind, confidence })
 }
 
-fn build_input_headers(extra_headers: &HashMap<String, String>) -> String {
-    let mut header_str = format!("User-Agent: {}\r\n", REQUEST_USER_AGENT);
-    for (key, value) in extra_headers {
-        header_str.push_str(&format!("{}: {}\r\n", key, value));
+/// Formats headers as an FFmpeg `-headers` block (CRLF-terminated lines),
+/// optionally led by a User-Agent line.
+pub(crate) fn ffmpeg_header_block(
+    user_agent: Option<&str>,
+    headers: &HashMap<String, String>,
+) -> String {
+    let mut block = String::new();
+    if let Some(user_agent) = user_agent {
+        block.push_str(&format!("User-Agent: {}\r\n", user_agent));
     }
-    header_str
+    for (key, value) in headers {
+        block.push_str(&format!("{}: {}\r\n", key, value));
+    }
+    block
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_source_descriptor, classify_rgb24_frames, classify_source_url, parse_hls_manifest,
-        SourceContentKind, SourceKind, SourceMetadata, SourceTransport,
+        assemble_source_descriptor, classify_rgb24_frames, classify_source_url,
+        merge_probed_metadata, parse_hls_manifest, select_ffprobe_video_stream, SourceContentKind,
+        SourceKind, SourceMetadata, SourceTransport,
     };
     use std::collections::HashMap;
 
@@ -780,6 +918,76 @@ hi.m3u8
         assert_eq!(metadata.source_resolution.as_deref(), Some("1920x1080"));
         assert_eq!(metadata.source_fps, Some(59.94));
         assert_eq!(metadata.content_kind, SourceContentKind::Unknown);
+    }
+
+    const MASTER_PLAYLIST_FFPROBE_JSON: &str = r#"{
+        "programs": [],
+        "streams": [
+            { "width": 640, "height": 360, "r_frame_rate": "30/1" },
+            { "width": 1280, "height": 720, "r_frame_rate": "30/1" },
+            { "width": 1280, "height": 720, "r_frame_rate": "60/1" },
+            { "width": 1920, "height": 1080, "r_frame_rate": "60000/1001" },
+            { "width": 0, "height": 0, "r_frame_rate": "0/0" }
+        ]
+    }"#;
+
+    #[test]
+    fn ffprobe_selection_prefers_the_manifest_resolution() {
+        let stream =
+            select_ffprobe_video_stream(MASTER_PLAYLIST_FFPROBE_JSON, Some((1280, 720))).unwrap();
+
+        // Two 720p variants: the higher frame rate is the one the proxy pins.
+        assert_eq!(stream.width, Some(1280));
+        assert_eq!(stream.height, Some(720));
+        assert_eq!(stream.source_fps, Some(60.0));
+    }
+
+    #[test]
+    fn ffprobe_selection_falls_back_to_the_largest_stream() {
+        let stream = select_ffprobe_video_stream(MASTER_PLAYLIST_FFPROBE_JSON, None).unwrap();
+
+        assert_eq!(stream.width, Some(1920));
+        assert_eq!(stream.height, Some(1080));
+        assert_eq!(stream.source_fps, Some(59.94));
+
+        // An unmatched manifest resolution is ignored rather than failing.
+        assert_eq!(
+            select_ffprobe_video_stream(MASTER_PLAYLIST_FFPROBE_JSON, Some((3840, 2160))),
+            Some(stream)
+        );
+    }
+
+    #[test]
+    fn ffprobe_selection_rejects_output_without_video_streams() {
+        assert_eq!(
+            select_ffprobe_video_stream(r#"{"streams": []}"#, None),
+            None
+        );
+        assert_eq!(select_ffprobe_video_stream("not json", None), None);
+    }
+
+    #[test]
+    fn merged_metadata_keeps_manifest_values_and_fills_missing_frame_rate() {
+        let manifest = parse_hls_manifest(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080\nhi.m3u8\n",
+        );
+        let probed = SourceMetadata {
+            width: Some(1280),
+            height: Some(720),
+            source_resolution: Some("1280x720".to_string()),
+            source_fps: Some(60.0),
+            ..SourceMetadata::default()
+        };
+
+        let merged = merge_probed_metadata(manifest, Some(probed.clone())).unwrap();
+        assert_eq!(merged.source_resolution.as_deref(), Some("1920x1080"));
+        assert_eq!(merged.source_fps, Some(60.0));
+
+        assert_eq!(
+            merge_probed_metadata(None, Some(probed.clone())),
+            Some(probed)
+        );
+        assert_eq!(merge_probed_metadata(None, None), None);
     }
 
     #[test]

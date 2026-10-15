@@ -50,10 +50,16 @@ export interface DetectedPlayer {
     installed: boolean;
 }
 
+export type FramegenTarget = '30fps' | '60fps' | 'matchDisplay';
+/** `nativeDouble` doubles the source rate with the GPU's own frame generation (NVIDIA Framegen or AMD Fluid Motion). */
+export type FramegenEngine = 'opticalFlow' | 'rife' | 'nativeDouble';
+
 export interface Settings {
     resolution: string;
     quality: number;
     framegen: boolean;
+    framegenTarget: FramegenTarget;
+    framegenEngine: FramegenEngine;
     hdr: boolean;
     executorPreference: ExecutorPreference;
     alwaysOnTop: boolean;
@@ -71,6 +77,8 @@ export interface StatusSettings {
     resolution: string;
     quality: number;
     framegen: boolean;
+    framegenTarget: FramegenTarget;
+    framegenEngine: FramegenEngine;
     hdr: boolean;
 }
 
@@ -87,6 +95,7 @@ export interface Session {
     sourceFps: number | null;
     targetFps: number | null;
     framegenEnabled: boolean;
+    framegenEngine: string | null;
     hdrEnabled: boolean;
     qualityLevel: number | null;
     executor: string | null;
@@ -109,7 +118,9 @@ export interface Status {
     primarySession: Session | null;
     settings: StatusSettings;
     encoderHasFramegen: boolean | null;
+    encoderHasNativeDouble: boolean | null;
     encoderHasTruehdr: boolean | null;
+    encoderHasHdrTonemap: boolean | null;
     encoderHasRife: boolean | null;
 }
 
@@ -317,6 +328,8 @@ export const DEFAULT_SETTINGS: Settings = {
     resolution: '1920x1080',
     quality: 2,
     framegen: true,
+    framegenTarget: '60fps',
+    framegenEngine: 'opticalFlow',
     hdr: true,
     executorPreference: 'auto',
     alwaysOnTop: false,
@@ -346,10 +359,14 @@ export const DEFAULT_STATUS: Status = {
         resolution: DEFAULT_SETTINGS.resolution,
         quality: DEFAULT_SETTINGS.quality,
         framegen: DEFAULT_SETTINGS.framegen,
+        framegenTarget: DEFAULT_SETTINGS.framegenTarget,
+        framegenEngine: DEFAULT_SETTINGS.framegenEngine,
         hdr: DEFAULT_SETTINGS.hdr,
     },
     encoderHasFramegen: null,
+    encoderHasNativeDouble: null,
     encoderHasTruehdr: null,
+    encoderHasHdrTonemap: null,
     encoderHasRife: null,
 };
 

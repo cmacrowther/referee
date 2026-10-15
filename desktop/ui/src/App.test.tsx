@@ -43,6 +43,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
         sourceFps: null,
         targetFps: null,
         framegenEnabled: false,
+        framegenEngine: null,
         hdrEnabled: false,
         qualityLevel: null,
         executor: null,

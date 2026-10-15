@@ -59,7 +59,7 @@ fn app_data_dir() -> (std::path::PathBuf, Vec<&'static str>) {
 /// Initializes encoder binaries and detects encoder capabilities for a
 /// headless server based on the current GPU information.
 ///
-/// This function ensures encoder binaries are present for the detected GPU,
+/// This function checks dependency updates for the detected GPU,
 /// refreshes GPU detection after installation, and writes detected capability
 /// flags into `server_state.encoder_capabilities`. If no supported GPU is
 /// detected or a binary download fails, it returns without writing capabilities.
@@ -68,7 +68,7 @@ fn app_data_dir() -> (std::path::PathBuf, Vec<&'static str>) {
 ///
 /// - `server_state` — shared server state which contains `gpu_info` and will be updated with `encoder_capabilities`.
 /// - `lib_dir` — filesystem directory where encoder binaries and related libraries are stored or downloaded to.
-/// - `http_client` — HTTP client used to download encoder binaries when they are missing.
+/// - `http_client` — HTTP client used to check and download dependency updates.
 ///
 /// # Examples
 ///
@@ -76,17 +76,17 @@ async fn bootstrap_headless_setup(
     server_state: &ServerState,
     lib_dir: &std::path::Path,
     http_client: &reqwest::Client,
-) {
+) -> bool {
     let initial_gpu = server_state.gpu_info.read().await.clone();
 
     if initial_gpu.vendor == "unknown" {
         warn!("[Setup]: No supported GPU detected during startup; skipping encoder setup.");
-        return;
+        return true;
     }
 
-    if !deps::binaries_ready(lib_dir, &initial_gpu.vendor) {
+    {
         info!(
-            "[Setup]: Downloading encoder binaries for {:?} {:?}",
+            "[Setup]: Checking dependency updates for {:?} {:?}",
             initial_gpu.vendor, initial_gpu.name
         );
 
@@ -98,7 +98,7 @@ async fn bootstrap_headless_setup(
 
         if let Err(download_error) = result {
             error!("[Setup]: Binary download failed: {}", download_error);
-            return;
+            return false;
         }
 
         let lib_dir_spawn = lib_dir.to_path_buf();
@@ -110,30 +110,31 @@ async fn bootstrap_headless_setup(
         *server_state.gpu_info.write().await = refreshed_gpu;
     }
 
-    let (backend, encoder_path, rife_worker_path) = {
+    let (backend, encoder_path, rife) = {
         let gpu = server_state.gpu_info.read().await;
         (
             gpu.backend.clone(),
             gpu.encoder_path.clone(),
-            gpu.rife_worker_path.clone(),
+            gpu.has_rife(),
         )
     };
 
     if let (Some(backend), Some(encoder_path)) = (backend, encoder_path) {
-        let rife = rife_worker_path
-            .as_deref()
-            .map(pipeline::detect_rife_capability)
-            .unwrap_or(false);
         let capabilities =
             pipeline::detect_encoder_capabilities(&encoder_path, &backend).with_rife(rife);
         info!(
-            "[Setup]: Encoder capabilities — fruc={}, truehdr={}, rife={}",
-            capabilities.has_fruc, capabilities.has_truehdr, capabilities.has_rife
+            "[Setup]: Encoder capabilities — fruc={}, native-double={}, truehdr={}, rife={}",
+            capabilities.has_fruc,
+            capabilities.has_native_double,
+            capabilities.has_truehdr,
+            capabilities.has_rife
         );
         *server_state.encoder_capabilities.write().await = Some(capabilities);
     } else {
         warn!("[Setup]: GPU detected, but no encoder binary is ready yet.");
+        return false;
     }
+    true
 }
 
 fn persisted_or_new_uuid(slot: &mut Option<String>, changed: &mut bool) -> String {
@@ -270,6 +271,7 @@ async fn main() {
         rate_limit_stream: Arc::new(RateLimiter::new(3, 60)),
         pending_consent_ui: Arc::new(std::sync::Mutex::new(None)),
         setup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        relay_link: Arc::new(server::RelayLinkMonitor::default()),
     };
 
     // Log a masked hint (last 4 chars only) — the full token must be supplied via
@@ -333,10 +335,10 @@ async fn main() {
         }
     }
 
-    bootstrap_headless_setup(&server_state, &lib_dir, &http_client).await;
+    let setup_ready = bootstrap_headless_setup(&server_state, &lib_dir, &http_client).await;
     server_state
         .setup_complete
-        .store(true, std::sync::atomic::Ordering::Release);
+        .store(setup_ready, std::sync::atomic::Ordering::Release);
 
     // GPU refresh loop — re-detect every 60 s so encoder_path stays accurate.
     let gpu_arc = server_state.gpu_info.clone();

@@ -1,6 +1,6 @@
 {
   "name": "referee",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "author": {
     "name": "cmacrowther",
     "email": "cmacrowther@gmail.com"
@@ -18,9 +18,11 @@
     "dev:ui": "vite --logLevel warn",
     "dev:server": "cargo run --manifest-path desktop/native/Cargo.toml --features headless --bin referee-server",
     "dev:docs": "npm --prefix docs run dev",
-    "build": "node scripts/sync-tauri-version.js && tauri build -c desktop/native/tauri.conf.json",
+    "build": "node scripts/sync-tauri-version.js && node scripts/build-rife-worker.js && tauri build -c desktop/native/tauri.conf.json -c desktop/native/tauri.rife.conf.json",
     "build:ui": "vite build",
     "build:server": "cargo build --manifest-path desktop/native/Cargo.toml --features headless --bin referee-server --release",
+    "fetch:rife": "node scripts/fetch-rife-vendor.js",
+    "build:rife": "node scripts/build-rife-worker.js",
     "build:client": "npm run build -w @cmacrowther/referee-client",
     "build:docs": "npm --prefix docs run build",
     "test": "vitest",
@@ -28,7 +30,7 @@
     "test:coverage": "vitest run --coverage",
     "typecheck:client": "npm run typecheck -w @cmacrowther/referee-client",
     "pack:client": "npm pack -w @cmacrowther/referee-client --dry-run",
-    "test:all": "vitest run && cargo test --manifest-path desktop/native/Cargo.toml"
+    "test:all": "vitest run && cargo test --manifest-path desktop/native/Cargo.toml && cargo test --manifest-path desktop/native/rife-worker/Cargo.toml --no-default-features"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.2.2",

@@ -108,12 +108,21 @@ const endpoints = [
   "gpuUtilization": 45,
   "encoderBackend": "nvenc",
   "encoderHasFramegen": true,
+  "encoderHasNativeDouble": true,
   "encoderHasTruehdr": true,
+  "encoderHasHdrTonemap": false,
   "activeSessions": 0,
   "sessions": [],
   "primarySession": null,
-  "settings": { "resolution": "1920x1080", "quality": 3, "framegen": false, "hdr": false },
-  "selectedExecutor": "nvenc",
+  "settings": {
+    "resolution": "1920x1080",
+    "quality": 3,
+    "framegen": true,
+    "framegenTarget": "60fps",
+    "framegenEngine": "opticalFlow",
+    "hdr": false
+  },
+  "selectedExecutor": "nvidiaSpecialized",
   "nvidiaAiAvailable": true,
   "amdAiAvailable": false,
   "encoderHasRife": true
@@ -128,13 +137,15 @@ const endpoints = [
       { name: "activeSessions", type: "number", description: "Number of currently active upscaling sessions" },
       { name: "sessions", type: "array", description: "Array of active session info objects" },
       { name: "primarySession", type: "object", description: "The first active session object, or null" },
-      { name: "settings", type: "object", description: "Current settings snapshot — resolution, quality, framegen, hdr" },
-      { name: "encoderHasFramegen", type: "boolean", description: "True if the detected encoder supports frame generation (NVIDIA only)" },
+      { name: "settings", type: "object", description: "Current settings snapshot — resolution, quality, framegen, framegenTarget, framegenEngine, hdr" },
+      { name: "encoderHasFramegen", type: "boolean", description: "True if the detected encoder supports optical flow frame generation (NVIDIA only)" },
+      { name: "encoderHasNativeDouble", type: "boolean", description: "True if the GPU can double the frame rate natively: NVIDIA Framegen (RTX 40 Series or newer) or AMD Fluid Motion (VCEEncC AMF FRC, Windows)" },
       { name: "encoderHasTruehdr", type: "boolean", description: "True if the detected encoder supports TrueHDR tone-mapping (NVIDIA only)" },
-      { name: "selectedExecutor", type: "string | null", description: "The executor kind selected by the current settings" },
+      { name: "encoderHasHdrTonemap", type: "boolean", description: "True if VCEEncC can map SDR to HDR10 on the GPU (AMD only)" },
+      { name: "selectedExecutor", type: "string | null", description: "The executor kind selected by the current settings: \"nvidiaSpecialized\" (NVEncC), \"amdSpecialized\" (VCEEncC), \"universal\" (FFmpeg), or \"cpu\"" },
       { name: "nvidiaAiAvailable", type: "boolean | null", description: "Whether the NVIDIA AI executor is supported on this system" },
       { name: "amdAiAvailable", type: "boolean | null", description: "Whether the AMD AI executor is supported on this system" },
-      { name: "encoderHasRife", type: "boolean | null", description: "Whether the encoder supports RIFE upscaling" },
+      { name: "encoderHasRife", type: "boolean | null", description: "Whether RIFE frame generation is available (rife-worker and a RIFE model are installed)" },
     ],
   },
   {
@@ -172,6 +183,7 @@ const endpoints = [
   "appName": "MyApp",
   "streamTitle": "Friday Night Stream",
   "contentKind": "live",
+  "displayRefreshRate": 144,
   "headers": {
     "Authorization": "Bearer <token>"
   }
@@ -200,6 +212,7 @@ const endpoints = [
       },
       { name: "headers", type: "object", required: false, description: "Extra HTTP headers forwarded to the encoder when fetching the stream. Hop-by-hop and forwarding headers are blocked (e.g. Host, X-Forwarded-For, Transfer-Encoding, Connection, Upgrade) — including them returns 400 INVALID_HEADERS." },
       { name: "contentKind", type: "string", required: false, description: "Override source content kind: \"live\" or \"vod\". Auto-detected if omitted." },
+      { name: "displayRefreshRate", type: "number", required: false, description: "Refresh rate of the viewer's display in Hz, used when framegenTarget is \"matchDisplay\". Defaults to the primary display of the machine running REFEREE." },
     ],
     response: `{
   "sessionId": "a1b2c3d4-...",
@@ -297,15 +310,19 @@ const endpoints = [
     request: `{
   "resolution": "1920x1080",
   "quality": 4,
-  "framegen": false,
+  "framegen": true,
+  "framegenTarget": "matchDisplay",
+  "framegenEngine": "opticalFlow",
   "hdr": false,
   "executorPreference": null
 }`,
     requestFields: [
       { name: "resolution", type: "string", required: false, description: "Output resolution, e.g. \"1920x1080\" or \"3840x2160\"." },
       { name: "quality", type: "number", required: false, description: "Encoder quality level 1–5." },
-      { name: "framegen", type: "boolean", required: false, description: "Enable frame generation (NVIDIA only)." },
-      { name: "hdr", type: "boolean", required: false, description: "Enable TrueHDR tone-mapping (NVIDIA only)." },
+      { name: "framegen", type: "boolean", required: false, description: "Enable frame generation." },
+      { name: "framegenTarget", type: "string", required: false, description: "Frame rate to generate up to: \"30fps\", \"60fps\" (default), or \"matchDisplay\" (the viewer's refresh rate, capped at 144 fps, or 120 fps at 4K). Sources already at the target are left alone." },
+      { name: "framegenEngine", type: "string", required: false, description: "\"opticalFlow\" (default: NVIDIA FRUC on NVIDIA, FFmpeg motion interpolation elsewhere) or \"nativeDouble\" (doubles the source frame rate with NVIDIA Framegen on RTX 40 Series or newer, or AMD Fluid Motion through VCEEncC on Windows; otherwise optical flow is used; \"nvidiaFramegen\" is accepted as an alias). \"rife\" runs RIFE on any GPU through Vulkan and falls back to optical flow without the worker or a model." },
+      { name: "hdr", type: "boolean", required: false, description: "Enable SDR-to-HDR10 mapping: NVIDIA TrueHDR, AMD VCEEncC mapping, or FFmpeg libplacebo elsewhere." },
       { name: "executorPreference", type: "string | null", required: false, description: "Override executor selection. Pass null to use automatic selection." },
     ],
     response: `{

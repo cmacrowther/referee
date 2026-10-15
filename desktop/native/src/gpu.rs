@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::deps;
@@ -19,6 +22,13 @@ pub struct GpuInfo {
     /// Resolved model directory passed to the `rife-worker` binary.
     pub rife_model_path: Option<PathBuf>,
     pub utilization: Option<u8>,
+}
+
+impl GpuInfo {
+    /// Whether `rife-worker` and a RIFE model were both found.
+    pub fn has_rife(&self) -> bool {
+        self.rife_worker_path.is_some() && self.rife_model_path.is_some()
+    }
 }
 
 impl Default for GpuInfo {
@@ -174,6 +184,31 @@ pub fn detect_compatible_gpu(lib_dir: &Path) -> GpuInfo {
         rife_model_path,
         utilization,
     }
+}
+
+/// Refresh rate of the primary display in Hz, for the Match Display frame
+/// generation target. `None` when it cannot be read, as on a machine with no
+/// display attached, and on platforms other than Windows.
+#[cfg(target_os = "windows")]
+pub fn detect_display_refresh_hz() -> Option<f64> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
+    };
+
+    // SAFETY: DEVMODEW is plain data and valid when zeroed. `dmSize` tells the
+    // API which structure version it may write, and a null device name
+    // selects the primary display.
+    let mut mode: DEVMODEW = unsafe { std::mem::zeroed() };
+    mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+    let found =
+        unsafe { EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut mode) } != 0;
+    // 0 and 1 mean "hardware default", which carries no rate.
+    (found && mode.dmDisplayFrequency > 1).then_some(mode.dmDisplayFrequency as f64)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn detect_display_refresh_hz() -> Option<f64> {
+    None
 }
 
 /// Detects the primary GPU vendor, a cleaned GPU name, and (for NVIDIA) current GPU utilization on Windows.
@@ -370,8 +405,43 @@ fn read_nvidia_utilization() -> Option<u8> {
     }
 }
 
+/// Lowest compute capability NVIDIA frame generation supports (Ada).
+const FRAME_GENERATION_MIN_COMPUTE_CAPABILITY: (u32, u32) = (8, 9);
+
+/// Whether the NVIDIA GPU supports NVIDIA frame generation (Ada or newer).
+/// Probed once per process with `nvidia-smi`; false when it cannot run.
+pub fn nvidia_gpu_supports_frame_generation() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let supported = read_nvidia_compute_capability()
+            .is_some_and(|capability| capability >= FRAME_GENERATION_MIN_COMPUTE_CAPABILITY);
+        info!("[GPU]: NVIDIA frame generation supported: {}", supported);
+        supported
+    })
+}
+
+fn read_nvidia_compute_capability() -> Option<(u32, u32)> {
+    let mut cmd = Command::new("nvidia-smi");
+    cmd.args(["--query-gpu=compute_cap", "--format=csv,noheader"]);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd.output().ok()?;
+    parse_compute_capability(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parses the first GPU's `major.minor` compute capability, which is the
+/// device NVEncC uses by default.
+fn parse_compute_capability(text: &str) -> Option<(u32, u32)> {
+    let (major, minor) = text.lines().next()?.trim().split_once('.')?;
+    Some((major.trim().parse().ok()?, minor.trim().parse().ok()?))
+}
+
 /// Reads current GPU utilization without doing a full GPU detection pass.
-/// Intended for frequent polling (e.g. once per second) in the status push loop.
+/// This blocks on an `nvidia-smi` spawn; frequent callers should use
+/// [`latest_utilization`] instead.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn read_utilization(vendor: &str) -> Option<u8> {
     match vendor {
@@ -383,4 +453,67 @@ pub fn read_utilization(vendor: &str) -> Option<u8> {
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn read_utilization(_vendor: &str) -> Option<u8> {
     None
+}
+
+const UTILIZATION_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+/// Stored in [`UtilizationSampler::latest`] when no reading is available.
+const NO_UTILIZATION_SAMPLE: u16 = u16::MAX;
+
+struct UtilizationSampler {
+    latest: AtomicU16,
+    last_refresh: Mutex<Option<Instant>>,
+}
+
+static NVIDIA_UTILIZATION: LazyLock<UtilizationSampler> = LazyLock::new(|| UtilizationSampler {
+    latest: AtomicU16::new(NO_UTILIZATION_SAMPLE),
+    last_refresh: Mutex::new(None),
+});
+
+/// Returns the most recent GPU utilization sample without blocking.
+///
+/// Each `nvidia-smi` call is a process spawn plus an NVML init, and the status
+/// push loop and the FFmpeg progress logger used to issue about three per
+/// second between them while NVENC was busy encoding. All callers now share
+/// one sample, refreshed on the blocking pool at most every
+/// `UTILIZATION_SAMPLE_INTERVAL`. The first call returns `None` while the
+/// initial sample is taken. Must be called from within a Tokio runtime.
+pub fn latest_utilization(vendor: &str) -> Option<u8> {
+    if vendor != "nvidia" {
+        return None;
+    }
+
+    let sampler = &*NVIDIA_UTILIZATION;
+    {
+        let mut last_refresh = sampler.last_refresh.lock().unwrap();
+        let stale = last_refresh.is_none_or(|at| at.elapsed() >= UTILIZATION_SAMPLE_INTERVAL);
+        if stale {
+            // Claim the refresh before spawning so concurrent callers don't
+            // start a second nvidia-smi.
+            *last_refresh = Some(Instant::now());
+            tokio::task::spawn_blocking(|| {
+                let sample = read_utilization("nvidia").map_or(NO_UTILIZATION_SAMPLE, u16::from);
+                NVIDIA_UTILIZATION.latest.store(sample, Ordering::Relaxed);
+            });
+        }
+    }
+
+    match sampler.latest.load(Ordering::Relaxed) {
+        NO_UTILIZATION_SAMPLE => None,
+        sample => u8::try_from(sample).ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_compute_capability;
+
+    #[test]
+    fn parses_first_gpu_compute_capability() {
+        assert_eq!(parse_compute_capability("8.9\n"), Some((8, 9)));
+        assert_eq!(parse_compute_capability("12.0\n8.6\n"), Some((12, 0)));
+        assert_eq!(parse_compute_capability("[N/A]\n"), None);
+        assert_eq!(parse_compute_capability(""), None);
+        assert!(Some((12, 0)) >= Some((8, 9)));
+        assert!((8, 6) < (8, 9));
+    }
 }

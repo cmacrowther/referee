@@ -39,6 +39,15 @@ impl FeatureAvailability {
     pub fn is_available(self) -> bool {
         !matches!(self, Self::Unavailable)
     }
+
+    /// `when_available` if `available`, otherwise `Unavailable`.
+    pub fn when(available: bool, when_available: Self) -> Self {
+        if available {
+            when_available
+        } else {
+            Self::Unavailable
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,8 +126,88 @@ pub struct BackendFamilyCapabilities {
     pub binary_availability: EncoderBinaryAvailability,
     pub resize: FeatureAvailability,
     pub interpolation: FeatureAvailability,
+    /// Whole-number frame multiplication (NVIDIA frame generation).
+    #[serde(default)]
+    pub frame_generation: FeatureAvailability,
     pub hdr_transform: FeatureAvailability,
     pub metadata_injection: FeatureAvailability,
+}
+
+impl BackendFamilyCapabilities {
+    /// NVEncC. NGX VSR resize, FRUC interpolation, NVIDIA frame generation,
+    /// and TrueHDR are exact when present; HDR metadata injection is not
+    /// offered.
+    pub fn nvidia(
+        binary_availability: EncoderBinaryAvailability,
+        has_resize: bool,
+        has_fruc: bool,
+        has_framegen: bool,
+        has_truehdr: bool,
+    ) -> Self {
+        Self {
+            family: BackendFamily::Nvidia,
+            binary_name: "NVEncC".to_string(),
+            binary_availability,
+            resize: FeatureAvailability::when(has_resize, FeatureAvailability::Exact),
+            interpolation: FeatureAvailability::when(has_fruc, FeatureAvailability::Exact),
+            frame_generation: FeatureAvailability::when(has_framegen, FeatureAvailability::Exact),
+            hdr_transform: FeatureAvailability::when(has_truehdr, FeatureAvailability::Exact),
+            metadata_injection: FeatureAvailability::Unavailable,
+        }
+    }
+
+    /// VCEEncC. AMF FSR resize (approximate: no AI model), AMF FRC frame
+    /// doubling, libplacebo SDR-to-HDR10, and HDR10 metadata injection when
+    /// present. No any-target interpolation.
+    pub fn amd(
+        binary_availability: EncoderBinaryAvailability,
+        has_resize: bool,
+        has_frc: bool,
+        has_hdr_tonemap: bool,
+    ) -> Self {
+        Self {
+            family: BackendFamily::Amd,
+            binary_name: "VCEEncC".to_string(),
+            binary_availability,
+            resize: FeatureAvailability::when(has_resize, FeatureAvailability::Approximate),
+            interpolation: FeatureAvailability::Unavailable,
+            frame_generation: FeatureAvailability::when(has_frc, FeatureAvailability::Exact),
+            hdr_transform: FeatureAvailability::when(has_hdr_tonemap, FeatureAvailability::Exact),
+            metadata_injection: FeatureAvailability::when(
+                has_hdr_tonemap,
+                FeatureAvailability::Exact,
+            ),
+        }
+    }
+
+    /// FFmpeg + libplacebo: exact resize, HDR transform, and metadata
+    /// injection, but no interpolation.
+    pub fn universal(binary_availability: EncoderBinaryAvailability) -> Self {
+        Self {
+            family: BackendFamily::Universal,
+            binary_name: "ffmpeg".to_string(),
+            binary_availability,
+            resize: FeatureAvailability::Exact,
+            interpolation: FeatureAvailability::Unavailable,
+            frame_generation: FeatureAvailability::Unavailable,
+            hdr_transform: FeatureAvailability::Exact,
+            metadata_injection: FeatureAvailability::Exact,
+        }
+    }
+
+    /// An unrecognized encoder: no features.
+    pub fn legacy(binary_name: &str, binary_availability: EncoderBinaryAvailability) -> Self {
+        Self {
+            family: BackendFamily::LegacyCompatibility,
+            binary_name: binary_name.to_string(),
+            binary_availability,
+            resize: FeatureAvailability::Unavailable,
+            interpolation: FeatureAvailability::Unavailable,
+            frame_generation: FeatureAvailability::Unavailable,
+            hdr_transform: FeatureAvailability::Unavailable,
+            metadata_injection: FeatureAvailability::Unavailable,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,12 +232,12 @@ impl BackendCapabilityInventory {
     pub fn to_backend_capabilities(&self) -> BackendCapabilities {
         let selected = &self.selected_backend;
         let selected_native_upscale_backend = native_upscale_backend_for_profile(selected);
+        // An AMD-native upscaler the selected executor is not using (the
+        // Universal preference on an AMD GPU), reported for diagnostics only.
         let future_native_upscale_candidate =
             self.vendor_native_backend
                 .as_ref()
                 .and_then(|profile| match profile.family {
-                    // AMD is the one vendor-native path that can already surface
-                    // separately from the planner's current `ExecutorKind`.
                     BackendFamily::Amd => native_upscale_backend_for_profile(profile),
                     _ => None,
                 });
@@ -162,14 +251,18 @@ impl BackendCapabilityInventory {
             ResizeSupport::Unsupported
         };
 
-        let interpolation = if selected.interpolation.is_available() {
-            InterpolationSupport::To60
-        } else {
-            InterpolationSupport::Unsupported
+        let interpolation = match (
+            selected.interpolation.is_available(),
+            selected.frame_generation.is_available(),
+        ) {
+            (true, true) => InterpolationSupport::NativeWithFramegen,
+            (true, false) => InterpolationSupport::Native,
+            (false, true) => InterpolationSupport::FramegenOnly,
+            (false, false) => InterpolationSupport::Unsupported,
         };
 
         let hdr = match self.selected_executor {
-            ExecutorKind::NvidiaSpecialized => HdrSupport {
+            ExecutorKind::NvidiaSpecialized | ExecutorKind::AmdSpecialized => HdrSupport {
                 passthrough_10_bit: false,
                 tonemap_to_hdr10: selected.hdr_transform.is_available(),
                 inject_hdr10_metadata: selected.metadata_injection.is_available(),
@@ -186,22 +279,6 @@ impl BackendCapabilityInventory {
 
         let upscale = if let Some(native_backend) = selected_native_upscale_backend {
             UpscalePlanningCapabilities::native_backend(native_backend)
-        } else if future_native_upscale_candidate == Some(NativeUpscaleBackend::AmdVceEncResize) {
-            // VCEEncC with `--vpp-resize` confirmed present and available: promote
-            // AMD to the native-backend upscale path so the planner stages
-            // `Resize(stage: Executor)` instead of falling back to shader ops
-            // (Anime4k / ArtCNN) that VCEEncC cannot execute.
-            //
-            // Quality levels outside AMF FSR's range still fall through to
-            // shared preprocess — this is governed by `native_resize_supports_request`
-            // in the planner, not here.
-            //
-            // The graph planner still uses `ExecutorKind::Universal` for AMD,
-            // so the explicit `AmdVppResize` accelerator annotation is added
-            // later at the runtime-family seam once the executor has resolved
-            // to AMD/VCEEncC. The important planning contract here is that
-            // native AMD upscale becomes `Resize(stage: Executor)`.
-            UpscalePlanningCapabilities::native_backend(NativeUpscaleBackend::AmdVceEncResize)
         } else {
             match self.selected_executor {
                 ExecutorKind::Universal => {
@@ -209,7 +286,9 @@ impl BackendCapabilityInventory {
                         future_native_upscale_candidate,
                     )
                 }
-                ExecutorKind::NvidiaSpecialized | ExecutorKind::Cpu => {
+                ExecutorKind::NvidiaSpecialized
+                | ExecutorKind::AmdSpecialized
+                | ExecutorKind::Cpu => {
                     UpscalePlanningCapabilities::shared_preprocess(future_native_upscale_candidate)
                 }
             }
@@ -263,7 +342,13 @@ pub enum ResizeSupport {
 pub enum InterpolationSupport {
     #[default]
     Unsupported,
-    To60,
+    /// The selected backend interpolates to any target frame rate (NVEncC FRUC).
+    Native,
+    /// FRUC, plus NVIDIA frame generation for whole-number multiples.
+    NativeWithFramegen,
+    /// Native frame doubling only (AMD Fluid Motion); other targets need a
+    /// portable or RIFE stage.
+    FramegenOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -303,6 +388,7 @@ mod tests {
                 binary_availability: EncoderBinaryAvailability::Available,
                 resize: FeatureAvailability::Exact,
                 interpolation: FeatureAvailability::Unavailable,
+                frame_generation: FeatureAvailability::Unavailable,
                 hdr_transform: FeatureAvailability::Exact,
                 metadata_injection: FeatureAvailability::Exact,
             },
@@ -312,6 +398,7 @@ mod tests {
                 binary_availability: EncoderBinaryAvailability::Available,
                 resize: FeatureAvailability::Approximate,
                 interpolation: FeatureAvailability::Unavailable,
+                frame_generation: FeatureAvailability::Unavailable,
                 hdr_transform: FeatureAvailability::Unavailable,
                 metadata_injection: FeatureAvailability::Unavailable,
             }),
@@ -321,6 +408,7 @@ mod tests {
                 binary_availability: EncoderBinaryAvailability::Available,
                 resize: FeatureAvailability::Exact,
                 interpolation: FeatureAvailability::Unavailable,
+                frame_generation: FeatureAvailability::Unavailable,
                 hdr_transform: FeatureAvailability::Exact,
                 metadata_injection: FeatureAvailability::Exact,
             },
@@ -340,12 +428,11 @@ mod tests {
                     tonemap_to_hdr10: true,
                     inject_hdr10_metadata: true,
                 },
-                // VCEEncC with --vpp-resize available: AMD is promoted to the
-                // native-backend upscale path so the planner stages Resize(Executor)
-                // instead of Anime4k/ArtCNN shader ops.
-                upscale: UpscalePlanningCapabilities::native_backend(
+                // The Universal executor renders upscales itself; the unused
+                // VCEEncC resize is only reported as a candidate.
+                upscale: UpscalePlanningCapabilities::temporary_universal_compatibility(Some(
                     NativeUpscaleBackend::AmdVceEncResize,
-                ),
+                )),
             }
         );
     }
@@ -360,6 +447,7 @@ mod tests {
                 binary_availability: EncoderBinaryAvailability::Available,
                 resize: FeatureAvailability::Exact,
                 interpolation: FeatureAvailability::Exact,
+                frame_generation: FeatureAvailability::Unavailable,
                 hdr_transform: FeatureAvailability::Exact,
                 metadata_injection: FeatureAvailability::Unavailable,
             },
@@ -370,6 +458,7 @@ mod tests {
                 binary_availability: EncoderBinaryAvailability::Available,
                 resize: FeatureAvailability::Exact,
                 interpolation: FeatureAvailability::Unavailable,
+                frame_generation: FeatureAvailability::Unavailable,
                 hdr_transform: FeatureAvailability::Exact,
                 metadata_injection: FeatureAvailability::Exact,
             },
@@ -383,7 +472,7 @@ mod tests {
                     min_quality: 1,
                     max_quality: 4,
                 },
-                interpolation: InterpolationSupport::To60,
+                interpolation: InterpolationSupport::Native,
                 hdr: HdrSupport {
                     passthrough_10_bit: false,
                     tonemap_to_hdr10: true,
@@ -409,6 +498,7 @@ mod tests {
                 binary_availability: EncoderBinaryAvailability::Available,
                 resize: FeatureAvailability::Exact,
                 interpolation: FeatureAvailability::Unavailable,
+                frame_generation: FeatureAvailability::Unavailable,
                 hdr_transform: FeatureAvailability::Exact,
                 metadata_injection: FeatureAvailability::Exact,
             },
@@ -418,6 +508,7 @@ mod tests {
                 binary_availability: EncoderBinaryAvailability::Available,
                 resize: FeatureAvailability::Unavailable, // ← no vpp-resize probed
                 interpolation: FeatureAvailability::Unavailable,
+                frame_generation: FeatureAvailability::Unavailable,
                 hdr_transform: FeatureAvailability::Unavailable,
                 metadata_injection: FeatureAvailability::Unavailable,
             }),
@@ -427,6 +518,7 @@ mod tests {
                 binary_availability: EncoderBinaryAvailability::Available,
                 resize: FeatureAvailability::Exact,
                 interpolation: FeatureAvailability::Unavailable,
+                frame_generation: FeatureAvailability::Unavailable,
                 hdr_transform: FeatureAvailability::Exact,
                 metadata_injection: FeatureAvailability::Exact,
             },
@@ -446,36 +538,23 @@ mod tests {
     }
 
     #[test]
-    fn amd_vceenc_with_vpp_resize_promotes_to_native_backend_upscale_path() {
-        // When VCEEncC is present and probed `--vpp-resize` is available, AMD
-        // is promoted to the native-backend upscale path.  The planner will
-        // then stage Resize(Executor) so AmdExecutor emits --vpp-resize amf_fsr.
+    fn amd_specialized_inventory_maps_fsr_frc_and_hdr_to_native_planner_capabilities() {
         let inventory = BackendCapabilityInventory {
-            selected_executor: ExecutorKind::Universal,
-            selected_backend: BackendFamilyCapabilities {
-                family: BackendFamily::Universal,
-                binary_name: "ffmpeg".to_string(),
-                binary_availability: EncoderBinaryAvailability::Available,
-                resize: FeatureAvailability::Exact,
-                interpolation: FeatureAvailability::Unavailable,
-                hdr_transform: FeatureAvailability::Exact,
-                metadata_injection: FeatureAvailability::Exact,
-            },
-            vendor_native_backend: Some(BackendFamilyCapabilities {
-                family: BackendFamily::Amd,
-                binary_name: "VCEEncC".to_string(),
-                binary_availability: EncoderBinaryAvailability::Available,
-                resize: FeatureAvailability::Approximate,
-                interpolation: FeatureAvailability::Unavailable,
-                hdr_transform: FeatureAvailability::Unavailable,
-                metadata_injection: FeatureAvailability::Unavailable,
-            }),
+            selected_executor: ExecutorKind::AmdSpecialized,
+            selected_backend: BackendFamilyCapabilities::amd(
+                EncoderBinaryAvailability::Available,
+                true,
+                true,
+                true,
+            ),
+            vendor_native_backend: None,
             universal_fallback: BackendFamilyCapabilities {
                 family: BackendFamily::Universal,
                 binary_name: "ffmpeg".to_string(),
                 binary_availability: EncoderBinaryAvailability::Available,
                 resize: FeatureAvailability::Exact,
                 interpolation: FeatureAvailability::Unavailable,
+                frame_generation: FeatureAvailability::Unavailable,
                 hdr_transform: FeatureAvailability::Exact,
                 metadata_injection: FeatureAvailability::Exact,
             },
@@ -483,14 +562,24 @@ mod tests {
 
         let translated = inventory.to_backend_capabilities();
 
+        assert_eq!(translated.executor, ExecutorKind::AmdSpecialized);
         assert_eq!(
             translated.upscale.selected_path,
-            SelectedUpscalePath::NativeBackend,
-            "VCEEncC with vpp-resize must promote to NativeBackend, not TemporaryUniversalCompatibility"
+            SelectedUpscalePath::NativeBackend
         );
         assert_eq!(
             translated.upscale.preferred_native_backend,
             Some(NativeUpscaleBackend::AmdVceEncResize)
+        );
+        // AMF FRC doubles only; fixed targets stay portable.
+        assert_eq!(translated.interpolation, InterpolationSupport::FramegenOnly);
+        assert_eq!(
+            translated.hdr,
+            HdrSupport {
+                passthrough_10_bit: false,
+                tonemap_to_hdr10: true,
+                inject_hdr10_metadata: true,
+            }
         );
     }
 }

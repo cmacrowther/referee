@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::graph::{SharedPreprocessOperation, SharedPreprocessPlan};
 use crate::runtime::{
-    FrameTransport, PipelineStageId, PipelineStageReadinessPolicy, Preprocessor, ProcessSpec,
-    StageRuntimeContext, StderrMode, StdinMode, StdoutMode,
+    PipelineStageId, PipelineStageReadinessPolicy, Preprocessor, ProcessSpec, StageRuntimeContext,
 };
 
 const STREAMING_RIFE_SENTINEL: &str = "[rife_worker] ready";
@@ -24,14 +23,14 @@ fn strip_extended_path_prefix(path: &Path) -> String {
 }
 
 /// Streaming RIFE preprocessor: drives `rife-worker` as a long-running
-/// NUT-in → NUT-out filter process.  Accepts HLS and non-HLS sources and
-/// supports fractional fps ratios.
+/// NUT-in → NUT-out filter process. Accepts HLS and non-HLS sources and any
+/// source-to-target frame-rate ratio; the worker passes audio through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamingRifePreprocessor {
     rife_worker_path: PathBuf,
     ffmpeg_path: PathBuf,
     model_path: PathBuf,
-    output_transport: FrameTransport,
+    pixel_format: String,
 }
 
 impl StreamingRifePreprocessor {
@@ -50,13 +49,14 @@ impl StreamingRifePreprocessor {
             rife_worker_path: rife_worker_path.into(),
             ffmpeg_path: ffmpeg_path.into(),
             model_path: model_path.into(),
-            output_transport: FrameTransport::StdoutPipe,
+            pixel_format: "yuv420p".to_string(),
         }
     }
 
-    /// Set the output transport used for frames produced by this preprocessor.
-    pub fn with_output_transport(mut self, output_transport: FrameTransport) -> Self {
-        self.output_transport = output_transport;
+    /// Output pixel format (`yuv420p` or `nv12`), to match what the executor
+    /// reads best.
+    pub fn with_pixel_format(mut self, pixel_format: impl Into<String>) -> Self {
+        self.pixel_format = pixel_format.into();
         self
     }
 
@@ -82,6 +82,9 @@ impl Preprocessor for StreamingRifePreprocessor {
     /// interpolation plan is present, or `io::ErrorKind::Unsupported` if
     /// source FPS metadata is missing or invalid.
     fn build_preprocess_spec(&self, context: &StageRuntimeContext) -> io::Result<ProcessSpec> {
+        let stage = PipelineStageId::Preprocess;
+        context.transport.input.ffmpeg_input_url(stage)?;
+        context.transport.output.ffmpeg_output_url(stage)?;
         let plan = context
             .execution_plan
             .to_intermediate_plan()
@@ -107,37 +110,31 @@ impl Preprocessor for StreamingRifePreprocessor {
                 )
             })?;
 
+        // The worker picks the GPU itself (a discrete GPU first), which on
+        // hybrid laptops is the GPU the encoder uses.
         let args = vec![
             "--ffmpeg-path".to_string(),
             strip_extended_path_prefix(&self.ffmpeg_path),
-            "--gpu-id".to_string(),
-            "0".to_string(),
             "--model-path".to_string(),
             strip_extended_path_prefix(&self.model_path),
             "--source-fps".to_string(),
             source_fps.to_string(),
             "--target-fps".to_string(),
             target_fps.to_string(),
+            "--pix-fmt".to_string(),
+            self.pixel_format.clone(),
         ];
 
-        Ok(ProcessSpec {
-            stage: PipelineStageId::Preprocess,
-            program: self.rife_worker_path.clone(),
+        Ok(ProcessSpec::new(
+            stage,
+            &self.rife_worker_path,
             args,
-            transport: context.transport.clone(),
-            stdin: StdinMode::Transport(FrameTransport::StdoutPipe),
-            stdout: StdoutMode::Transport(FrameTransport::StdoutPipe),
-            stderr_piped: true,
-            current_dir: None,
-            env: Vec::new(),
-            readiness_policy: PipelineStageReadinessPolicy::ReadyOnStderrSentinel {
-                sentinel: STREAMING_RIFE_SENTINEL.to_string(),
-            },
-            log_label: "rife-worker".to_string(),
-            stderr_mode: StderrMode::Raw,
-            kill_on_drop: true,
-            hidden_window: true,
-        })
+            context.transport.clone(),
+            "rife-worker",
+        )
+        .with_readiness_policy(PipelineStageReadinessPolicy::ReadyOnStderrSentinel {
+            sentinel: STREAMING_RIFE_SENTINEL.to_string(),
+        }))
     }
 }
 
@@ -168,9 +165,7 @@ mod tests {
                     VideoOp::NormalizeInput,
                     VideoOp::Interpolate(InterpolationPlan {
                         target_fps: 60,
-                        decision: InterpolationDecision::portable_fallback(
-                            OpExecutionStage::Preprocess,
-                        ),
+                        decision: InterpolationDecision::rife(OpExecutionStage::Preprocess),
                     }),
                 ],
             },
@@ -226,7 +221,14 @@ mod tests {
             .any(|w| w == ["--model-path", "models/rife-v4.25-lite_ensembleFalse"]));
         assert!(spec.args.windows(2).any(|w| w[0] == "--source-fps"));
         assert!(spec.args.windows(2).any(|w| w == ["--target-fps", "60"]));
-        assert!(spec.args.windows(2).any(|w| w == ["--gpu-id", "0"]));
+        assert!(spec.args.windows(2).any(|w| w == ["--pix-fmt", "yuv420p"]));
+        assert!(!spec.args.iter().any(|arg| arg == "--gpu-id"));
+
+        let nv12 = preprocessor
+            .with_pixel_format("nv12")
+            .build_preprocess_spec(&context(Some(30.0)))
+            .unwrap();
+        assert!(nv12.args.windows(2).any(|w| w == ["--pix-fmt", "nv12"]));
     }
 
     #[test]

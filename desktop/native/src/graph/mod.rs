@@ -23,12 +23,14 @@ pub use intermediate::{
     UnresolvedOperationReason,
 };
 #[allow(unused_imports)]
+pub use plan::{parse_resolution, round_frame_rate};
+#[allow(unused_imports)]
 pub use plan::{
     Anime4k2xPlan, Artcnn2xPlan, ColorPrimariesIntent, ExecutionPlan, ExecutorKind,
     HdrMetadataKind, HdrMetadataPlan, HdrPlan, HdrTransformKind, HdrTransformPlan,
     InterpolationDecision, InterpolationPlan, InterpolationRealization,
-    InterpolationUnsupportedReason, MatrixCoefficientsIntent, OpExecutionStage, OutputBitDepth,
-    ResizePlan, TransferCharacteristicIntent, VideoOp,
+    InterpolationUnsupportedReason, MatrixCoefficientsIntent, NativeInterpolationEngine,
+    OpExecutionStage, OutputBitDepth, ResizePlan, TransferCharacteristicIntent, VideoOp,
 };
 #[allow(unused_imports)]
 pub use planner::GraphPlanner;

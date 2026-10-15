@@ -115,6 +115,14 @@ pub async fn start_server(state: ServerState) {
             std::process::exit(1);
         }
     };
+    // Disable Nagle on accepted connections. Playlists, segments, and the input
+    // proxy's streamed bodies are latency-sensitive, and Nagle combined with the
+    // peer's delayed ACK can hold back the tail of a response.
+    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+        if let Err(error) = tcp.set_nodelay(true) {
+            warn!("[Main]: Failed to set TCP_NODELAY on connection: {}", error);
+        }
+    });
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -126,12 +134,6 @@ pub async fn start_server(state: ServerState) {
 pub async fn shutdown(sessions: &SessionMap) {
     let ids: Vec<String> = sessions.iter().map(|e| e.key().clone()).collect();
     for id in ids {
-        if let Err(error) = stop_tracked_session(&id, sessions).await {
-            warn!(
-                "[Relay]: Failed to stop session {} during shutdown cleanly: {}",
-                id, error
-            );
-            cleanup_session(&id, sessions).await;
-        }
+        stop_tracked_session(&id, sessions).await;
     }
 }

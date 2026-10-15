@@ -1,33 +1,20 @@
 use std::io;
 use std::path::PathBuf;
 
-use crate::exec::libplacebo_filters::{
-    map_color_primaries, map_matrix, map_quality_to_libplacebo_scaler, map_transfer,
-    parse_resolution, push_aspect_preserving_resize_args,
-};
+use crate::exec::libplacebo_filters::LibplaceboParams;
 use crate::graph::{
-    ColorPrimariesIntent, HdrTransformKind, MatrixCoefficientsIntent, OutputBitDepth,
-    SharedPreprocessExecutionMode, SharedPreprocessOperation, SharedPreprocessPlan,
-    TransferCharacteristicIntent,
+    HdrTransformKind, OutputBitDepth, SharedPreprocessExecutionMode, SharedPreprocessOperation,
+    SharedPreprocessPlan,
 };
-use crate::runtime::{
-    FrameTransport, PipelineStageId, PipelineStageReadinessPolicy, Preprocessor, ProcessSpec,
-    StageRuntimeContext, StderrMode, StdinMode, StdoutMode,
-};
+use crate::runtime::{PipelineStageId, Preprocessor, ProcessSpec, StageRuntimeContext};
 
 /// Filter parameters derived from `PreprocessorOwned` ops in a
 /// [`SharedPreprocessPlan`].  Resize, HDR transform, and portable frame
 /// interpolation are renderable here; shader upscale ops that arrive as
 /// `PreprocessorOwned` are still skipped until their renderers land.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct PreprocessFilterPlan {
-    output_resolution: Option<String>,
-    resize_quality: Option<u8>,
-    output_bit_depth: OutputBitDepth,
-    color_primaries: ColorPrimariesIntent,
-    transfer: TransferCharacteristicIntent,
-    matrix: MatrixCoefficientsIntent,
-    tone_map_to_hdr10: bool,
+    libplacebo: LibplaceboParams,
     /// Target frame rate for portable frame generation.  Populated when a
     /// preprocess-owned interpolation op is present and executable (i.e.
     /// `InterpolationDecision::portable_fallback` with no gap reason).
@@ -35,54 +22,9 @@ struct PreprocessFilterPlan {
     target_fps: Option<u32>,
 }
 
-impl Default for PreprocessFilterPlan {
-    /// Create a `PreprocessFilterPlan` with no-op defaults.
-    ///
-    /// The produced plan represents "do nothing" preprocessing:
-    /// - no resize, no interpolation
-    /// - 8-bit output bit depth
-    /// - color primaries, transfer, and matrix set to preserve source
-    /// - `tone_map_to_hdr10` is `false`
-    ///
-    /// # Examples
-    ///
-    fn default() -> Self {
-        Self {
-            output_resolution: None,
-            resize_quality: None,
-            output_bit_depth: OutputBitDepth::Bit8,
-            color_primaries: ColorPrimariesIntent::PreserveSource,
-            transfer: TransferCharacteristicIntent::PreserveSource,
-            matrix: MatrixCoefficientsIntent::PreserveSource,
-            tone_map_to_hdr10: false,
-            target_fps: None,
-        }
-    }
-}
-
 impl PreprocessFilterPlan {
-    /// Create a PreprocessFilterPlan by extracting and consolidating only the operations
-    /// that are marked for preprocessor-owned execution from a SharedPreprocessPlan.
-    ///
-    /// The returned plan copies relevant parameters from preprocess-owned operations:
-    /// - `Resize` sets `output_resolution` and `resize_quality`.
-    /// - `HdrTransform` sets `output_bit_depth`, `color_primaries`, `transfer`, `matrix`,
-    ///   and sets `tone_map_to_hdr10` when the operation kind is `TonemapToHdr10`.
-    /// - `Interpolate` sets `target_fps` only when the interpolation plan is executable.
-    /// Shader-based upscale operations are ignored (skipped silently).
-    ///
-    /// # Parameters
-    ///
-    /// - `plan`: the shared preprocess plan to derive from; only operations with
-    ///   `execution_mode == SharedPreprocessExecutionMode::PreprocessorOwned` are considered.
-    ///
-    /// # Returns
-    ///
-    /// A `PreprocessFilterPlan` with fields populated from the matching preprocess-owned
-    /// operations (or defaults when none apply).
-    ///
-    /// # Examples
-    ///
+    /// Collects the parameters of the preprocessor-owned operations in a
+    /// shared preprocess plan. Shader upscale operations are skipped.
     fn from_shared_preprocess_plan(plan: &SharedPreprocessPlan) -> Self {
         let mut filter_plan = Self::default();
 
@@ -92,17 +34,13 @@ impl PreprocessFilterPlan {
             }
             match &op_plan.operation {
                 SharedPreprocessOperation::Resize(op) => {
-                    filter_plan.output_resolution = Some(op.plan.target_resolution.clone());
-                    filter_plan.resize_quality = op.plan.quality;
+                    filter_plan.libplacebo.apply_resize(&op.plan);
                 }
                 SharedPreprocessOperation::HdrTransform(op) => {
-                    filter_plan.output_bit_depth = op.hdr.output_bit_depth;
-                    filter_plan.color_primaries = op.hdr.color_primaries;
-                    filter_plan.transfer = op.hdr.transfer;
-                    filter_plan.matrix = op.hdr.matrix;
+                    filter_plan.libplacebo.apply_hdr_color(&op.hdr);
                     // NvidiaTrueHdrTonemapToHdr10 is a native NVIDIA operation
                     // and must never reach a portable preprocess stage.
-                    filter_plan.tone_map_to_hdr10 =
+                    filter_plan.libplacebo.tone_map_to_hdr10 =
                         matches!(op.plan.kind, HdrTransformKind::TonemapToHdr10);
                 }
                 SharedPreprocessOperation::Interpolate(op) => {
@@ -126,102 +64,23 @@ impl PreprocessFilterPlan {
         filter_plan
     }
 
-    /// Returns whether any processing that must be performed by libplacebo is required.
-    ///
-    /// This is true when the plan requests a resize, a tonemap-to-HDR10, a 10-bit output
-    /// bit depth, or any explicit color primaries / transfer / matrix conversion
-    /// (i.e., any of those intents are not `PreserveSource`).
-    ///
-    /// # Examples
-    ///
-    fn has_libplacebo_processing(&self) -> bool {
-        self.output_resolution.is_some()
-            || self.tone_map_to_hdr10
-            || self.output_bit_depth == OutputBitDepth::Bit10
-            || !matches!(self.color_primaries, ColorPrimariesIntent::PreserveSource)
-            || !matches!(self.transfer, TransferCharacteristicIntent::PreserveSource)
-            || !matches!(self.matrix, MatrixCoefficientsIntent::PreserveSource)
-    }
-
-    /// Builds a `libplacebo=...` FFmpeg filter string for preprocess-owned resize and HDR operations.
-    ///
-    /// Returns `None` when no libplacebo-related processing is required (prevents inserting a no-op filter).
-    ///
-    /// # Examples
-    ///
-    fn build_libplacebo_filter(&self) -> Option<String> {
-        if !self.has_libplacebo_processing() {
-            return None;
-        }
-
-        let mut args = Vec::new();
-
-        if let Some((width, height)) = self.output_resolution.as_deref().and_then(parse_resolution)
-        {
-            push_aspect_preserving_resize_args(
-                &mut args,
-                width,
-                height,
-                map_quality_to_libplacebo_scaler(self.resize_quality),
-            );
-        }
-
-        if self.tone_map_to_hdr10 {
-            args.push("tonemapping=bt.2390".to_string());
-        }
-        if let Some(primaries) = map_color_primaries(self.color_primaries) {
-            args.push(format!("color_primaries={}", primaries));
-        }
-        if let Some(trc) = map_transfer(self.transfer) {
-            args.push(format!("color_trc={}", trc));
-        }
-        if let Some(colorspace) = map_matrix(self.matrix) {
-            args.push(format!("colorspace={}", colorspace));
-        }
-        args.push(format!(
-            "format={}",
-            if self.output_bit_depth == OutputBitDepth::Bit10 {
-                "yuv420p10le"
-            } else {
-                "yuv420p"
-            }
-        ));
-
-        Some(format!("libplacebo={}", args.join(":")))
-    }
-
-    /// Constructs a `minterpolate` FFmpeg filter configured for the plan's target frame rate.
-    ///
-    /// Returns `None` when no target frame rate is configured (`target_fps` is `None`).
-    ///
-    /// # Examples
-    ///
-    fn build_interpolation_filter(&self) -> Option<String> {
-        let fps = self.target_fps?;
-        Some(format!(
-            "minterpolate=fps={}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1",
-            fps
-        ))
-    }
-
-    /// Builds the FFmpeg filter graph string composed of libplacebo (resize / HDR)
-    /// and interpolation filters.
-    ///
-    /// The libplacebo filter, when present, is placed before the interpolation
-    /// filter so interpolation operates on already-scaled and color-processed
-    /// frames. Returns `None` when no filters are required.
-    ///
-    /// # Examples
-    ///
+    /// Builds the filter graph: libplacebo (resize / HDR) first, so
+    /// interpolation runs on already-scaled and color-processed frames, then
+    /// `minterpolate`. Returns `None` when no filters are required.
     fn build_filter_graph(&self) -> Option<String> {
         let mut filters = Vec::new();
 
-        if let Some(libplacebo) = self.build_libplacebo_filter() {
-            filters.push(libplacebo);
+        if self.libplacebo.has_resize_or_color_work()
+            || self.libplacebo.output_bit_depth == OutputBitDepth::Bit10
+        {
+            filters.push(self.libplacebo.render(false, None));
         }
 
-        if let Some(interpolation) = self.build_interpolation_filter() {
-            filters.push(interpolation);
+        if let Some(fps) = self.target_fps {
+            filters.push(format!(
+                "minterpolate=fps={}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1",
+                fps
+            ));
         }
 
         if filters.is_empty() {
@@ -230,111 +89,31 @@ impl PreprocessFilterPlan {
             Some(filters.join(","))
         }
     }
-
-    /// Selects the FFmpeg pixel format string to use for rawvideo output based on the planned output bit depth.
-    ///
-    /// When the plan targets 10-bit output, returns `"yuv420p10le"`; otherwise returns `"yuv420p"`.
-    ///
-    /// # Examples
-    ///
-    fn output_pixel_format(&self) -> &'static str {
-        if self.output_bit_depth == OutputBitDepth::Bit10 {
-            "yuv420p10le"
-        } else {
-            "yuv420p"
-        }
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FfmpegPreprocessorCommand {
-    pub program: PathBuf,
-    pub args: Vec<String>,
-    pub stdin: StdinMode,
-    pub stdout: StdoutMode,
-    pub output_transport: FrameTransport,
-}
-
+/// Portable preprocess stage: renders preprocessor-owned resize, HDR, and
+/// interpolation on NUT frames from the normalizer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfmpegPreprocessor {
     program: PathBuf,
-    output_transport: FrameTransport,
 }
 
 impl FfmpegPreprocessor {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
-            output_transport: FrameTransport::StdoutPipe,
         }
     }
 
-    pub fn with_output_transport(mut self, output_transport: FrameTransport) -> Self {
-        self.output_transport = output_transport;
-        self
-    }
-
-    /// Builds the FFmpeg command used for the preprocess pipeline stage.
-
-    ///
-
-    /// This validates the provided runtime context, derives the shared preprocess
-
-    /// plan, and constructs an `FfmpegPreprocessorCommand` that either:
-
-    /// - applies a filter graph (libplacebo and/or minterpolate) and emits rawvideo
-
-    ///   with an appropriate pixel format when preprocess-owned operations are
-
-    ///   renderable, or
-
-    /// - uses stream passthrough (`-c copy`) when no renderable preprocess filter is
-
-    ///   produced or when the preprocess stage is not required.
-
-    ///
-
-    /// The returned command includes program path, FFmpeg arguments, configured
-
-    /// stdin/stdout modes, and the associated output transport.
-
-    ///
-
-    /// # Examples
-
-    ///
-
-    pub fn build_command(
-        &self,
-        context: &StageRuntimeContext,
-    ) -> io::Result<FfmpegPreprocessorCommand> {
-        self.validate_context(context)?;
+    /// Builds the FFmpeg preprocess process. It applies a filter graph
+    /// (libplacebo and/or minterpolate) and emits rawvideo when
+    /// preprocessor-owned operations are renderable, and stream-copies
+    /// otherwise.
+    pub fn build_command(&self, context: &StageRuntimeContext) -> io::Result<ProcessSpec> {
+        let stage = PipelineStageId::Preprocess;
+        let input_url = context.transport.input.ffmpeg_input_url(stage)?;
+        let output_url = context.transport.output.ffmpeg_output_url(stage)?;
         let preprocess_plan = self.planned_shared_preprocess(context);
-
-        let (input_arg, stdin) = self.resolve_input_transport(&context.transport.input)?;
-        let output_arg = self.output_sink()?;
-        let stdout = match &self.output_transport {
-            FrameTransport::StdoutPipe => StdoutMode::Transport(FrameTransport::StdoutPipe),
-            FrameTransport::NamedPipe(_) => StdoutMode::Null,
-            FrameTransport::LocalSocket(path) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "FFmpeg preprocess does not yet support local-socket output at {:?}.",
-                        path
-                    ),
-                ))
-            }
-            transport => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "FFmpeg preprocess cannot map {:?} to a process stdout mode.",
-                        transport
-                    ),
-                ))
-            }
-        };
 
         let mut args = vec![
             "-hide_banner".to_string(),
@@ -346,7 +125,7 @@ impl FfmpegPreprocessor {
             "-f".to_string(),
             "nut".to_string(),
             "-i".to_string(),
-            input_arg,
+            input_url.to_string(),
             "-map".to_string(),
             "0:v:0".to_string(),
             "-map".to_string(),
@@ -356,35 +135,31 @@ impl FfmpegPreprocessor {
         ];
 
         let filter_plan = PreprocessFilterPlan::from_shared_preprocess_plan(&preprocess_plan);
+        // Without preprocess-owned ops, executor fallbacks and deferred
+        // portable ops stay where they are and frames pass straight through.
+        // Preprocess-owned ops with no renderable filter (only shader upscale)
+        // are also copied until their renderers land.
+        let filter_graph = preprocess_plan
+            .requires_stage()
+            .then(|| filter_plan.build_filter_graph())
+            .flatten();
 
-        if preprocess_plan.requires_stage() {
-            // Render preprocess-owned operations.  libplacebo handles resize
-            // and HDR transforms; minterpolate handles portable frame-rate
-            // doubling.  Either or both may be present; build_filter_graph
-            // combines them (libplacebo first, then minterpolate).
-            // Shader upscale ops remain skipped until their renderers land.
-            if let Some(filter) = filter_plan.build_filter_graph() {
-                args.push("-vf".to_string());
-                args.push(filter);
-                args.extend([
-                    "-c:v".to_string(),
-                    "rawvideo".to_string(),
-                    "-pix_fmt".to_string(),
-                    filter_plan.output_pixel_format().to_string(),
-                    "-c:a".to_string(),
-                    "copy".to_string(),
-                ]);
-            } else {
-                // PreprocessorOwned ops were present but none produced a
-                // renderable filter (e.g. only shader upscale landed here).
-                // Fall back to copy until their renderers land.
-                args.extend(["-c".to_string(), "copy".to_string()]);
-            }
-        } else {
-            // No preprocess-owned ops: passthrough copy.
-            // Resize/HDR with TemporaryExecutorFallback mode stay in the
-            // executor.  Deferred/unimplemented portable ops stay deferred.
-            args.extend(["-c".to_string(), "copy".to_string()]);
+        match filter_graph {
+            Some(filter) => args.extend([
+                "-vf".to_string(),
+                filter,
+                "-c:v".to_string(),
+                "rawvideo".to_string(),
+                "-pix_fmt".to_string(),
+                filter_plan
+                    .libplacebo
+                    .output_bit_depth
+                    .planar_yuv_format()
+                    .to_string(),
+                "-c:a".to_string(),
+                "copy".to_string(),
+            ]),
+            None => args.extend(["-c".to_string(), "copy".to_string()]),
         }
 
         args.extend([
@@ -392,147 +167,29 @@ impl FfmpegPreprocessor {
             "1".to_string(),
             "-f".to_string(),
             "nut".to_string(),
-            output_arg,
+            output_url.to_string(),
         ]);
 
-        Ok(FfmpegPreprocessorCommand {
-            program: self.program.clone(),
+        Ok(ProcessSpec::new(
+            stage,
+            &self.program,
             args,
-            stdin,
-            stdout,
-            output_transport: self.output_transport.clone(),
-        })
+            context.transport.clone(),
+            "ffmpeg-preprocess",
+        ))
     }
 
-    /// Extracts the shared preprocess plan derived from the stage's execution plan.
-    ///
-    /// This converts the context's execution plan into an intermediate plan and returns
-    /// its shared preprocess plan used to determine preprocess-stage operations.
-    ///
-    /// # Examples
-    ///
     fn planned_shared_preprocess(&self, context: &StageRuntimeContext) -> SharedPreprocessPlan {
         context
             .execution_plan
             .to_intermediate_plan()
             .shared_preprocess_plan()
     }
-
-    /// Validates that the runtime context uses an explicit inter-stage input transport and that its output transport matches this preprocessor's configured output transport.
-    ///
-    /// On success, the context is suitable for running the FFmpeg preprocess stage. On failure, an `io::Error` with `InvalidInput` is returned:
-    /// - when `context.transport.input` is not `FrameTransport::StdoutPipe` or `FrameTransport::NamedPipe(_)`;
-    /// - when `context.transport.output` does not equal the preprocessor's `output_transport`.
-    ///
-    /// # Parameters
-    ///
-    /// - `context`: runtime stage context whose input/output transports are validated.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the context is valid for the FFmpeg preprocess stage, otherwise an `Err(io::Error)` describing the invalid transport.
-    ///
-    /// # Examples
-    ///
-    fn validate_context(&self, context: &StageRuntimeContext) -> io::Result<()> {
-        match context.transport.input {
-            FrameTransport::StdoutPipe | FrameTransport::NamedPipe(_) => {}
-            ref transport => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                    "FFmpeg preprocess requires an explicit inter-stage input transport, got {:?}.",
-                    transport
-                ),
-                ))
-            }
-        }
-
-        let expected_output = self.output_transport.clone();
-        if context.transport.output != expected_output {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "FFmpeg preprocess requires {:?} output transport, got {:?}.",
-                    expected_output, context.transport.output
-                ),
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn resolve_input_transport(
-        &self,
-        transport: &FrameTransport,
-    ) -> io::Result<(String, StdinMode)> {
-        match transport {
-            FrameTransport::StdoutPipe => Ok((
-                "pipe:0".to_string(),
-                StdinMode::Transport(FrameTransport::StdoutPipe),
-            )),
-            FrameTransport::NamedPipe(path) => {
-                Ok((path.to_string_lossy().to_string(), StdinMode::Null))
-            }
-            FrameTransport::LocalSocket(path) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "FFmpeg preprocess does not yet support local-socket input at {:?}.",
-                    path
-                ),
-            )),
-            transport => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "FFmpeg preprocess cannot consume {:?} as its input transport.",
-                    transport
-                ),
-            )),
-        }
-    }
-
-    fn output_sink(&self) -> io::Result<String> {
-        match &self.output_transport {
-            FrameTransport::StdoutPipe => Ok("pipe:1".to_string()),
-            FrameTransport::NamedPipe(path) => Ok(path.to_string_lossy().to_string()),
-            FrameTransport::LocalSocket(path) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "FFmpeg preprocess does not yet support local-socket output at {:?}.",
-                    path
-                ),
-            )),
-            transport => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "FFmpeg preprocess cannot emit to {:?}; expected an explicit inter-stage transport.",
-                    transport
-                ),
-            )),
-        }
-    }
 }
 
 impl Preprocessor for FfmpegPreprocessor {
     fn build_preprocess_spec(&self, context: &StageRuntimeContext) -> io::Result<ProcessSpec> {
-        let command = self.build_command(context)?;
-
-        Ok(ProcessSpec {
-            stage: PipelineStageId::Preprocess,
-            program: command.program,
-            args: command.args,
-            transport: context.transport.clone(),
-            stdin: command.stdin,
-            stdout: command.stdout,
-            stderr_piped: true,
-            current_dir: None,
-            env: Vec::new(),
-            readiness_policy: PipelineStageReadinessPolicy::ReadyOnSpawn,
-            log_label: "ffmpeg-preprocess".to_string(),
-            stderr_mode: StderrMode::Raw,
-            kill_on_drop: true,
-            hidden_window: true,
-        })
+        self.build_command(context)
     }
 }
 
@@ -547,8 +204,7 @@ mod tests {
         VideoOp,
     };
     use crate::runtime::{
-        FrameTransport, Preprocessor, SessionOutputPaths, StageRuntimeContext, StdinMode,
-        StdoutMode, TransportConfig,
+        FrameTransport, Preprocessor, SessionOutputPaths, StageRuntimeContext, TransportConfig,
     };
     use crate::source::{SourceClassification, SourceDescriptor, SourceKind, SourceTransport};
     use std::collections::HashMap;
@@ -639,14 +295,6 @@ mod tests {
         assert!(preprocess_plan.operations.iter().all(|operation| {
             operation.execution_mode == SharedPreprocessExecutionMode::PreprocessorOwned
         }));
-        assert_eq!(
-            command.stdin,
-            StdinMode::Transport(FrameTransport::StdoutPipe)
-        );
-        assert_eq!(
-            command.stdout,
-            StdoutMode::Transport(FrameTransport::StdoutPipe)
-        );
         assert!(has_subsequence(
             &command.args,
             &["-f", "nut", "-i", "pipe:0"]
@@ -825,22 +473,25 @@ mod tests {
     }
 
     #[test]
-    fn build_preprocess_spec_keeps_stage_identity_for_named_pipe_output() {
-        let named_pipe =
-            FrameTransport::NamedPipe(PathBuf::from(r"\\.\pipe\referee-preprocess-session-1"));
-        let preprocessor =
-            FfmpegPreprocessor::new("ffmpeg").with_output_transport(named_pipe.clone());
+    fn build_preprocess_spec_keeps_stage_identity_and_rejects_non_pipe_transports() {
+        let preprocessor = FfmpegPreprocessor::new("ffmpeg");
         let spec = preprocessor
             .build_preprocess_spec(&context(
                 vec![VideoOp::NormalizeInput],
                 FrameTransport::StdoutPipe,
-                named_pipe,
+                FrameTransport::StdoutPipe,
             ))
             .unwrap();
 
         assert_eq!(spec.stage, crate::runtime::PipelineStageId::Preprocess);
-        assert_eq!(spec.stdin, StdinMode::Transport(FrameTransport::StdoutPipe));
-        assert_eq!(spec.stdout, StdoutMode::Null);
+        assert_eq!(spec.log_label, "ffmpeg-preprocess");
+        assert!(preprocessor
+            .build_preprocess_spec(&context(
+                vec![VideoOp::NormalizeInput],
+                FrameTransport::SourcePull,
+                FrameTransport::StdoutPipe,
+            ))
+            .is_err());
     }
 
     #[test]

@@ -130,6 +130,27 @@ describe('useSetup — handleSetupResponse', () => {
         })
         expect(setView).toHaveBeenCalledWith('setup')
     })
+
+    it('keeps update failures visible when the installed binary still exists', () => {
+        const { api } = makeMockApi()
+        const setView = vi.fn()
+        const { result } = renderHook(() => useSetup(api, setView))
+        act(() => {
+            result.current.handleSetupResponse({
+                setupNeeded: false,
+                gpuVendor: 'nvidia',
+                gpuName: null,
+                setupInProgress: false,
+                setupComplete: false,
+                setupError: 'Dependency validation failed',
+            })
+        })
+        expect(setView).toHaveBeenLastCalledWith('setup')
+        act(() => { vi.advanceTimersByTime(1500) })
+        expect(result.current.setupState.complete).toBe(false)
+        expect(result.current.setupState.error).toBe('Dependency validation failed')
+        expect(result.current.setupState.progress?.phase).not.toBe('done')
+    })
 })
 
 // ─── Event subscriptions ──────────────────────────────────────────────────────

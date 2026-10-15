@@ -10,6 +10,14 @@ pub(super) struct StreamStartRequest {
     pub(super) headers: Option<HashMap<String, String>>,
     #[serde(rename = "contentKind")]
     pub(super) content_kind: Option<SourceContentKind>,
+    /// Refresh rate of the viewer's display in Hz, for the Match Display frame
+    /// generation target. Filled from this machine's display when omitted.
+    #[serde(
+        rename = "displayRefreshRate",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) display_refresh_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,22 +87,15 @@ pub(super) fn tmp_file_response_headers(filename: &str) -> TmpFileResponseHeader
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct RuntimeBackend {
-    pub(super) gpu_vendor: String,
-    pub(super) encoder_backend: String,
-    pub(super) encoder_path: PathBuf,
-    pub(super) ffmpeg_path: PathBuf,
-    pub(super) rife_worker_path: Option<PathBuf>,
-    pub(super) rife_model_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
 pub(super) struct StartupContext {
     pub(super) runtime_backend: RuntimeBackend,
     pub(super) source_descriptor: SourceDescriptor,
     pub(super) pipeline_request: PipelineRequest,
     pub(super) planner_capabilities: BackendCapabilities,
     pub(super) execution_plan: ExecutionPlan,
+    /// The same stream planned without RIFE, for when `rife-worker` fails to
+    /// start. `None` unless the plan uses RIFE.
+    pub(super) rife_fallback_plan: Option<ExecutionPlan>,
     pub(super) quality_level: u8,
     pub(super) framegen_enabled: bool,
     pub(super) target_fps: Option<f64>,
@@ -215,16 +216,6 @@ pub(super) fn resolve_runtime_backend(gpu: &GpuInfo) -> HandlerResult<RuntimeBac
     }
 }
 
-pub(super) fn source_dimensions(source_descriptor: &SourceDescriptor) -> Option<(u32, u32)> {
-    let metadata = source_descriptor.metadata.as_ref()?;
-    metadata.width.zip(metadata.height).or_else(|| {
-        metadata
-            .source_resolution
-            .as_deref()
-            .and_then(parse_resolution)
-    })
-}
-
 pub(super) fn build_upscale_request(
     source_descriptor: &SourceDescriptor,
     output_resolution: &str,
@@ -233,7 +224,11 @@ pub(super) fn build_upscale_request(
     let Some((output_width, output_height)) = parse_resolution(output_resolution) else {
         return UpscaleRequest::Off;
     };
-    let Some((source_width, source_height)) = source_dimensions(source_descriptor) else {
+    let Some((source_width, source_height)) = source_descriptor
+        .metadata
+        .as_ref()
+        .and_then(SourceMetadata::dimensions)
+    else {
         return UpscaleRequest::Off;
     };
 
@@ -252,7 +247,9 @@ pub(super) fn build_pipeline_request(
 ) -> PipelineRequest {
     build_pipeline_request_from_parts(
         &settings.resolution,
-        settings.framegen,
+        settings
+            .framegen()
+            .interpolation_request(None, &settings.resolution, false),
         settings.hdr,
         source_descriptor,
         quality_level,
@@ -261,7 +258,7 @@ pub(super) fn build_pipeline_request(
 
 pub(super) fn build_pipeline_request_from_parts(
     resolution: &str,
-    framegen: bool,
+    interpolation: InterpolationRequest,
     hdr: bool,
     source_descriptor: &SourceDescriptor,
     quality_level: u8,
@@ -285,11 +282,7 @@ pub(super) fn build_pipeline_request_from_parts(
             .and_then(|metadata| metadata.source_fps),
         latency_mode: LatencyMode::Low,
         upscale: build_upscale_request(source_descriptor, resolution, quality_level),
-        interpolation: if framegen {
-            InterpolationRequest::To60
-        } else {
-            InterpolationRequest::Off
-        },
+        interpolation,
         hdr: if hdr {
             HdrRequest::TonemapToHdr10
         } else {
@@ -310,6 +303,9 @@ pub(super) fn active_upscaler_label(execution_plan: &ExecutionPlan) -> Option<St
             }
             VideoOp::Resize(_) if execution_plan.executor == ExecutorKind::NvidiaSpecialized => {
                 Some("NVIDIA AI".to_string())
+            }
+            VideoOp::Resize(_) if execution_plan.executor == ExecutorKind::AmdSpecialized => {
+                Some("AMD FSR".to_string())
             }
             _ => None,
         })
@@ -433,6 +429,18 @@ pub(super) fn disable_universal_portable_interpolation(
     }
 }
 
+/// Plans `pipeline_request` and applies the runtime adjustments that depend on
+/// this machine (§6.5 of PIPELINE.md).
+fn plan_for_runtime(
+    runtime_backend: &RuntimeBackend,
+    pipeline_request: &PipelineRequest,
+    planner_capabilities: &BackendCapabilities,
+) -> ExecutionPlan {
+    let mut execution_plan = build_execution_plan(pipeline_request, planner_capabilities);
+    disable_universal_portable_interpolation(runtime_backend, &mut execution_plan);
+    execution_plan
+}
+
 pub(super) fn assemble_startup_context(
     runtime_backend: RuntimeBackend,
     source_descriptor: SourceDescriptor,
@@ -441,10 +449,10 @@ pub(super) fn assemble_startup_context(
     quality_level: u8,
 ) -> StartupContext {
     let source_fps = pipeline_request.source_fps;
-    let mut execution_plan = build_execution_plan(&pipeline_request, &planner_capabilities);
-    disable_universal_portable_interpolation(&runtime_backend, &mut execution_plan);
-    let framegen_enabled = pipeline::is_interpolation_enabled(&execution_plan);
-    let target_fps = pipeline::planned_target_frame_rate(source_fps, &execution_plan);
+    let execution_plan =
+        plan_for_runtime(&runtime_backend, &pipeline_request, &planner_capabilities);
+    let framegen_enabled = execution_plan.has_executable_interpolation();
+    let target_fps = execution_plan.output_frame_rate(source_fps);
 
     StartupContext {
         runtime_backend,
@@ -452,6 +460,7 @@ pub(super) fn assemble_startup_context(
         pipeline_request,
         planner_capabilities,
         execution_plan,
+        rife_fallback_plan: None,
         quality_level,
         framegen_enabled,
         target_fps,
@@ -467,6 +476,7 @@ pub(super) async fn build_startup_context(
     headers: &HashMap<String, String>,
     quality_level: u8,
     content_kind_override: Option<SourceContentKind>,
+    display_refresh_hz: Option<f64>,
 ) -> StartupContext {
     let ffprobe_path = {
         let gpu = state.gpu_info.read().await;
@@ -503,9 +513,20 @@ pub(super) async fn build_startup_context(
         }
     }
 
+    // RIFE's worker grid needs the source frame rate.
+    let source_fps_known = source_descriptor
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.source_fps.is_some_and(|fps| fps > 0.0));
+    let rife_available = runtime_backend.has_rife() && source_fps_known;
+    let interpolation = settings.framegen.interpolation_request(
+        display_refresh_hz,
+        &settings.resolution,
+        rife_available,
+    );
     let pipeline_request = build_pipeline_request_from_parts(
         &settings.resolution,
-        settings.framegen,
+        interpolation,
         settings.hdr,
         &source_descriptor,
         quality_level,
@@ -518,13 +539,91 @@ pub(super) async fn build_startup_context(
     )
     .await;
 
-    assemble_startup_context(
+    // Plan the same stream without RIFE up front, so a session whose worker
+    // fails at startup can retry on the next best engine.
+    let rife_fallback_plan = match interpolation {
+        InterpolationRequest::RifeTargetFps(target_fps) => {
+            let fallback_request = PipelineRequest {
+                interpolation: InterpolationRequest::TargetFps(target_fps),
+                ..pipeline_request.clone()
+            };
+            let fallback_capabilities = build_planner_capabilities(
+                state,
+                runtime_backend,
+                &fallback_request,
+                settings.executor_preference,
+            )
+            .await;
+            Some(plan_for_runtime(
+                runtime_backend,
+                &fallback_request,
+                &fallback_capabilities,
+            ))
+        }
+        _ => None,
+    };
+
+    let mut startup_context = assemble_startup_context(
         runtime_backend.clone(),
         source_descriptor,
         pipeline_request,
         planner_capabilities,
         quality_level,
-    )
+    );
+    startup_context.rife_fallback_plan = rife_fallback_plan;
+    log_framegen_decision(
+        session_id,
+        settings.framegen,
+        display_refresh_hz,
+        rife_available,
+        &startup_context,
+    );
+    startup_context
+}
+
+fn log_framegen_decision(
+    session_id: &str,
+    framegen: FramegenSettings,
+    display_refresh_hz: Option<f64>,
+    rife_available: bool,
+    startup_context: &StartupContext,
+) {
+    let Some(interpolation) = startup_context.execution_plan.interpolation_plan() else {
+        return;
+    };
+    if framegen.engine == FramegenEngine::Rife && !rife_available {
+        info!(
+            "[Planner]: Session {} requested RIFE, which needs rife-worker, a RIFE model, and a known source frame rate (worker={}, model={}, source fps={:?}); using optical flow.",
+            session_id,
+            startup_context.runtime_backend.rife_worker_path.is_some(),
+            startup_context.runtime_backend.rife_model_path.is_some(),
+            startup_context.pipeline_request.source_fps,
+        );
+    }
+    let display_note = match (framegen.target, display_refresh_hz) {
+        _ if framegen.engine == FramegenEngine::NativeDouble => String::new(),
+        (FramegenTarget::MatchDisplay, Some(hz)) => format!(" (Match Display, {hz:.2} Hz)"),
+        (FramegenTarget::MatchDisplay, None) => " (Match Display, refresh rate unknown)".into(),
+        _ => String::new(),
+    };
+    let source_fps = startup_context
+        .pipeline_request
+        .source_fps
+        .map(|fps| format!("{fps:.2}"))
+        .unwrap_or_else(|| "unknown".to_string());
+    info!(
+        "[Planner]: Session {} frame generation {} fps -> {} fps{}: {:?}{}.",
+        session_id,
+        source_fps,
+        interpolation.target_fps,
+        display_note,
+        interpolation.decision.realization,
+        interpolation
+            .decision
+            .unsupported_reason
+            .map(|reason| format!(" ({reason:?})"))
+            .unwrap_or_default(),
+    );
 }
 
 pub(super) fn build_remote_proxy_session_info(
@@ -612,7 +711,7 @@ pub(super) fn maybe_show_stream_notification(
 pub(super) async fn handle_stream_start(
     State(state): State<ServerState>,
     RemoteIp(ip_str): RemoteIp,
-    Json(req): Json<StreamStartRequest>,
+    Json(mut req): Json<StreamStartRequest>,
 ) -> HandlerResult<Json<StreamStartResponse>> {
     // Rate limit: 3 stream-start requests per minute per IP to prevent GPU DoS.
     let rate_key = format!("stream:{}", ip_str);
@@ -625,6 +724,13 @@ pub(super) async fn handle_stream_start(
     }
 
     validate_stream_start_request(&req)?;
+
+    // Match Display targets the viewer's display. Without a client hint, assume
+    // the viewer is on this machine; a relay forwards the hint so the
+    // processing peer matches this display rather than its own.
+    if req.display_refresh_rate.is_none() {
+        req.display_refresh_rate = crate::gpu::detect_display_refresh_hz();
+    }
 
     // SSRF protection: reject URLs that resolve to loopback or link-local addresses.
     // RFC-1918 private ranges are allowed so LAN stream sources remain reachable.
@@ -650,16 +756,15 @@ pub(super) async fn handle_stream_start(
     let app_name = normalize_optional_text(req.app_name.clone());
     let stream_title = normalize_optional_text(req.stream_title.clone());
 
-    if let Some(relay_target) =
-        resolve_active_relay_target(&relay_settings)
-            .await
-            .map_err(|error| {
-                error_response(
-                    StatusCode::BAD_GATEWAY,
-                    error_codes::RELAY_UNAVAILABLE,
-                    error,
-                )
-            })?
+    if let Some(relay_target) = resolve_active_relay_target(&state, &relay_settings)
+        .await
+        .map_err(|error| {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                error_codes::RELAY_UNAVAILABLE,
+                error,
+            )
+        })?
     {
         return handle_relay_stream_start(
             &state,
@@ -698,13 +803,7 @@ pub(super) async fn handle_relay_stream_start(
     app_name: Option<String>,
     stream_title: Option<String>,
 ) -> HandlerResult<StreamStartResponse> {
-    let evicted_sessions = stop_existing_sessions(state).await.map_err(|error| {
-        error_response(
-            StatusCode::BAD_GATEWAY,
-            error_codes::SESSION_STOP_FAILED,
-            error,
-        )
-    })?;
+    let evicted_sessions = stop_existing_sessions(state).await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
     maybe_show_stream_window(state, ui_settings);
@@ -757,14 +856,22 @@ pub(super) async fn handle_relay_stream_start(
         .or(remote_response.stream_title);
     let response_quality = local_session_info.quality_level;
 
+    let remote = RemoteSessionTarget {
+        base_url: relay_target.base_url.clone(),
+        session_id: remote_session_id.clone(),
+        token: relay_target.remote_token.clone(),
+    };
+    let (hb_tx, hb_rx) = mpsc::channel::<()>(1);
     let session = Session::new_remote(
         local_session_info,
         relay_target.base_url.clone(),
         remote_session_id,
         relay_target.remote_token.clone(),
         relay_target.selected_peer.clone(),
+        hb_tx,
     );
     state.sessions.insert(session_id.clone(), session);
+    spawn_relay_session_keepalive(state.clone(), session_id.clone(), remote, hb_rx);
 
     emit_status_update(state).await;
     maybe_show_stream_notification(state, ui_settings, response_app_name.as_deref());
@@ -793,20 +900,14 @@ pub(super) async fn handle_local_stream_start(
     let runtime_backend = resolve_runtime_backend(&gpu)?;
 
     // Kill any active sessions before starting a new one — only one stream at a time.
-    let evicted_sessions = stop_existing_sessions(state).await.map_err(|error| {
-        error_response(
-            StatusCode::BAD_GATEWAY,
-            error_codes::SESSION_STOP_FAILED,
-            error,
-        )
-    })?;
+    let evicted_sessions = stop_existing_sessions(state).await;
 
     let output_resolution = settings.resolution.clone();
     let quality_level = clamp_quality(&output_resolution, settings.quality);
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let session_dir = state.tmp_dir.join(&session_id);
-    std::fs::create_dir_all(&session_dir).ok();
+    tokio::fs::create_dir_all(&session_dir).await.ok();
 
     let startup_context = build_startup_context(
         state,
@@ -817,10 +918,10 @@ pub(super) async fn handle_local_stream_start(
         &extra_headers,
         quality_level,
         req.content_kind,
+        req.display_refresh_rate,
     )
     .await;
 
-    let packager_playlist_path = session_dir.join("index.m3u8");
     let profile = settings
         .encoding_profiles
         .get(&output_resolution)
@@ -877,6 +978,10 @@ pub(super) async fn handle_local_stream_start(
             source_fps: startup_context.pipeline_request.source_fps,
             target_fps: startup_context.target_fps,
             framegen_enabled: startup_context.framegen_enabled,
+            framegen_engine: startup_context
+                .execution_plan
+                .framegen_label()
+                .map(String::from),
             hdr_enabled: settings.hdr,
             quality_level: startup_context.quality_level,
             executor: startup_context.execution_plan.executor,
@@ -895,45 +1000,22 @@ pub(super) async fn handle_local_stream_start(
 
     state.sessions.insert(session_id.clone(), session);
 
-    let streaming_rife_params = match (
-        startup_context.runtime_backend.rife_worker_path.clone(),
-        startup_context.runtime_backend.rife_model_path.clone(),
-    ) {
-        (Some(rife_worker_path), Some(model_path)) => Some(StreamingRifeParams {
-            rife_worker_path,
-            ffmpeg_path: startup_context.runtime_backend.ffmpeg_path.clone(),
-            model_path,
-        }),
-        _ => None,
+    let launch = PipelineLaunch {
+        session_id: session_id.clone(),
+        source: startup_context.source_descriptor,
+        execution_plan: startup_context.execution_plan,
+        rife_fallback_plan: startup_context.rife_fallback_plan,
+        output_resolution: output_resolution.clone(),
+        profile,
+        session_dir,
+        backend: startup_context.runtime_backend,
     };
-    start_pipeline(
-        &session_id,
-        &startup_context.source_descriptor,
-        &output_resolution,
-        &profile,
-        &startup_context.execution_plan,
-        &packager_playlist_path,
-        &startup_context.runtime_backend.gpu_vendor,
-        &startup_context.runtime_backend.encoder_backend,
-        &startup_context.runtime_backend.encoder_path,
-        &startup_context.runtime_backend.ffmpeg_path,
-        streaming_rife_params,
-        &state.sessions,
-        &session_dir,
-        completion,
-        hb_rx,
-    );
+    let playlist_path = launch.playlist_path();
+    start_pipeline(launch, &state.sessions, completion, hb_rx);
 
     // Session startup completion is gated on the packager-owned final playlist,
     // even when the current backend happens to emit that playlist inline.
-    match wait_for_packager_playlist(
-        &packager_playlist_path,
-        &session_id,
-        &state.sessions,
-        180_000,
-    )
-    .await
-    {
+    match wait_for_packager_playlist(&playlist_path, &session_id, &state.sessions, 180_000).await {
         PlaylistWaitOutcome::Ready => {}
         PlaylistWaitOutcome::SessionEnded => {
             return Err(error_response(
@@ -985,33 +1067,10 @@ pub(super) async fn handle_heartbeat(
 ) -> HandlerResult<Json<OkResponse>> {
     if let Some(session) = state.sessions.get(&session_id) {
         // A full channel (previous heartbeat not yet consumed) is fine — the session is alive.
-        // Remote-backed sessions do not own a local heartbeat channel, so this
-        // becomes a no-op until forwarded relay heartbeats are added.
+        // Relay-backed sessions hand the heartbeat to their keepalive task, which owns the
+        // peer round trip and removes the session once the remote half is gone, so the
+        // next heartbeat then gets a 404 here without this handler touching the LAN.
         session.try_send_heartbeat();
-        let remote = session.remote_backing().cloned();
-        drop(session);
-
-        if let Some(remote) = remote {
-            match forward_remote_heartbeat_request(&remote).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    cleanup_session(&session_id, &state.sessions).await;
-                    emit_status_update(&state).await;
-                    return Err(error_response(
-                        StatusCode::NOT_FOUND,
-                        error_codes::SESSION_NOT_FOUND,
-                        "Relay-backed session is no longer active on the linked REFEREE instance.",
-                    ));
-                }
-                Err(error) => {
-                    return Err(error_response(
-                        StatusCode::BAD_GATEWAY,
-                        error_codes::RELAY_HEARTBEAT_FAILED,
-                        error,
-                    ));
-                }
-            }
-        }
         Ok(Json(OkResponse {
             status: "ok".to_string(),
         }))
@@ -1052,15 +1111,7 @@ pub(super) async fn handle_stream_stop(
     if req.stop_all {
         let ids: Vec<String> = state.sessions.iter().map(|e| e.key().clone()).collect();
         for id in &ids {
-            stop_tracked_session(id, &state.sessions)
-                .await
-                .map_err(|error| {
-                    error_response(
-                        StatusCode::BAD_GATEWAY,
-                        error_codes::RELAY_STOP_FAILED,
-                        error,
-                    )
-                })?;
+            stop_tracked_session(id, &state.sessions).await;
         }
     } else {
         let session_id = req.session_id.ok_or_else(|| {
@@ -1072,15 +1123,7 @@ pub(super) async fn handle_stream_stop(
         })?;
 
         let session_id = resolve_session_id(&state.sessions, session_id)?;
-        let stopped_app_name = stop_tracked_session(&session_id, &state.sessions)
-            .await
-            .map_err(|error| {
-                error_response(
-                    StatusCode::BAD_GATEWAY,
-                    error_codes::RELAY_STOP_FAILED,
-                    error,
-                )
-            })?;
+        let stopped_app_name = stop_tracked_session(&session_id, &state.sessions).await;
         #[cfg(feature = "headless")]
         let _ = &stopped_app_name;
 
@@ -1119,7 +1162,7 @@ pub(super) async fn serve_tmp_file(
 ) -> Result<axum::response::Response, StatusCode> {
     let session_dir = match state.sessions.get(&session_id) {
         Some(session) => {
-            if let Some(remote) = session.remote_backing().cloned() {
+            if let Some(remote) = session.remote_backing().map(RemoteSessionTarget::from) {
                 drop(session);
                 return serve_remote_tmp_file(&session_id, &filename, &remote, &req).await;
             }
@@ -1192,7 +1235,58 @@ pub(super) async fn handle_input_proxy(
     .await
 }
 
-pub(super) fn build_remote_tmp_proxy_url(session_id: &str, target_url: &reqwest::Url) -> String {
+/// Returns the file name when `target_url` is a flat file in the remote
+/// session's output directory, which is everything the peer's own
+/// `/v1/tmp/{session_id}/{filename}` route can serve.
+pub(super) fn remote_session_output_filename<'a>(
+    remote: &RemoteSessionTarget,
+    target_url: &'a reqwest::Url,
+) -> Option<&'a str> {
+    let base_url = reqwest::Url::parse(&remote.base_url).ok()?;
+    if target_url.scheme() != base_url.scheme()
+        || target_url.host_str() != base_url.host_str()
+        || target_url.port_or_known_default() != base_url.port_or_known_default()
+        || target_url.query().is_some()
+        || target_url.fragment().is_some()
+    {
+        return None;
+    }
+
+    let mut segments = target_url.path_segments()?;
+    let filename = match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("v1"), Some("tmp"), Some(session_id), Some(filename), None)
+            if session_id == remote.session_id =>
+        {
+            filename
+        }
+        _ => return None,
+    };
+
+    (!filename.is_empty() && filename != "." && filename != "..").then_some(filename)
+}
+
+pub(super) fn build_remote_tmp_proxy_url(
+    session_id: &str,
+    remote: &RemoteSessionTarget,
+    target_url: &reqwest::Url,
+) -> String {
+    // The peer's output is flat files under its session directory. Mapping those
+    // straight onto the local session path keeps rewritten playlists short and
+    // keeps the peer's LAN address out of what the browser sees. Anything else
+    // keeps the explicit `?url=` form, validated again on the way back in.
+    if let Some(filename) = remote_session_output_filename(remote, target_url) {
+        return format!(
+            "http://localhost:{}/v1/tmp/{}/{}",
+            PORT, session_id, filename
+        );
+    }
+
     let filename = target_url
         .path_segments()
         .and_then(|segments| segments.last())
@@ -1210,20 +1304,19 @@ pub(super) fn build_remote_tmp_proxy_url(session_id: &str, target_url: &reqwest:
 }
 
 pub(super) fn build_remote_tmp_target_url(
-    remote: &RemoteSessionBacking,
+    remote: &RemoteSessionTarget,
     filename: &str,
     requested_url: Option<&str>,
 ) -> Result<reqwest::Url, StatusCode> {
-    let base_url =
-        reqwest::Url::parse(&remote.remote_base_url).map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let allowed_prefix = format!("/v1/tmp/{}/", remote.remote_session_id);
+    let base_url = reqwest::Url::parse(&remote.base_url).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let allowed_prefix = format!("/v1/tmp/{}/", remote.session_id);
 
     let target_url = match requested_url {
         Some(raw) => reqwest::Url::parse(raw).map_err(|_| StatusCode::BAD_REQUEST)?,
         None => reqwest::Url::parse(&format!(
             "{}/v1/tmp/{}/{}",
-            remote.remote_base_url.trim_end_matches('/'),
-            remote.remote_session_id,
+            remote.base_url.trim_end_matches('/'),
+            remote.session_id,
             filename
         ))
         .map_err(|_| StatusCode::BAD_GATEWAY)?,
@@ -1247,7 +1340,7 @@ pub(super) fn build_remote_tmp_target_url(
 pub(super) async fn serve_remote_tmp_file(
     session_id: &str,
     filename: &str,
-    remote: &RemoteSessionBacking,
+    remote: &RemoteSessionTarget,
     request: &TmpFileRequest,
 ) -> Result<axum::response::Response, StatusCode> {
     let target_url = build_remote_tmp_target_url(remote, filename, request.url.as_deref())?;
@@ -1257,7 +1350,7 @@ pub(super) async fn serve_remote_tmp_file(
             StatusCode::BAD_GATEWAY
         })?
         .get(target_url.clone())
-        .header("X-Referee-Token", remote.remote_token.as_str())
+        .header("X-Referee-Token", remote.token.as_str())
         .send()
         .await
         .map_err(|error| {
@@ -1283,7 +1376,7 @@ pub(super) async fn serve_remote_tmp_file(
         let body = upstream.text().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
         let rewritten =
             hls_relay::rewrite_hls_manifest_with_target_resolver(&target_url, &body, |resolved| {
-                Some(build_remote_tmp_proxy_url(session_id, resolved))
+                Some(build_remote_tmp_proxy_url(session_id, remote, resolved))
             });
         let manifest_content_type = content_type
             .as_deref()

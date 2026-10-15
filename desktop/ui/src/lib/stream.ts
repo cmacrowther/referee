@@ -5,6 +5,8 @@ import {
     DEFAULT_SETTINGS,
     DEFAULT_STATUS,
     type ExecutorPreference,
+    type FramegenEngine,
+    type FramegenTarget,
     type RelayPeerMetadata,
     type Session,
     type Settings,
@@ -12,6 +14,7 @@ import {
     type SettingsUiFeatureSupport,
     type SettingsUiLockState,
     type SettingsUiResolvedPath,
+    type SettingsUiResolvedPathKind,
     type SettingsUiSupportKind,
     type Status,
 } from '@/lib/types'
@@ -74,6 +77,87 @@ function normalizeRelayPeerMetadata(peer?: Partial<RelayPeerMetadata> | null): R
  * @param value - Candidate value (legacy alias or canonical identifier) to normalize
  * @returns `'nvidiaAi'`, `'amdAi'`, or `'universal'` for recognized inputs; otherwise the default executor preference
  */
+const FRAMEGEN_TARGETS: readonly FramegenTarget[] = ['30fps', '60fps', 'matchDisplay']
+const FRAMEGEN_ENGINES: readonly FramegenEngine[] = ['opticalFlow', 'rife', 'nativeDouble']
+
+export function normalizeFramegenTarget(value: unknown): FramegenTarget {
+    return FRAMEGEN_TARGETS.find(target => target === value) ?? DEFAULT_SETTINGS.framegenTarget
+}
+
+export function normalizeFramegenEngine(value: unknown): FramegenEngine {
+    // Settings saved before AMD Fluid Motion name the NVIDIA-only engine.
+    if (value === 'nvidiaFramegen') return 'nativeDouble'
+    return FRAMEGEN_ENGINES.find(engine => engine === value) ?? DEFAULT_SETTINGS.framegenEngine
+}
+
+export const FRAMEGEN_TARGET_OPTIONS: ReadonlyArray<{ value: FramegenTarget; label: string }> = [
+    { value: '30fps', label: '30 FPS' },
+    { value: '60fps', label: '60 FPS' },
+    { value: 'matchDisplay', label: 'Match Display' },
+]
+
+export interface FramegenEngineOption {
+    value: FramegenEngine
+    label: string
+    available: boolean
+    /** Why the engine cannot run, when it is unavailable. */
+    reason: string | null
+}
+
+/**
+ * Lists the frame generation engines for the resolved processing path with
+ * their availability. Native doubling is offered only on the vendor paths:
+ * NVIDIA Framegen on NVIDIA, AMD Fluid Motion on AMD. An unavailable engine
+ * falls back to the path's built-in interpolation when a stream starts.
+ */
+export function getFramegenEngineOptions(status: Status, pathKind: SettingsUiResolvedPathKind): FramegenEngineOption[] {
+    const rifeAvailable = status.encoderHasRife === true
+    const rife: FramegenEngineOption = {
+        value: 'rife',
+        label: 'RIFE',
+        available: rifeAvailable,
+        reason: rifeAvailable ? null : 'Needs rife-worker and a RIFE model.',
+    }
+
+    const nativeDoubleAvailable = status.encoderHasNativeDouble === true
+    if (pathKind === 'nvidiaNative') {
+        return [
+            { value: 'opticalFlow', label: 'Optical Flow (FRUC)', available: true, reason: null },
+            rife,
+            {
+                value: 'nativeDouble',
+                label: 'Double via NVIDIA Framegen',
+                available: nativeDoubleAvailable,
+                reason: nativeDoubleAvailable ? null : 'Requires an NVIDIA® RTX 40 Series or newer GPU.',
+            },
+        ]
+    }
+
+    if (pathKind === 'amdNative') {
+        return [
+            { value: 'opticalFlow', label: 'FFmpeg Motion Interpolation', available: true, reason: null },
+            rife,
+            {
+                value: 'nativeDouble',
+                label: 'Double via AMD Fluid Motion',
+                available: nativeDoubleAvailable,
+                reason: nativeDoubleAvailable ? null : 'Requires VCEEncC with AMF frame rate conversion on Windows.',
+            },
+        ]
+    }
+
+    const amd = normalizeGpuVendor(status.gpuVendor) === 'amd'
+    return [
+        {
+            value: 'opticalFlow',
+            label: amd ? 'FFmpeg Motion Interpolation' : 'Optical Flow (FRUC)',
+            available: amd,
+            reason: amd ? null : 'Requires the NVIDIA® NVEncC path.',
+        },
+        rife,
+    ]
+}
+
 export function normalizeExecutorPreference(value: unknown): ExecutorPreference {
     if (!import.meta.env.DEV) {
         return DEFAULT_SETTINGS.executorPreference
@@ -111,7 +195,7 @@ export function normalizeActiveProcessingEngine(value?: string | null): ActivePr
         .replace(/executor$/i, '')
         .toLowerCase()
     if (normalized === 'nvidiaspecialized' || normalized === 'nvidia') return 'nvidiaAi'
-    if (normalized === 'amd' || normalized === 'amdai') return 'amdAi'
+    if (normalized === 'amdspecialized' || normalized === 'amd' || normalized === 'amdai') return 'amdAi'
     if (normalized === 'universal') return 'universal'
     if (normalized === 'cpu') return 'cpu'
     return null
@@ -143,6 +227,8 @@ export function normalizeSettings(settings?: Partial<Settings>): Settings {
         resolution,
         quality: clampQualityForResolution(resolution, settings?.quality ?? DEFAULT_SETTINGS.quality),
         framegen: Boolean(settings?.framegen ?? DEFAULT_SETTINGS.framegen),
+        framegenTarget: normalizeFramegenTarget(settings?.framegenTarget),
+        framegenEngine: normalizeFramegenEngine(settings?.framegenEngine),
         hdr: Boolean(settings?.hdr ?? DEFAULT_SETTINGS.hdr),
         executorPreference,
         alwaysOnTop: Boolean(settings?.alwaysOnTop ?? DEFAULT_SETTINGS.alwaysOnTop),
@@ -231,6 +317,12 @@ function normalizeSession(session?: (Partial<Session> & Record<string, unknown>)
                 : typeof session.framegen_enabled === 'boolean'
                   ? session.framegen_enabled
                   : false,
+        framegenEngine:
+            typeof session.framegenEngine === 'string'
+                ? session.framegenEngine
+                : typeof session.framegen_engine === 'string'
+                  ? session.framegen_engine
+                  : null,
         hdrEnabled: typeof session.hdrEnabled === 'boolean' ? session.hdrEnabled : typeof session.hdr_enabled === 'boolean' ? session.hdr_enabled : false,
         qualityLevel:
             typeof session.qualityLevel === 'number' ? session.qualityLevel : typeof session.quality_level === 'number' ? session.quality_level : null,
@@ -262,7 +354,7 @@ function normalizeSession(session?: (Partial<Session> & Record<string, unknown>)
  * - sessions are normalized and filtered into a `sessions` array and `primarySession` is resolved
  * - `activeSessions` is derived from available keys
  * - GPS and encoder fields (`gpuReady`, `gpuName`, `gpuVendor`, `gpuUtilization`, `encoderBackend`) are validated and normalized
- * - executor/availability flags (`selectedExecutor`, `nvidiaAiAvailable`, `amdAiAvailable`, `encoderHasFramegen`, `encoderHasTruehdr`, `encoderHasRife`) are normalized from multiple possible keys
+ * - executor/availability flags (`selectedExecutor`, `nvidiaAiAvailable`, `amdAiAvailable`, `encoderHasFramegen`, `encoderHasNativeDouble`, `encoderHasTruehdr`, `encoderHasHdrTonemap`, `encoderHasRife`) are normalized from multiple possible keys
  * - `settings` is merged with `DEFAULT_STATUS.settings`
  */
 export function normalizeStatus(status?: StatusLike): Status {
@@ -300,7 +392,12 @@ export function normalizeStatus(status?: StatusLike): Status {
     const amdAiAvailable =
         typeof status?.amdAiAvailable === 'boolean' ? status.amdAiAvailable : typeof status?.amd_ai_available === 'boolean' ? status.amd_ai_available : null
     const encoderHasFramegen = readBoolean(status?.encoderHasFramegen) ?? readBoolean(status?.encoder_has_framegen)
+    const encoderHasNativeDouble =
+        readBoolean(status?.encoderHasNativeDouble) ??
+        readBoolean(status?.encoder_has_native_double) ??
+        readBoolean(status?.encoderHasNvidiaFramegen)
     const encoderHasTruehdr = readBoolean(status?.encoderHasTruehdr) ?? readBoolean(status?.encoder_has_truehdr)
+    const encoderHasHdrTonemap = readBoolean(status?.encoderHasHdrTonemap) ?? readBoolean(status?.encoder_has_hdr_tonemap)
     const encoderHasRife = readBoolean(status?.encoderHasRife) ?? readBoolean(status?.encoder_has_rife)
 
     return {
@@ -320,9 +417,13 @@ export function normalizeStatus(status?: StatusLike): Status {
         settings: {
             ...DEFAULT_STATUS.settings,
             ...status?.settings,
+            framegenTarget: normalizeFramegenTarget(status?.settings?.framegenTarget),
+            framegenEngine: normalizeFramegenEngine(status?.settings?.framegenEngine),
         },
         encoderHasFramegen,
+        encoderHasNativeDouble,
         encoderHasTruehdr,
+        encoderHasHdrTonemap,
         encoderHasRife,
     }
 }
@@ -427,7 +528,10 @@ function createFeatureSupportState({
 function deriveResolvedPath(settings: Settings, status: Status, detectionPending: boolean): SettingsUiResolvedPath {
     const activeEngine = normalizeActiveProcessingEngine(status.selectedExecutor)
     const gpuVendor = normalizeGpuVendor(status.gpuVendor)
-    const amdNativeLikely = gpuVendor === 'amd' && status.amdAiAvailable === true && (settings.executorPreference === 'amdAi' || activeEngine === 'universal')
+    // Before the backend reports its executor, an AMD GPU with VCEEncC will
+    // resolve to the AMD path unless Universal is forced.
+    const amdNativeLikely =
+        activeEngine === null && gpuVendor === 'amd' && status.amdAiAvailable === true && settings.executorPreference !== 'universal'
 
     if (activeEngine === 'nvidiaAi') {
         return {
@@ -448,8 +552,8 @@ function deriveResolvedPath(settings: Settings, status: Status, detectionPending
     if (amdNativeLikely) {
         return {
             kind: 'amdNative',
-            label: 'AMD® Native / Universal Graph',
-            reason: 'AMD® acceleration is available even though the graph-level executor reports Universal.',
+            label: 'AMD® Native',
+            reason: 'AMD® acceleration through VCEEncC is available.',
         }
     }
 
@@ -648,8 +752,8 @@ function getUpscaleSupport(resolvedPath: SettingsUiResolvedPath, lockState: Sett
         return createFeatureSupportState({
             support: 'native',
             lockState,
-            sourceLabel: 'AMD® native upscale',
-            reason: 'Uses the AMD® runtime upscale path when available.',
+            sourceLabel: 'AMD® FSR upscale',
+            reason: 'Uses AMD® FidelityFX™ Super Resolution in VCEEncC.',
         })
     }
 
@@ -689,12 +793,30 @@ function getFramegenSupport(status: Status, resolvedPath: SettingsUiResolvedPath
         })
     }
 
+    if (resolvedPath.kind === 'amdNative' && status.encoderHasNativeDouble === true) {
+        return createFeatureSupportState({
+            support: 'native',
+            lockState,
+            sourceLabel: 'AMD® Fluid Motion',
+            reason: 'Boost frames with AMD® Fluid Motion frame rate conversion.',
+        })
+    }
+
     if (status.encoderHasRife === true) {
         return createFeatureSupportState({
             support: 'fallback',
             lockState,
             sourceLabel: 'RIFE interpolation',
             reason: 'Boost frames with RIFE AI-powered frame interpolation.',
+        })
+    }
+
+    if (resolvedPath.kind === 'amdNative') {
+        return createFeatureSupportState({
+            support: 'fallback',
+            lockState,
+            sourceLabel: 'FFmpeg motion interpolation',
+            reason: 'Boost frames with FFmpeg motion-compensated interpolation.',
         })
     }
 
@@ -713,7 +835,7 @@ function getFramegenSupport(status: Status, resolvedPath: SettingsUiResolvedPath
  * @param resolvedPath - Derived executor/path resolution used to determine native vs fallback support
  * @param lockState - UI lock state that may disable the feature
  * @param detectionPending - Whether hardware detection is still in progress
- * @returns A SettingsUiFeatureSupport object: `native` when NVIDIA TrueHDR is available, `fallback` when a non-pending path can provide HDR mapping, or `unavailable` with a reason when detection is pending or no path is available
+ * @returns A SettingsUiFeatureSupport object: `native` when NVIDIA TrueHDR or AMD's VCEEncC HDR mapping is available, `fallback` when a non-pending path can provide HDR mapping, or `unavailable` with a reason when detection is pending or no path is available
  */
 function getHdrSupport(status: Status, resolvedPath: SettingsUiResolvedPath, lockState: SettingsUiLockState, detectionPending: boolean) {
     if (resolvedPath.kind === 'nvidiaNative' && status.encoderHasTruehdr === true) {
@@ -722,6 +844,15 @@ function getHdrSupport(status: Status, resolvedPath: SettingsUiResolvedPath, loc
             lockState,
             sourceLabel: 'NVIDIA® TrueHDR',
             reason: 'Convert SDR content to HDR with NVIDIA® RTX™ HDR.',
+        })
+    }
+
+    if (resolvedPath.kind === 'amdNative' && status.encoderHasHdrTonemap === true) {
+        return createFeatureSupportState({
+            support: 'native',
+            lockState,
+            sourceLabel: 'AMD® HDR mapping',
+            reason: 'Convert SDR content to HDR on the AMD® GPU while encoding.',
         })
     }
 
@@ -820,7 +951,9 @@ export function deriveSettingsUiCapabilities(settings: Settings, status: Status,
             reason:
                 resolvedPath.kind === 'nvidiaNative'
                     ? 'The current advanced controls still reflect NVENC-style tuning.'
-                    : 'Advanced controls should be normalized before they drive non-NVIDIA paths.',
+                    : resolvedPath.kind === 'amdNative'
+                      ? 'VCEEncC maps presets P1–P2 to fast, P3–P5 to balanced, and P6–P7 to slow.'
+                      : 'Advanced controls should be normalized before they drive non-NVIDIA paths.',
         },
     }
 }
@@ -900,7 +1033,7 @@ export function formatEncoderBackend(value?: string | null) {
  * Formats an executor identifier into a human-readable label.
  *
  * @param value - Executor identifier (e.g., `"nvidia"`, `"universal"`, `"cpu"`) or null/undefined
- * @returns `'NVIDIA® AI'`, `'Universal'`, or `'CPU'` for recognized identifiers; `'Not Selected'` when `value` is missing; otherwise returns the original `value`
+ * @returns `'NVIDIA® AI'`, `'AMD® AI'`, `'Universal'`, or `'CPU'` for recognized identifiers; `'Not Selected'` when `value` is missing; otherwise returns the original `value`
  */
 export function formatExecutorKind(value?: string | null) {
     if (!value) {
@@ -913,6 +1046,7 @@ export function formatExecutorKind(value?: string | null) {
         .replace(/executor$/i, '')
         .toLowerCase()
     if (normalized === 'nvidiaspecialized' || normalized === 'nvidia') return 'NVIDIA® AI'
+    if (normalized === 'amdspecialized' || normalized === 'amd') return 'AMD® AI'
     if (normalized === 'universal') return 'Universal'
     if (normalized === 'cpu') return 'CPU'
     return value
@@ -942,6 +1076,7 @@ export function formatSourceContentKind(value?: string | null) {
  * - `artcnn` → `ArtCNN`
  * - `libplacebo` → `Placebo`
  * - `nvidiaai` → `NVIDIA® AI`
+ * - `amdfsr` → `AMD® FSR`
  * - otherwise returns the original `value`
  */
 export function formatUpscalerLabel(value?: string | null) {
@@ -957,6 +1092,7 @@ export function formatUpscalerLabel(value?: string | null) {
     if (normalized === 'artcnn') return 'ArtCNN'
     if (normalized === 'libplacebo') return 'Placebo'
     if (normalized === 'nvidiaai') return 'NVIDIA® AI'
+    if (normalized === 'amdfsr') return 'AMD® FSR'
     return value
 }
 
@@ -1011,7 +1147,22 @@ export function hasPendingSession(status?: Status | null) {
 }
 
 export function getStandbyFrameRateLabel(settings: Settings) {
-    return settings.framegen ? 'Up to 60 FPS' : 'Native'
+    if (!settings.framegen) {
+        return 'Native'
+    }
+
+    if (settings.framegenEngine === 'nativeDouble') {
+        return '2x Source'
+    }
+
+    switch (settings.framegenTarget) {
+        case '30fps':
+            return 'Up to 30 FPS'
+        case 'matchDisplay':
+            return 'Match Display'
+        default:
+            return 'Up to 60 FPS'
+    }
 }
 
 export function getFrameRateTone(frameRateValue: number | null | undefined, hasActiveStream: boolean) {

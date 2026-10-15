@@ -2,6 +2,8 @@ use super::*;
 
 #[derive(Deserialize)]
 pub(super) struct AuthRequestBody {
+    // The SDK and relay linking send camelCase `appName`; snake_case stays accepted.
+    #[serde(alias = "appName")]
     app_name: Option<String>,
 }
 
@@ -394,6 +396,20 @@ pub(super) fn apply_stream_settings_patch(
 
     if let Some(framegen) = object.get("framegen").and_then(|value| value.as_bool()) {
         settings.framegen = framegen;
+    }
+
+    if let Some(target) = object
+        .get("framegenTarget")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+    {
+        settings.framegen_target = target;
+    }
+
+    if let Some(engine) = object
+        .get("framegenEngine")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+    {
+        settings.framegen_engine = engine;
     }
 
     if let Some(hdr) = object.get("hdr").and_then(|value| value.as_bool()) {

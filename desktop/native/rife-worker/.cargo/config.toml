@@ -1,0 +1,4 @@
+# Link the C and C++ runtimes statically on Windows so rife-worker.exe does not
+# depend on the Visual C++ redistributable (msvcp140.dll) being installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

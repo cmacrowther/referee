@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::{
     ffmpeg_binary, rife_worker_binary, vs_rife_model_install_dir, FFMPEG_PATH_ENV,
@@ -158,6 +157,17 @@ pub fn resolve_rife_worker_path(lib_dir: &Path) -> Option<PathBuf> {
         }
     }
 
+    // Development builds: the worker crate's own release build.
+    #[cfg(debug_assertions)]
+    {
+        let candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("rife-worker/target/release")
+            .join(rife_worker_binary());
+        if let Some(p) = normalized_existing_path(candidate) {
+            return Some(p);
+        }
+    }
+
     // 3. lib_dir fallback.
     if let Some(p) = normalized_existing_path(lib_dir.join(rife_worker_binary())) {
         return Some(p);
@@ -187,7 +197,7 @@ pub fn resolve_rife_model_path(lib_dir: &Path) -> Option<PathBuf> {
         let p = PathBuf::from(&val);
         if !p.as_os_str().is_empty() {
             let p = fs::canonicalize(&p).unwrap_or(p);
-            if p.is_dir() {
+            if rife_model_complete(&p) {
                 return Some(p);
             }
         }
@@ -196,12 +206,19 @@ pub fn resolve_rife_model_path(lib_dir: &Path) -> Option<PathBuf> {
     let models_base = vs_rife_model_install_dir(lib_dir);
     for model_name in RIFE_DEFAULT_MODEL_DIRS {
         let candidate = models_base.join(model_name);
-        if candidate.is_dir() {
+        if rife_model_complete(&candidate) {
             return Some(fs::canonicalize(&candidate).unwrap_or(candidate));
         }
     }
 
     None
+}
+
+/// A directory alone can be left by an interrupted model download.
+pub(super) fn rife_model_complete(path: &Path) -> bool {
+    ["flownet.param", "flownet.bin"].iter().all(|name| {
+        fs::metadata(path.join(name)).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -442,19 +459,12 @@ pub(super) fn is_known_rife_model_dir_name(name: &str) -> bool {
 /// # Returns
 /// `Ok(String)` containing FFmpeg's stdout on success; `Err(String)` with a descriptive error message otherwise.
 fn run_ffmpeg_probe(ffmpeg_path: &Path, args: &[&str], probe_name: &str) -> Result<String, String> {
-    let mut command = Command::new(ffmpeg_path);
-    command.args(args);
-    crate::process::hide_std_command_window(&mut command);
-    let output = command
-        .output()
+    let output = crate::process::cached_probe_output(ffmpeg_path, args)
         .map_err(|e| format!("Failed to inspect FFmpeg {}: {}", probe_name, e))?;
-    if !output.status.success() {
-        return Err(format!(
-            "FFmpeg {} probe failed with status {}",
-            probe_name, output.status
-        ));
+    if !output.success {
+        return Err(format!("FFmpeg {} probe failed", probe_name));
     }
-    String::from_utf8(output.stdout)
+    String::from_utf8(output.stdout.clone())
         .map_err(|e| format!("FFmpeg {} output was not valid UTF-8: {}", probe_name, e))
 }
 
@@ -480,7 +490,7 @@ pub fn detect_ffmpeg_filter(ffmpeg_path: &Path, filter_name: &str) -> bool {
 /// # Returns
 ///
 /// `true` if any line contains `filter_name` as the second whitespace-separated token, `false` otherwise.
-fn parse_ffmpeg_filter_support(filters_output: &str, filter_name: &str) -> bool {
+pub(super) fn parse_ffmpeg_filter_support(filters_output: &str, filter_name: &str) -> bool {
     filters_output
         .lines()
         .any(|line| line.split_whitespace().nth(1) == Some(filter_name))
@@ -490,7 +500,7 @@ fn parse_ffmpeg_filter_support(filters_output: &str, filter_name: &str) -> bool 
 ///
 /// # Examples
 ///
-fn parse_ffmpeg_buildconf_flag(buildconf_output: &str, flag: &str) -> bool {
+pub(super) fn parse_ffmpeg_buildconf_flag(buildconf_output: &str, flag: &str) -> bool {
     buildconf_output
         .lines()
         .map(str::trim)

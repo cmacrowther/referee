@@ -91,6 +91,75 @@ describe('UpscalerSettingsCard', () => {
         expect(onChange).toHaveBeenCalledWith({ framegen: false });
     });
 
+    it('switches between frame rates and NVIDIA Framegen in one list on the NVIDIA path', () => {
+        const onChange = vi.fn();
+        const nvidiaStatus = {
+            ...DEFAULT_STATUS,
+            gpuReady: true,
+            gpuVendor: 'nvidia',
+            selectedExecutor: 'nvidiaSpecialized',
+            nvidiaAiAvailable: true,
+            encoderHasFramegen: true,
+            encoderHasNativeDouble: true,
+        };
+        const { rerender } = render(
+            <UpscalerSettingsCard
+                settings={DEFAULT_SETTINGS}
+                locked={false}
+                status={nvidiaStatus}
+                engineSettings={false}
+                onChange={onChange}
+            />
+        );
+
+        fireEvent.change(screen.getByRole('combobox', { name: 'Frame Rate' }), { target: { value: 'nativeDouble' } });
+        expect(onChange).toHaveBeenCalledWith({ framegenEngine: 'nativeDouble' });
+
+        fireEvent.change(screen.getByRole('combobox', { name: 'Frame Rate' }), { target: { value: 'matchDisplay' } });
+        expect(onChange).toHaveBeenCalledWith({ framegenTarget: 'matchDisplay' });
+        expect(
+            (screen.getByRole('option', { name: 'RIFE (unavailable)' }) as HTMLOptionElement).disabled
+        ).toBe(true);
+        expect(
+            (screen.getByRole('option', { name: 'Optical Flow (FRUC)' }) as HTMLOptionElement).disabled
+        ).toBe(false);
+
+        rerender(
+            <UpscalerSettingsCard
+                settings={{ ...DEFAULT_SETTINGS, framegenEngine: 'nativeDouble' }}
+                locked={false}
+                status={nvidiaStatus}
+                engineSettings={false}
+                onChange={onChange}
+            />
+        );
+
+        // While doubling, every frame rate stays one pick away and returns to optical flow.
+        const frameRate = screen.getByRole('combobox', { name: 'Frame Rate' }) as HTMLSelectElement;
+        expect(frameRate.disabled).toBe(false);
+        expect(frameRate.value).toBe('nativeDouble');
+        expect(screen.getByText('Doubles the source frame rate')).not.toBeNull();
+        expect(screen.queryByRole('combobox', { name: 'Interpolator' })).toBeNull();
+
+        fireEvent.change(frameRate, { target: { value: '60fps' } });
+        expect(onChange).toHaveBeenLastCalledWith({ framegenTarget: '60fps', framegenEngine: 'opticalFlow' });
+    });
+
+    it('hides frame generation options while Motion Boost is off', () => {
+        render(
+            <UpscalerSettingsCard
+                settings={{ ...DEFAULT_SETTINGS, framegen: false }}
+                locked={false}
+                status={{ ...DEFAULT_STATUS, gpuVendor: 'nvidia', selectedExecutor: 'nvidiaSpecialized', encoderHasFramegen: true }}
+                engineSettings={false}
+                onChange={vi.fn()}
+            />
+        );
+
+        expect(screen.queryByRole('combobox', { name: 'Frame Rate' })).toBeNull();
+        expect(screen.queryByRole('combobox', { name: 'Interpolator' })).toBeNull();
+    });
+
     it('locks remote relay settings when the linked peer is offline', () => {
         const onChange = vi.fn();
 

@@ -1,0 +1,26 @@
+[package]
+name = "rife-worker"
+version = "0.7.0"
+description = "NUT-in/NUT-out RIFE frame interpolation stage for the REFEREE pipeline."
+authors = ["cmacrowther"]
+edition = "2021"
+publish = false
+
+# Standalone: not a member of the main desktop crate's build.
+[workspace]
+
+[features]
+default = ["engine"]
+# Build and link the ncnn/VS-RIFE engine. Without it only the pure frame
+# scheduling and stream sniffing logic compiles, so it can be unit tested on
+# machines without a C++ toolchain.
+engine = []
+
+[build-dependencies]
+cmake = "0.1"
+cc = { version = "1", features = ["parallel"] }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"

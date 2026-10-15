@@ -42,7 +42,7 @@ Built for speed and extreme resource efficiency, REFEREE utilizes a modern, mult
 The backend uses a graph-based plan/execute model. Three executor implementations are selected at runtime based on hardware:
 
 * **`NvidiaSpecializedExecutor`** — Windows + NVIDIA, backed by NVEncC for native NGX-VSR upscaling, FRUC frame generation, and TrueHDR.
-* **`AmdExecutor`** — AMD path via VCEEncC with AMF-FSR upscaling.
+* **`AmdExecutor`** — AMD counterpart of the NVIDIA path, backed by VCEEncC: AMF FSR upscaling, "Double via AMD Fluid Motion" (AMF FRC, Windows), and SDR-to-HDR10 mapping. Falls back to the Universal path if VCEEncC fails to start.
 * **`UniversalExecutor`** — Cross-platform FFmpeg/libplacebo path. Supports Anime4K and ArtCNN GLSL shader upscaling, libplacebo HDR tonemapping, NVENC (Linux/NVIDIA), and VAAPI (Linux/AMD).
 
 Each request flows through Preprocess → Execute → Package stages, planned by a `GraphPlanner` that separates capability modelling from executor implementation. See the [developer docs](https://referee.craw.ca/developers) for the full breakdown.
@@ -119,14 +119,14 @@ For the full API reference, authentication details, CORS configuration, and reve
 
 **Pipeline / Enhancement**
 - **AI Upscaling** — NVIDIA NGX-VSR and AMD AMF-FSR for hardware-native upscaling. Anime4K and ArtCNN GLSL shader upscaling via the Universal executor for broader hardware reach.
-- **Frame Generation** — Motion-compensated frame interpolation for smoother playback (FRUC on NVIDIA; expanding to AMD/Linux).
+- **Frame Generation** — Boost to 30 or 60 FPS or match the viewer's display, with NVIDIA Optical Flow (FRUC), RIFE on any Vulkan GPU, or native doubling: "Double via NVIDIA Framegen" on RTX 40 Series and newer, "Double via AMD Fluid Motion" on AMD (Windows).
 - **TrueHDR** — On-the-fly SDR → HDR10/BT.2020 tone mapping.
 - **Low Latency** — Hardware-accelerated pipeline; 3–6 s end-to-end with standard HLS buffering.
 
 **Platform & Deployment**
 - **REFEREE Relay** — Devices without a compatible GPU can relay sessions to a capable peer on the same LAN.
 - **Headless / Self-Hosted** — Run `referee-server` standalone or via the provided Docker Compose stacks (NVIDIA and AMD profiles).
-- **Self-Contained** — All encoder dependencies download automatically on first run. No manual SDK configuration.
+- **Self-Contained** — Encoder dependencies install automatically and check for updates on every launch. Updates are validated before installation, with rollback and an offline fallback to working versions. No manual SDK configuration.
 
 **Developer Experience**
 - **TypeScript client** — `@cmacrowther/referee-client` on npm with full TypeScript types and a `useReferee()` React hook.

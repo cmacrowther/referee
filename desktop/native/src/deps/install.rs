@@ -182,7 +182,8 @@ pub(super) fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
 /// Installs platform-appropriate flat binary files from a source directory into a destination directory.
 ///
 /// This recursively traverses `source_dir`, copying files that match platform-specific criteria:
-/// on Windows, files with `exe` or `dll` extensions; on non-Windows, files with no extension that do not start with `.`.
+/// on Windows, files with `exe`, `dll`, or `json` extensions; on non-Windows,
+/// extensionless executables, shared libraries, and JSON resources.
 /// Copied files retain their filename and are placed directly in `dest_dir`. On Unix systems, copied files are
 /// given mode `0o755`.
 ///
@@ -206,7 +207,8 @@ pub(super) fn install_flat_binary_files(
     let entries =
         fs::read_dir(source_dir).map_err(|e| format!("Failed to read temp dir: {}", e))?;
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read binary entry: {e}"))?;
         let path = entry.path();
         if path.is_dir() {
             install_flat_binary_files(&path, dest_dir, label)?;
@@ -218,14 +220,22 @@ pub(super) fn install_flat_binary_files(
                 .unwrap_or_default();
 
             let should_keep = if cfg!(target_os = "windows") {
-                matches!(ext.as_str(), "exe" | "dll")
+                matches!(ext.as_str(), "exe" | "dll" | "json")
             } else {
                 // On Linux, executables have no extension (e.g. ffmpeg, ffprobe).
-                ext.is_empty() && !name.starts_with('.')
+                (ext.is_empty() && !name.starts_with('.')) || name.contains(".so") || ext == "json"
             };
 
             if should_keep {
                 let dest = dest_dir.join(&name);
+                if dest.exists() {
+                    if fs::read(&path).map_err(|e| e.to_string())?
+                        == fs::read(&dest).map_err(|e| e.to_string())?
+                    {
+                        continue;
+                    }
+                    return Err(format!("Conflicting files named {name} in {label} archive"));
+                }
                 fs::copy(&path, &dest).map_err(|e| format!("Failed to copy {}: {}", name, e))?;
                 info!("[Deps/Install]: Installed {}", name);
 
@@ -264,7 +274,8 @@ fn copy_vs_rife_model_dirs(source_dir: &Path, dest_dir: &Path) -> Result<(), Str
     let entries =
         fs::read_dir(source_dir).map_err(|e| format!("Failed to read temp dir: {}", e))?;
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read model entry: {e}"))?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -301,7 +312,8 @@ pub(super) fn copy_directory_recursive(source_dir: &Path, dest_dir: &Path) -> Re
     let entries = fs::read_dir(source_dir)
         .map_err(|e| format!("Failed to read {}: {}", source_dir.display(), e))?;
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
         let source = entry.path();
         let dest = dest_dir.join(entry.file_name());
         if source.is_dir() {

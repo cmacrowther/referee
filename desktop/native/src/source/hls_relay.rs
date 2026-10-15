@@ -7,11 +7,21 @@ use std::collections::HashMap;
 use super::classify_source_url;
 
 const INPUT_PROXY_USER_AGENT: &str = "REFEREE-InputProxy";
+/// Upstream stall bounds for the input proxy. NVEncC and the single-process
+/// FFmpeg executor pull through this proxy with no read timeout of their own,
+/// so a CDN connection that stalls mid-segment used to freeze the pipeline
+/// while client heartbeats kept the session alive. Failing the body instead
+/// lets the encoder's reconnect logic move on. The read timeout matches the
+/// staged normalizer's `-rw_timeout`.
+const INPUT_PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const INPUT_PROXY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 static INPUT_PROXY_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
             .user_agent(INPUT_PROXY_USER_AGENT)
+            .connect_timeout(INPUT_PROXY_CONNECT_TIMEOUT)
+            .read_timeout(INPUT_PROXY_READ_TIMEOUT)
             .build()
             .expect("Failed to build input proxy HTTP client")
     });

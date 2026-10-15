@@ -182,18 +182,21 @@ export function useSetup(api: RendererApi, setView: (view: AppView) => void) {
 
         if (!response.setupNeeded) {
             const inProgress = response.setupInProgress === true;
+            const complete = response.setupComplete ?? (!inProgress && !response.setupError);
             setSetupState(previous => ({
                 ...previous,
                 gpu,
                 error: response.setupError ?? null,
-                complete: response.setupComplete ?? !inProgress,
-                progress: response.setupProgress ?? {
-                    phase: 'done',
-                    percent: 100,
-                    detail: 'Setup complete'
-                }
+                complete,
+                progress: response.setupProgress ?? (!complete
+                    ? previous.progress ?? getFallbackSetupProgress(gpu.vendor)
+                    : {
+                        phase: 'done',
+                        percent: 100,
+                        detail: 'Setup complete'
+                    })
             }));
-            if (!inProgress) {
+            if (complete && !inProgress && !response.setupError) {
                 setView('status');
             } else {
                 setView('setup');

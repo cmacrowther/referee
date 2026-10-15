@@ -201,16 +201,12 @@ pub fn run() {
             // when it runs for the first time.
             let initial_capabilities = match (&gpu_info.backend, &gpu_info.encoder_path) {
                 (Some(backend), Some(encoder_path)) => {
-                    let rife = gpu_info
-                        .rife_worker_path
-                        .as_deref()
-                        .map(pipeline::detect_rife_capability)
-                        .unwrap_or(false);
+                    let rife = gpu_info.has_rife();
                     let caps = pipeline::detect_encoder_capabilities(encoder_path, backend)
                         .with_rife(rife);
                     info!(
-                        "[Main]: Encoder capabilities — fruc={}, truehdr={}, rife={}",
-                        caps.has_fruc, caps.has_truehdr, caps.has_rife
+                        "[Main]: Encoder capabilities — fruc={}, native-double={}, truehdr={}, rife={}",
+                        caps.has_fruc, caps.has_native_double, caps.has_truehdr, caps.has_rife
                     );
                     Some(caps)
                 }
@@ -236,6 +232,7 @@ pub fn run() {
                 rate_limit_stream: Arc::new(server::RateLimiter::new(3, 60)),
                 pending_consent_ui: Arc::new(std::sync::Mutex::new(None)),
                 setup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                relay_link: Arc::new(server::RelayLinkMonitor::default()),
             };
 
             let setup_done = Arc::new(Notify::new());
@@ -299,6 +296,7 @@ pub fn run() {
                 let settings_arc = server_state_clone.settings.clone();
                 let caps_arc = server_state_clone.encoder_capabilities.clone();
                 let setup_complete_arc = server_state_clone.setup_complete.clone();
+                let server_state_for_status = server_state_clone.clone();
                 tokio::spawn(async move {
                     let mut last_status_signature: Option<String> = None;
                     loop {
@@ -324,9 +322,10 @@ pub fn run() {
                         let has_active_sessions = !sessions.is_empty();
                         let mut gpu = gpu_info_arc.read().await.clone();
                         // Poll utilization in real-time only while a stream is active — no child
-                        // processes when the app is idle in standby.
+                        // processes when the app is idle in standby. The shared sampler keeps
+                        // nvidia-smi off this task and rate-limits it across all callers.
                         if has_active_sessions {
-                            if let Some(util) = gpu::read_utilization(&gpu.vendor) {
+                            if let Some(util) = gpu::latest_utilization(&gpu.vendor) {
                                 gpu.utilization = Some(util);
                             }
                         }
@@ -341,12 +340,14 @@ pub fn run() {
                             caps.as_ref(),
                             setup_complete,
                         );
-                        let status =
-                            server::apply_status_readiness(status, &gpu, &settings, setup_complete)
-                                .await;
-                        let status =
-                            server::enrich_status_with_remote_processing_stats(status, &sessions)
-                                .await;
+                        let status = server::finalize_status(
+                            &server_state_for_status,
+                            status,
+                            &gpu,
+                            &settings,
+                            setup_complete,
+                        )
+                        .await;
                         let status_signature = serde_json::to_string(&status).ok();
                         if status_signature.is_none()
                             || status_signature.as_ref() != last_status_signature.as_ref()

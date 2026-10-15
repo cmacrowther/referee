@@ -16,7 +16,11 @@ pub struct StatusResponse {
     pub(super) primary_session: Option<SessionInfo>,
     pub(super) settings: SettingsSnapshot,
     pub(super) encoder_has_framegen: Option<bool>,
+    pub(super) encoder_has_native_double: Option<bool>,
     pub(super) encoder_has_truehdr: Option<bool>,
+    /// VCEEncC's libplacebo SDR-to-HDR10 mapping (the AMD counterpart of
+    /// TrueHDR).
+    pub(super) encoder_has_hdr_tonemap: Option<bool>,
     pub(super) encoder_has_rife: Option<bool>,
 }
 
@@ -25,6 +29,10 @@ pub struct SettingsSnapshot {
     resolution: String,
     quality: u8,
     framegen: bool,
+    #[serde(rename = "framegenTarget")]
+    framegen_target: FramegenTarget,
+    #[serde(rename = "framegenEngine")]
+    framegen_engine: FramegenEngine,
     hdr: bool,
 }
 
@@ -65,11 +73,9 @@ pub(super) fn build_settings_executor_request(settings: &ServerSettings) -> Pipe
         source_fps: None,
         latency_mode: LatencyMode::Low,
         upscale: UpscaleRequest::Quality(clamp_quality(&settings.resolution, settings.quality)),
-        interpolation: if settings.framegen {
-            InterpolationRequest::To60
-        } else {
-            InterpolationRequest::Off
-        },
+        interpolation: settings
+            .framegen()
+            .interpolation_request(None, &settings.resolution, false),
         hdr: if settings.hdr {
             HdrRequest::TonemapToHdr10
         } else {
@@ -114,8 +120,7 @@ pub(super) async fn emit_status_update(state: &ServerState) {
         caps.as_ref(),
         setup_complete,
     );
-    let status = apply_status_readiness(status, &gpu, &settings, setup_complete).await;
-    let status = enrich_status_with_remote_processing_stats(status, &state.sessions).await;
+    let status = finalize_status(state, status, &gpu, &settings, setup_complete).await;
     if let Some(handle) = &state.app_handle {
         let _ = handle.emit("status-update", &status);
     }
@@ -192,10 +197,14 @@ pub(crate) fn build_status(
             resolution: settings.resolution.clone(),
             quality: settings.quality,
             framegen: settings.framegen,
+            framegen_target: settings.framegen_target,
+            framegen_engine: settings.framegen_engine,
             hdr: settings.hdr,
         },
         encoder_has_framegen: capabilities.map(|c| c.has_fruc),
+        encoder_has_native_double: capabilities.map(|c| c.has_native_double),
         encoder_has_truehdr: capabilities.map(|c| c.has_truehdr),
+        encoder_has_hdr_tonemap: capabilities.map(|c| c.has_hdr_tonemap),
         encoder_has_rife: capabilities.map(|c| c.has_rife),
     }
 }
@@ -203,25 +212,24 @@ pub(crate) fn build_status(
 pub(super) fn remote_backing_for_status(
     status: &StatusResponse,
     sessions_map: &SessionMap,
-) -> Option<(String, RemoteSessionBacking)> {
+) -> Option<(String, RemoteSessionTarget)> {
     let local_session_id = status
         .primary_session
         .as_ref()
         .map(|session| session.id.clone())
         .or_else(|| status.sessions.first().map(|session| session.id.clone()))?;
     let session = sessions_map.get(&local_session_id)?;
-    let remote = session.remote_backing()?.clone();
+    let remote = RemoteSessionTarget::from(session.remote_backing()?);
     Some((local_session_id, remote))
 }
 
 pub(super) fn apply_remote_status_to_local_status(
     status: &mut StatusResponse,
     local_session_id: &str,
-    remote: &RemoteSessionBacking,
+    remote: &RemoteSessionTarget,
     mut remote_status: RemoteStatusResponse,
 ) {
-    let remote_session_info =
-        take_remote_session_info(&mut remote_status, &remote.remote_session_id);
+    let remote_session_info = take_remote_session_info(&mut remote_status, &remote.session_id);
 
     status.gpu_ready = remote_status.gpu_ready;
     status.gpu_name = remote_status.gpu_name;
@@ -236,6 +244,8 @@ pub(super) fn apply_remote_status_to_local_status(
     status.nvidia_ai_available = remote_status.nvidia_ai_available;
     status.amd_ai_available = remote_status.amd_ai_available;
     status.encoder_has_framegen = remote_status.encoder_has_framegen;
+    status.encoder_has_native_double = remote_status.encoder_has_native_double;
+    status.encoder_has_hdr_tonemap = remote_status.encoder_has_hdr_tonemap;
     status.encoder_has_truehdr = remote_status.encoder_has_truehdr;
     status.encoder_has_rife = remote_status.encoder_has_rife;
 
@@ -255,32 +265,41 @@ pub(super) fn apply_remote_status_to_local_status(
     }
 }
 
-pub(crate) async fn enrich_status_with_remote_processing_stats(
+/// Final pass shared by every status producer. A relay-backed session takes the
+/// peer's live processing stats, and `gpuReady` reflects the linked peer while
+/// relay is enabled.
+///
+/// The peer's status already carries its readiness, so the link probe only runs
+/// when there is no relay-backed session or its live stats could not be read.
+pub(crate) async fn finalize_status(
+    state: &ServerState,
     mut status: StatusResponse,
-    sessions_map: &SessionMap,
+    gpu: &GpuInfo,
+    settings: &ServerSettings,
+    setup_complete: bool,
 ) -> StatusResponse {
-    let Some((local_session_id, remote)) = remote_backing_for_status(&status, sessions_map) else {
-        return status;
-    };
-
-    match fetch_remote_status(&remote.remote_base_url).await {
-        Ok(remote_status) => {
-            apply_remote_status_to_local_status(
-                &mut status,
-                &local_session_id,
-                &remote,
-                remote_status,
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                "[Relay]: Failed to refresh processing stats from linked REFEREE session {}: {}",
-                remote.remote_session_id,
-                error
-            );
+    if let Some((local_session_id, remote)) = remote_backing_for_status(&status, &state.sessions) {
+        let timeout = std::time::Duration::from_millis(RELAY_LIVE_STATS_TIMEOUT_MS);
+        match fetch_remote_status(&remote.base_url, timeout).await {
+            Ok(remote_status) => {
+                apply_remote_status_to_local_status(
+                    &mut status,
+                    &local_session_id,
+                    &remote,
+                    remote_status,
+                );
+                return status;
+            }
+            Err(error) => {
+                warn!(
+                    "[Relay]: Failed to refresh processing stats from linked REFEREE session {}: {}",
+                    remote.session_id, error
+                );
+            }
         }
     }
 
+    status.gpu_ready = Some(gpu_ready_for_status(state, gpu, settings, setup_complete).await);
     status
 }
 
@@ -296,6 +315,5 @@ pub(super) async fn handle_status(State(state): State<ServerState>) -> Json<Stat
         caps.as_ref(),
         setup_complete,
     );
-    let status = apply_status_readiness(status, &gpu, &settings, setup_complete).await;
-    Json(enrich_status_with_remote_processing_stats(status, &state.sessions).await)
+    Json(finalize_status(&state, status, &gpu, &settings, setup_complete).await)
 }

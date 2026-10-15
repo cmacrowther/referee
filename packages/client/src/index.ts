@@ -2,14 +2,24 @@
 
 export type RefereeGpuVendor = "nvidia" | "amd" | (string & {})
 export type RefereeEncoderBackend = "nvenc" | "vceenc" | (string & {})
-export type RefereeExecutorKind = "nvidiaSpecialized" | "universal" | "cpu" | (string & {})
+export type RefereeExecutorKind = "nvidiaSpecialized" | "amdSpecialized" | "universal" | "cpu" | (string & {})
 export type RefereeContentKind = "live" | "vod" | (string & {})
 export type RefereeStartupStage = "starting" | "ready" | (string & {})
+/** Output frame rate frame generation aims for. Ignored by `"nativeDouble"`. */
+export type RefereeFramegenTarget = "30fps" | "60fps" | "matchDisplay" | (string & {})
+/**
+ * `"nativeDouble"` doubles the source frame rate with the GPU's own frame
+ * generation: NVIDIA Framegen or AMD Fluid Motion. Servers still accept the
+ * older `"nvidiaFramegen"` spelling.
+ */
+export type RefereeFramegenEngine = "opticalFlow" | "rife" | "nativeDouble" | (string & {})
 
 export interface RefereeSettings {
   resolution: string
   quality: number
   framegen: boolean
+  framegenTarget: RefereeFramegenTarget
+  framegenEngine: RefereeFramegenEngine
   hdr: boolean
 }
 
@@ -27,6 +37,8 @@ export interface SessionInfo {
   sourceFps: number | null
   targetFps: number | null
   framegenEnabled: boolean
+  /** Engine generating frames (`"NVIDIA FRUC"`, `"NVIDIA Framegen"`, `"AMD Fluid Motion"`, `"RIFE"`, `"Portable"`), or `null` when off. */
+  framegenEngine: string | null
   hdrEnabled: boolean
   qualityLevel: number
   executor: RefereeExecutorKind
@@ -43,7 +55,11 @@ export interface RefereeStatus {
   gpuUtilization: number | null
   encoderBackend: RefereeEncoderBackend | null
   encoderHasFramegen: boolean | null
+  /** Native frame doubling: NVIDIA Framegen (RTX 40 Series or newer) or AMD Fluid Motion (VCEEncC AMF FRC, Windows). */
+  encoderHasNativeDouble: boolean | null
   encoderHasTruehdr: boolean | null
+  /** AMD SDR-to-HDR10 mapping in VCEEncC (the AMD counterpart of TrueHDR). */
+  encoderHasHdrTonemap: boolean | null
   encoderHasRife: boolean | null
   /** Reserved for future servers; current REFEREE status responses do not include this field. */
   encoderHasStreamingRife?: boolean | null
@@ -70,6 +86,11 @@ export interface StartSessionOptions {
   contentKind?: "live" | "vod"
   /** Extra HTTP headers forwarded to the encoder when fetching the stream. */
   headers?: Record<string, string>
+  /**
+   * Refresh rate of the viewer's display in Hz, used by the Match Display
+   * frame generation target. Defaults to the REFEREE machine's display.
+   */
+  displayRefreshRate?: number
 }
 
 export interface StartSessionResponse {
