@@ -1,6 +1,6 @@
 {
   "name": "@cmacrowther/referee-client",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Official JavaScript/TypeScript client for the REFEREE upscaling API",
   "license": "GPL-3.0-or-later",
   "author": {

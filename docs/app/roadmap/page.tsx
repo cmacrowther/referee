@@ -651,6 +651,24 @@ export default async function RoadmapPage() {
                 <li className="relative pl-8">
                   <span className="absolute left-0 top-1.5 flex h-[15px] w-[15px] items-center justify-center rounded-full border-2 border-accent bg-background" aria-hidden="true" />
                   <div className="flex flex-wrap items-baseline gap-3 mb-3">
+                    <h3 className="font-semibold">v0.7.1</h3>
+                    <time dateTime="2026-10-15" className="text-xs text-muted-foreground">October 15, 2026</time>
+                  </div>
+                  <ul className="space-y-1.5 text-sm text-muted-foreground">
+                    {[
+                      "Optional EasyProxy source routing extracts video from supported site links. Use a managed installation with a private Python runtime or connect to an external EasyProxy server from Source Proxy settings.",
+                      "Managed EasyProxy starts when streams need it and stops when idle. Unavailable proxy servers and failed extraction return dedicated API errors with troubleshooting details.",
+                      "Desktop update controls check GitHub releases, show download progress, and verify downloaded installers. Automatic updates install when no stream is running on supported installed builds.",
+                      "Added a development stream panel and expanded coverage for Source Proxy settings, update controls, stream handling, and status views.",
+                    ].map((change) => (
+                      <li key={change} className="flex gap-2"><span className="text-accent flex-shrink-0">+</span>{change}</li>
+                    ))}
+                  </ul>
+                </li>
+
+                <li className="relative pl-8">
+                  <span className="absolute left-0 top-1.5 flex h-[15px] w-[15px] items-center justify-center rounded-full border-2 border-accent bg-background" aria-hidden="true" />
+                  <div className="flex flex-wrap items-baseline gap-3 mb-3">
                     <h3 className="font-semibold">v0.7.0</h3>
                     <time dateTime="2026-10-15" className="text-xs text-muted-foreground">October 15, 2026</time>
                   </div>

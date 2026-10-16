@@ -30,7 +30,7 @@ export default function DevelopersPage() {
             <div className="pt-10 pb-0">
               <Alert className="border-accent/25 bg-accent/8">
                 <Tag className="h-4 w-4 text-accent" />
-                <AlertTitle className="text-foreground">REFEREE 0.7.0 — API <code className="font-mono">/v1/</code></AlertTitle>
+                <AlertTitle className="text-foreground">REFEREE 0.7.1 — API <code className="font-mono">/v1/</code></AlertTitle>
                 <AlertDescription>
                   <p>
                     All endpoints are under the <code>/v1/</code> prefix. Mutating endpoints require an{" "}

@@ -1,7 +1,7 @@
 [package]
 name = "referee"
 default-run = "referee"
-version = "0.7.0"
+version = "0.7.1"
 description = "Live transcoding proxy service for upscaling remote livestreams locally using supported NVIDIA RTX and AMD Radeon graphics hardware."
 authors = ["cmacrowther"]
 edition = "2021"

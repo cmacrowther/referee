@@ -1,6 +1,6 @@
 {
     "productName": "REFEREE Upscaler",
-    "version": "0.7.0",
+    "version": "0.7.1",
     "identifier": "com.referee.proxy",
     "build": {
         "beforeBuildCommand": "npm run build:ui",
