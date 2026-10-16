@@ -126,6 +126,7 @@ For the full API reference, authentication details, CORS configuration, and reve
 **Platform & Deployment**
 - **REFEREE Relay** — Devices without a compatible GPU can relay sessions to a capable peer on the same LAN.
 - **Headless / Self-Hosted** — Run `referee-server` standalone or via the provided Docker Compose stacks (NVIDIA and AMD profiles).
+- **EasyProxy Routing (optional)** — Fetch stream sources through [EasyProxy](https://github.com/realbestia1/EasyProxy), whose extractor finds the video behind links to the sites it supports. REFEREE can install and run it for you (a private Python runtime, started only while streams need it), or use a server you run yourself. Turn it on under Settings → Stream → Source Proxy.
 - **Self-Contained** — Encoder dependencies install automatically and check for updates on every launch. Updates are validated before installation, with rollback and an offline fallback to working versions. No manual SDK configuration.
 
 **Developer Experience**

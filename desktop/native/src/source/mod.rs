@@ -1,3 +1,4 @@
+pub mod easy_proxy;
 pub mod hls_relay;
 
 use regex::Regex;
@@ -269,6 +270,25 @@ pub async fn is_ssrf_target(url: &str) -> bool {
         }
         Err(_) => true, // DNS failure — fail closed
     }
+}
+
+/// [`is_ssrf_target`] without the DNS lookup, for URLs another proxy fetches
+/// on REFEREE's behalf. Blocks loopback and link-local IP literals and
+/// `localhost` names; names that only resolve to those are not caught.
+pub fn is_literal_ssrf_target(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return true;
+    };
+
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return is_blocked_ip(ip);
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost")
 }
 
 fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
@@ -715,13 +735,13 @@ async fn probe_source_content_kind(
             CONTENT_PROBE_FRAMES,
             CONTENT_PROBE_WIDTH,
             CONTENT_PROBE_HEIGHT,
-            source_url
+            easy_proxy::redact_url_for_log(source_url)
         );
         Some(probe)
     } else {
         warn!(
             "[Content Probe]: Could not classify source content from sampled frames: {}",
-            source_url
+            easy_proxy::redact_url_for_log(source_url)
         );
         None
     }
@@ -891,6 +911,30 @@ mod tests {
         assert_eq!(classification.transport, SourceTransport::RemoteHttp);
         assert_eq!(classification.kind, SourceKind::Hls);
         assert!(classification.requires_local_hls_relay());
+    }
+
+    #[test]
+    fn literal_ssrf_check_blocks_loopback_and_link_local_without_dns() {
+        for blocked in [
+            "http://127.0.0.1:22/",
+            "http://[::1]/",
+            "http://169.254.169.254/latest",
+            "http://[fe80::1]/",
+            "http://localhost:8080/",
+            "http://LOCALHOST./",
+            "http://app.localhost/",
+        ] {
+            assert!(super::is_literal_ssrf_target(blocked), "{blocked}");
+        }
+
+        for allowed in [
+            "https://cdn.example.com/live.m3u8",
+            "http://192.168.1.20/stream.m3u8",
+            "http://localhost.example.com/",
+            "aGVsbG8",
+        ] {
+            assert!(!super::is_literal_ssrf_target(allowed), "{allowed}");
+        }
     }
 
     #[test]

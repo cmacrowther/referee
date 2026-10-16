@@ -118,6 +118,8 @@ pub struct ServerState {
     /// Cached reachability of the linked relay peer, shared by every status
     /// producer, plus rebinding when the peer's address changes.
     pub relay_link: Arc<RelayLinkMonitor>,
+    /// The EasyProxy server REFEREE installs and runs in managed mode.
+    pub easy_proxy: Arc<EasyProxyService>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +135,7 @@ pub struct ServerSettings {
     pub notifications: bool,
     pub encoding_profiles: std::collections::HashMap<String, EncodingProfile>,
     pub relay: RelaySettings,
+    pub easy_proxy: EasyProxySettings,
 }
 
 impl ServerSettings {
@@ -159,6 +162,7 @@ impl From<&Settings> for ServerSettings {
             notifications: s.notifications,
             encoding_profiles: s.encoding_profiles.clone(),
             relay: s.relay.clone(),
+            easy_proxy: s.easy_proxy.clone(),
         }
     }
 }
@@ -187,6 +191,7 @@ pub(super) struct LocalStreamSettings {
     pub(super) hdr: bool,
     pub(super) executor_preference: ExecutorPreference,
     pub(super) encoding_profiles: HashMap<String, EncodingProfile>,
+    pub(super) easy_proxy: EasyProxySettings,
     pub(super) ui: StreamUiSettings,
 }
 
@@ -199,6 +204,7 @@ impl From<&ServerSettings> for LocalStreamSettings {
             hdr: settings.hdr,
             executor_preference: settings.executor_preference,
             encoding_profiles: settings.encoding_profiles.clone(),
+            easy_proxy: settings.easy_proxy.clone(),
             ui: StreamUiSettings::from(settings),
         }
     }

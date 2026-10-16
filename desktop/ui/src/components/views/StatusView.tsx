@@ -1,6 +1,8 @@
+import type { ReactNode } from 'react';
+
 import { RelayLinkCard } from '@/components/status/RelayLinkCard';
 import { StreamCard } from '@/components/status/StreamCard';
-import { getSessionCount } from '@/lib/stream';
+import { getSessionCount, hasLiveSession } from '@/lib/stream';
 import type { RelayLinkStatus, Settings, Status } from '@/lib/types';
 
 interface StatusViewProps {
@@ -11,6 +13,8 @@ interface StatusViewProps {
     isStopping: boolean;
     onOpenRelaySettings?: () => void;
     onStop: () => void;
+    /** Debug builds only: shown under the card until a stream is live. */
+    debugPanel?: ReactNode;
 }
 
 function hasConfiguredRelayPeer(settings: Settings) {
@@ -29,7 +33,8 @@ export function StatusView({
     requireRelayRoute = false,
     isStopping,
     onOpenRelaySettings,
-    onStop
+    onStop,
+    debugPanel
 }: StatusViewProps) {
     const hasOutboundRelayLink = settings.relay.enabled
         && Boolean(settings.relay.remoteToken)
@@ -51,6 +56,8 @@ export function StatusView({
                     onOpenRelaySettings={onOpenRelaySettings}
                     onStop={onStop}
                 />
+                {/* Stays mounted while a started stream is still warming up, so a failed start can report its error. */}
+                {debugPanel && !hasLiveSession(status) ? debugPanel : null}
             </div>
         </section>
     );

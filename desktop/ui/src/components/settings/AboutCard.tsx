@@ -1,8 +1,8 @@
-import { ArrowUpCircle, BookOpen, ExternalLink, GitBranch, PlayCircle, Scale, User } from 'lucide-react';
+import { BookOpen, ExternalLink, GitBranch, PlayCircle, Scale, User } from 'lucide-react';
 import { type ReactNode, useEffect, useState } from 'react';
 
 import { SettingsSection } from '@/components/settings/SettingsPrimitives';
-import type { RendererApi, UpdateInfo } from '@/lib/types';
+import type { RendererApi } from '@/lib/types';
 
 interface AboutCardProps {
     api: RendererApi;
@@ -15,7 +15,7 @@ interface LinkRowProps {
     onClick: () => void;
 }
 
-function LinkRow({ icon, title, url, onClick }: LinkRowProps) {
+export function LinkRow({ icon, title, url, onClick }: LinkRowProps) {
     return (
         <button
             type="button"
@@ -34,12 +34,6 @@ function LinkRow({ icon, title, url, onClick }: LinkRowProps) {
 
 export function AboutCard({ api }: AboutCardProps) {
     const [version, setVersion] = useState('...');
-    const [updateInfo, setUpdateInfo] = useState<UpdateInfo>({
-        currentVersion: '...',
-        hasUpdate: false
-    });
-    const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
-    const [isInstalling, setIsInstalling] = useState(false);
 
     useEffect(() => {
         let isMounted = true;
@@ -52,62 +46,15 @@ export function AboutCard({ api }: AboutCardProps) {
             })
             .catch(() => {});
 
-        api.checkForUpdate()
-            .then(nextUpdateInfo => {
-                if (isMounted) {
-                    setUpdateInfo(nextUpdateInfo);
-                    if (nextUpdateInfo.currentVersion) {
-                        setVersion(nextUpdateInfo.currentVersion);
-                    }
-                }
-            })
-            .catch(() => {});
-
-        const unsubscribe = api.onUpdateProgress(percent => {
-            setDownloadProgress(percent);
-        });
-
         return () => {
             isMounted = false;
-            unsubscribe();
         };
     }, [api]);
-
-    async function handleInstallUpdate() {
-        if (!updateInfo.downloadUrl) {
-            return;
-        }
-
-        setIsInstalling(true);
-        try {
-            await api.downloadAndInstallUpdate(updateInfo.downloadUrl);
-        } catch {
-            setIsInstalling(false);
-            setDownloadProgress(null);
-        }
-    }
-
-    const updateLabel = downloadProgress !== null ? `${downloadProgress}%` : 'Update';
 
     return (
         <SettingsSection
             title="About"
-            aside={
-                <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-medium text-referee-muted">v{version}</span>
-                    {updateInfo.hasUpdate && updateInfo.downloadUrl && (
-                        <button
-                            type="button"
-                            disabled={isInstalling}
-                            onClick={handleInstallUpdate}
-                            className="inline-flex items-center gap-1 rounded bg-referee-green/15 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-referee-green transition-colors hover:bg-referee-green/25 disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                            <ArrowUpCircle className="size-[11px]" />
-                            <span>{updateLabel}</span>
-                        </button>
-                    )}
-                </div>
-            }
+            aside={<span className="text-[10px] font-medium text-referee-muted">v{version}</span>}
         >
             <LinkRow
                 icon={<BookOpen className="size-4" />}

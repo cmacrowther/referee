@@ -435,15 +435,19 @@ pub(super) fn apply_stream_settings_patch(
 
 pub(super) async fn handle_stream_settings_update(
     State(state): State<ServerState>,
-    Json(patch): Json<serde_json::Value>,
+    Json(mut patch): Json<serde_json::Value>,
 ) -> axum::response::Response {
-    if !patch.is_object() {
+    let Some(object) = patch.as_object_mut() else {
         return json_error_response(
             StatusCode::BAD_REQUEST,
             error_codes::INVALID_SETTINGS,
             "Settings update must be a JSON object.",
         );
-    }
+    };
+    // EasyProxy is configured on this machine only (desktop app or
+    // config.json). The input proxy trusts that server's origin past the SSRF
+    // guard, so a token holder must not be able to repoint it.
+    object.remove("easyProxy");
 
     if let Some(settings_manager) = state.settings_manager.as_ref() {
         let updated = settings_manager.merge_and_update(patch);

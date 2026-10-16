@@ -184,6 +184,18 @@ describe('normalizeSettings', () => {
         expect(result.relay).toEqual(DEFAULT_SETTINGS.relay)
     })
 
+    it('defaults EasyProxy off and trims its text fields to null when blank', () => {
+        expect(normalizeSettings().easyProxy).toEqual({ enabled: false, mode: 'managed', url: null, apiPassword: null })
+
+        const result = normalizeSettings({
+            easyProxy: { enabled: true, mode: 'external', url: '  http://127.0.0.1:7860  ', apiPassword: '   ' },
+        })
+        expect(result.easyProxy).toEqual({ enabled: true, mode: 'external', url: 'http://127.0.0.1:7860', apiPassword: null })
+
+        const unknownMode = normalizeSettings({ easyProxy: { enabled: true, mode: 'sidecar' as any, url: null, apiPassword: null } })
+        expect(unknownMode.easyProxy.mode).toBe('managed')
+    })
+
     it('applies provided overrides', () => {
         const result = normalizeSettings({ resolution: '2560x1440', quality: 3 })
         expect(result.resolution).toBe('2560x1440')

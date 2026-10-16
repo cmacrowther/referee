@@ -1,4 +1,5 @@
 mod deps;
+mod easy_proxy_service;
 mod exec;
 mod gpu;
 mod graph;
@@ -272,6 +273,12 @@ async fn main() {
         pending_consent_ui: Arc::new(std::sync::Mutex::new(None)),
         setup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         relay_link: Arc::new(server::RelayLinkMonitor::default()),
+        easy_proxy: easy_proxy_service::EasyProxyService::new(
+            lib_dir.clone(),
+            app_data.join("easyproxy-data"),
+            http_client.clone(),
+            easy_proxy_service::ServerAccess::for_build(),
+        ),
     };
 
     // Log a masked hint (last 4 chars only) — the full token must be supplied via

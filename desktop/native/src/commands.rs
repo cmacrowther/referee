@@ -17,6 +17,7 @@ pub struct AppState {
     pub setup_done: Arc<Notify>,
     pub setup_state: Arc<Mutex<SetupLifecycle>>,
     pub http_client: reqwest::Client,
+    pub updater: Arc<crate::updater::Updater>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -135,146 +136,26 @@ pub async fn revoke_approved_origin(
     Ok(())
 }
 
-#[derive(Serialize)]
-pub struct UpdateInfo {
-    #[serde(rename = "currentVersion")]
-    current_version: String,
-    #[serde(rename = "latestVersion")]
-    latest_version: Option<String>,
-    #[serde(rename = "hasUpdate")]
-    has_update: bool,
-    #[serde(rename = "downloadUrl")]
-    download_url: Option<String>,
+#[tauri::command]
+pub async fn get_update_status(
+    state: State<'_, AppState>,
+) -> Result<crate::updater::UpdateStatus, String> {
+    Ok(state.updater.status())
 }
 
+/// Checks GitHub for a newer release; a failed check is reported in the status.
 #[tauri::command]
 pub async fn check_for_update(
-    app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<UpdateInfo, String> {
-    let current_version = app
-        .config()
-        .version
-        .clone()
-        .unwrap_or_else(|| "0.0.0".to_string());
-
-    let client = &state.http_client;
-
-    let response: serde_json::Value = client
-        .get("https://api.github.com/repos/cmacrowther/referee/releases/latest")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let latest_version = response["tag_name"]
-        .as_str()
-        .map(|v| v.trim_start_matches('v').to_string());
-
-    let has_update = latest_version
-        .as_ref()
-        .map(|v| !v.is_empty() && semver_gt(v, &current_version))
-        .unwrap_or(false);
-
-    let download_url = if cfg!(target_os = "windows") {
-        response["assets"].as_array().and_then(|assets| {
-            assets
-                .iter()
-                .find(|a| {
-                    a["name"]
-                        .as_str()
-                        .map(|n| n.ends_with(".exe"))
-                        .unwrap_or(false)
-                })
-                .and_then(|a| a["browser_download_url"].as_str().map(String::from))
-        })
-    } else {
-        response["assets"].as_array().and_then(|assets| {
-            assets
-                .iter()
-                .find(|a| {
-                    a["name"]
-                        .as_str()
-                        .map(|n| n.ends_with(".AppImage"))
-                        .unwrap_or(false)
-                })
-                .and_then(|a| a["browser_download_url"].as_str().map(String::from))
-        })
-    };
-
-    Ok(UpdateInfo {
-        current_version,
-        latest_version,
-        has_update,
-        download_url,
-    })
+) -> Result<crate::updater::UpdateStatus, String> {
+    Ok(state.updater.check().await)
 }
 
+/// Downloads and installs the release found by the last check, then exits so
+/// the installer can replace REFEREE. Progress arrives as `update-status`.
 #[tauri::command]
-pub async fn download_and_install_update(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    download_url: String,
-) -> Result<(), String> {
-    let client = &state.http_client;
-
-    let temp_dir = std::env::temp_dir();
-    let temp_path = if cfg!(target_os = "windows") {
-        temp_dir.join("REFEREE-Update.exe")
-    } else {
-        temp_dir.join("REFEREE-Update.AppImage")
-    };
-
-    let mut response = client
-        .get(&download_url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let _total = response.content_length().unwrap_or(0);
-
-    // Stream directly to disk rather than buffering the entire installer binary in RAM.
-    // NOTE: signature/hash verification is not yet implemented here; the download relies
-    // on HTTPS transport integrity. A detached signature check should be added once
-    // a public key is published alongside releases.
-    {
-        use tokio::io::AsyncWriteExt as _;
-        let mut file = tokio::fs::File::create(&temp_path)
-            .await
-            .map_err(|e| e.to_string())?;
-        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-        }
-        file.flush().await.map_err(|e| e.to_string())?;
-    }
-
-    let _ = app.emit("update-progress", 100);
-
-    // Launch installer and quit
-    #[cfg(target_os = "windows")]
-    {
-        let mut command = std::process::Command::new(&temp_path);
-        crate::process::hide_std_command_window(&mut command);
-        command.spawn().map_err(|e| e.to_string())?;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&temp_path)
-            .map_err(|e| e.to_string())?
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&temp_path, perms).map_err(|e| e.to_string())?;
-        std::process::Command::new(&temp_path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-    }
-
-    app.exit(0);
-    Ok(())
+pub async fn install_update(app: AppHandle) -> Result<(), String> {
+    crate::updater::install_update(&app).await
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -874,21 +755,6 @@ pub async fn unlink_relay_peer(state: State<'_, AppState>, app: AppHandle) -> Re
     Ok(())
 }
 
-fn semver_gt(a: &str, b: &str) -> bool {
-    let parse = |v: &str| -> (u64, u64, u64) {
-        let mut parts = v.splitn(3, '.');
-        let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-        let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-        let patch = parts
-            .next()
-            .and_then(|p| p.split('-').next())
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(0);
-        (major, minor, patch)
-    };
-    parse(a) > parse(b)
-}
-
 #[tauri::command]
 pub async fn stop_stream(
     session_id: String,
@@ -994,6 +860,7 @@ pub async fn save_settings(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
+    let previous_easy_proxy = state.settings_manager.get().easy_proxy;
     let updated = state.settings_manager.merge_and_update(settings);
 
     // Sync to server
@@ -1001,6 +868,12 @@ pub async fn save_settings(
         let mut server_settings = state.server_state.settings.write().await;
         *server_settings = crate::server::ServerSettings::from(&updated);
     }
+    crate::server::apply_easy_proxy_settings(
+        &state.server_state,
+        &previous_easy_proxy,
+        &updated.easy_proxy,
+    )
+    .await;
 
     // Apply window always-on-top
     if let Some(window) = app.get_webview_window("main") {
@@ -1018,9 +891,16 @@ pub async fn save_stream_settings(
     app: AppHandle,
 ) -> Result<(), String> {
     let stream_patch = stream_settings_patch(&settings);
+    let previous_easy_proxy = state.settings_manager.get().easy_proxy;
     let updated = state.settings_manager.merge_and_update(settings);
 
     sync_settings_to_server_state(state.inner(), &updated);
+    crate::server::apply_easy_proxy_settings(
+        &state.server_state,
+        &previous_easy_proxy,
+        &updated.easy_proxy,
+    )
+    .await;
 
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_always_on_top(updated.always_on_top);
@@ -1033,6 +913,80 @@ pub async fn save_stream_settings(
     }
 
     Ok(())
+}
+
+/// Checks that EasyProxy answers and accepts the password. Managed mode
+/// starts the server if needed; external mode takes the values being edited,
+/// so they can be tested before they are saved.
+#[tauri::command]
+pub async fn check_easy_proxy(
+    mode: crate::settings::EasyProxyMode,
+    url: Option<String>,
+    api_password: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<crate::source::easy_proxy::EasyProxyStatus, String> {
+    let route = match mode {
+        crate::settings::EasyProxyMode::Managed => {
+            state.server_state.easy_proxy.ensure_running().await?
+        }
+        crate::settings::EasyProxyMode::External => {
+            crate::source::easy_proxy::EasyProxyRoute::new(url.as_deref(), api_password.as_deref())?
+        }
+    };
+    route.check().await
+}
+
+/// Debug builds only: starts a stream from a URL entered on the standby
+/// screen, then opens the built-in player unless player auto-open is set up,
+/// in which case the renderer launches the configured player itself.
+#[tauri::command]
+pub async fn start_debug_stream(
+    url: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if !cfg!(debug_assertions) {
+        return Err("Debug streams are only available in development builds.".to_string());
+    }
+    let url = url.trim().to_string();
+    info!(
+        "[Debug]: Starting a stream from the standby screen: {}",
+        url
+    );
+    server::start_debug_stream(&state.server_state, url).await?;
+
+    if resolve_player_launch_target(&state.settings_manager.get().player).is_err() {
+        let window = crate::tray::get_or_create_stream_player_window(&app)
+            .map_err(|e| format!("Failed to open built-in player: {}", e))?;
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_easy_proxy_status(
+    state: State<'_, AppState>,
+) -> crate::easy_proxy_service::ManagedEasyProxyStatus {
+    state.server_state.easy_proxy.status()
+}
+
+/// Installs or updates the managed EasyProxy in the background; progress is
+/// read with `get_easy_proxy_status`. Async so the install task is spawned on
+/// the runtime rather than the main thread.
+#[tauri::command]
+pub async fn install_easy_proxy(state: State<'_, AppState>) -> Result<(), String> {
+    state.server_state.easy_proxy.start_install();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_easy_proxy(state: State<'_, AppState>) -> Result<(), String> {
+    if !state.server_state.sessions.is_empty() {
+        return Err("Stop active streams before removing EasyProxy.".to_string());
+    }
+    state.server_state.easy_proxy.remove().await
 }
 
 #[tauri::command]

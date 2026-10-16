@@ -75,12 +75,14 @@ REFEREE is a local HTTP service on port **14002**. A web page sends it a source 
 | `exec/` | Executors: `nvidia.rs`, `amd.rs`, `universal.rs`. Plus `family.rs` (runtime executor selection), `ffmpeg_packager.rs`, `libplacebo_filters.rs` (`LibplaceboParams`, shared by the Universal executor and the FFmpeg preprocessor), and `mod.rs` (shared Rigaya input/output args, FFmpeg HLS muxer args, GOP alignment, `EncoderInput`) |
 | `normalize/` | `FfmpegNormalizer`: any source → NUT (staged path only) |
 | `preprocess/` | `StreamingRifePreprocessor` (drives `rife-worker`), `FfmpegPreprocessor` (libplacebo + `minterpolate`) |
-| `source/` | `mod.rs` (classification, manifest/ffprobe probing, content-kind detection, SSRF guard), `hls_relay.rs` (input proxy + manifest rewriting) |
+| `source/` | `mod.rs` (classification, manifest/ffprobe probing, content-kind detection, SSRF guard), `hls_relay.rs` (input proxy + manifest rewriting), `easy_proxy.rs` (optional EasyProxy extraction and routing, §10.6) |
+| `easy_proxy_service.rs` | Managed EasyProxy: install state, on-demand start, idle stop (§10.7). Its installer is `deps/easy_proxy/` |
 | `gpu.rs` | GPU vendor/name detection, encoder/ffmpeg/rife path resolution, utilization polling |
 | `deps/` | First-run downloads (`download.rs`), archive extraction (`install.rs`), binary resolution and validation (`resolution.rs`), shader install (`shaders.rs`) |
 | `settings.rs` | `Settings` (`config.json`), `SettingsManager`, relay/player sub-settings |
 | `commands.rs` | Tauri `#[tauri::command]` handlers (setup flow, settings, relay linking, updates, player launch) |
 | `tray.rs` | System tray and window management (`main`, `stream-player` labels) |
+| `updater.rs` | REFEREE's own updates from GitHub releases: check, verified download, elevated install, the automatic-update loop (§14) |
 | `paths.rs`, `process.rs` | App-data paths; `CREATE_NO_WINDOW` helpers |
 
 ---
@@ -151,13 +153,15 @@ The lib crate is `referee_lib` (`staticlib`, `cdylib`, `rlib`).
 | GPU re-detection | `lib.rs`, `server_main.rs` | 60 s | Desktop waits for `setup_done` first. Overwrites `gpu_info` (paths and utilization). Does **not** re-probe `encoder_capabilities`. |
 | Renderer status push | `lib.rs` | 1 s with sessions, 5 s idle | Only while the `main` or `stream-player` window is visible. Emits `status-update` only when the serialized JSON changed. Reads GPU utilization only while a session is active, through the shared non-blocking `gpu::latest_utilization` sampler (at most one `nvidia-smi` every 2 s across all callers). |
 | Per-session supervisor | `pipeline/run.rs::start_pipeline` → `PipelineSupervisor::run` | 250 ms child poll | One tokio task per local session. |
+| Update check | `updater.rs::spawn_auto_updates` (desktop only) | 2 min after launch, then every 6 h | Always checks. With `autoUpdate` on it also downloads, then installs once no session has run and setup has not been in progress for 5 min (polled every 30 s). |
 
 ### 3.4 On-disk layout
 
 | Location | Contents |
 |---|---|
-| App data (`com.referee.proxy`) | `config.json` (settings, `apiToken`, `instanceId`, relay link), `approved-origins.json` (`{origin: {appName, approvedAt}}`), `logs/`, `lib/` |
-| `lib/` | `ffmpeg[.exe]`, `ffprobe[.exe]` (+ DLLs on Windows), `NVEncC64.exe` (Windows+NVIDIA), `VCEEncC64.exe` / `vceencc` (AMD), `shaders/anime4k/Anime4K_Upscale_CNN_x2_M.glsl`, `shaders/artcnn/ArtCNN_C4F16.glsl`, `vs-rife/models/<model-dir>/`, optionally `rife-worker[.exe]` |
+| App data (`com.referee.proxy`) | `config.json` (settings, `apiToken`, `instanceId`, relay link), `approved-origins.json` (`{origin: {appName, approvedAt}}`), `logs/`, `lib/`, `easyproxy-data/` (managed EasyProxy's `CONFIG_DIR`: its admin settings and recordings; kept when EasyProxy is updated or removed) |
+| `lib/` | `ffmpeg[.exe]`, `ffprobe[.exe]` (+ DLLs on Windows), `NVEncC64.exe` (Windows+NVIDIA), `VCEEncC64.exe` / `vceencc` (AMD), `shaders/anime4k/Anime4K_Upscale_CNN_x2_M.glsl`, `shaders/artcnn/ArtCNN_C4F16.glsl`, `vs-rife/models/<model-dir>/`, optionally `rife-worker[.exe]`, and when managed EasyProxy is installed `easyproxy/` (`python/`, `app/`, `referee_launcher.py`, `install.json`; §10.7) |
+| App cache (`com.referee.proxy`) `updates/` | The downloaded REFEREE installer (`REFEREE-<version>-update.exe`/`.deb`/`.rpm`). Per-user, because the installer runs elevated. Removed at startup and before each download. |
 | `{std::env::temp_dir()}/RefereeProxy/{session_id}/` | `index.m3u8`, `segment_%06d.ts`, and (Universal with shaders/CAS) `referee-universal-runtime.glsl`. Wiped on every startup and removed when the session ends. |
 
 Docker volume mount: `/home/referee/.local/share/com.referee.proxy`. In the NVIDIA image `LD_LIBRARY_PATH` includes its `lib/`.
@@ -268,7 +272,7 @@ The call **blocks** until `index.m3u8` exists and is non-empty (up to 180 s loca
 
 ### 4.6 `POST /v1/settings/stream`
 
-Takes a JSON object patch and applies it through `SettingsManager::merge_and_update`. It accepts every key that method handles, not only stream keys: `resolution`, `quality`, `framegen`, `framegenTarget`, `framegenEngine`, `hdr`, `executorPreference`, `alwaysOnTop`, `showOnProxyStart`, `minimizeToTray`, `closeToTray`, `notifications`, `encodingProfiles`, `player`, `instanceId`, `relay`. It refreshes `ServerSettings` and emits `settings-sync` on desktop. Used by relay peers to push stream settings to the processing machine. Non-object → 400 `INVALID_SETTINGS`.
+Takes a JSON object patch and applies it through `SettingsManager::merge_and_update`. It accepts every key that method handles, not only stream keys: `resolution`, `quality`, `framegen`, `framegenTarget`, `framegenEngine`, `hdr`, `executorPreference`, `alwaysOnTop`, `showOnProxyStart`, `minimizeToTray`, `closeToTray`, `notifications`, `autoUpdate`, `encodingProfiles`, `player`, `instanceId`, `relay`. The one exception is `easyProxy`, which is dropped from the patch: the input proxy trusts that server's origin past the SSRF guard (§10.6), so only the desktop app or `config.json` may set it. It refreshes `ServerSettings` and emits `settings-sync` on desktop. Used by relay peers to push stream settings to the processing machine. Non-object → 400 `INVALID_SETTINGS`.
 
 ### 4.7 Error envelope and codes
 
@@ -294,6 +298,8 @@ Takes a JSON object patch and applies it through `SettingsManager::merge_and_upd
 | `CONSENT_TIMEOUT` | 408 | No decision in 180 s |
 | `RATE_LIMITED` | 429 | Auth or stream-start limiter |
 | `PIPELINE_EXITED` | 502 | Session vanished before the playlist appeared |
+| `EASYPROXY_UNAVAILABLE` | 502 | EasyProxy routing is on, but the managed server is still installing, failed to install, or failed to start, or the external server's URL is invalid, it is unreachable, or it refuses the API password (§10.6–10.7) |
+| `EASYPROXY_EXTRACTION_FAILED` | 502 | EasyProxy's extractor found no video at the source URL, did not answer in time, or returned a video on a loopback or link-local address (§10.6) |
 | `RELAY_UNAVAILABLE`, `RELAY_START_FAILED`, `RELAY_STATUS_SYNC_FAILED` | 502 | Relay stream start ([§11](#11-lan-relay-referee-relay)) |
 | `NO_ENCODER` | 503 | Supported vendor but no encoder/backend resolved |
 | `RELAY_REQUIRED` | 503 | No supported local GPU vendor and relay not enabled |
@@ -312,6 +318,8 @@ POST /v1/stream/start                                   server/stream.rs::handle
   ▼ no
 handle_local_stream_start
   ├─ resolve_runtime_backend(GpuInfo)        → RuntimeBackend {vendor, backend, encoder, ffmpeg, rife paths}
+  ├─ resolve_easy_proxy_route()              → Option<EasyProxyRoute>; starts or checks the server (502 EASYPROXY_UNAVAILABLE)   (§10.6–10.7)
+  ├─ extract_easy_proxy_source()             → EasyProxyRoute::extract: EasyProxy URL + password header, when routing is on (502 EASYPROXY_EXTRACTION_FAILED)
   ├─ stop_existing_sessions()                → evictedSessions   (one session at a time)
   ├─ clamp_quality(); create {tmp}/RefereeProxy/{id}/
   ├─ build_startup_context()
@@ -747,13 +755,41 @@ Only for remote HLS. Everything else gets `metadata: None`.
 ### 10.4 Input proxy (`hls_relay.rs`)
 
 - `runtime_url` = `http://127.0.0.1:14002/v1/input/{session_id}?url=<encoded original>`. Encoders and the normalizer pull through this.
-- `relay_request` checks http(s), runs an SSRF check on **every** proxied URL, forwards the session's headers (UA `REFEREE-InputProxy`), and streams non-manifest bodies. The upstream client has a 10 s connect timeout and a 15 s read timeout. Encoders pulling through the proxy set no read timeout of their own, so an upstream that stalls mid-segment fails the body, and the encoder's reconnect logic takes over instead of the pipeline freezing.
+- `relay_request` checks http(s), runs an SSRF check on **every** proxied URL, forwards the session's headers (UA `REFEREE-InputProxy`), and streams non-manifest bodies. Sessions routed through EasyProxy pick their URL and headers differently (`resolve_upstream_request`, §10.6). The upstream client has a 10 s connect timeout and a 15 s read timeout. Encoders pulling through the proxy set no read timeout of their own, so an upstream that stalls mid-segment fails the body, and the encoder's reconnect logic takes over instead of the pipeline freezing.
 - Manifests (by `.m3u8`/`.m3u` path or mpegurl content-type) are rewritten so every URI line and `URI="…"` attribute points back through the proxy. If there are two or more video variants, **only the highest-bandwidth variant is kept**, which pins the top rendition.
 - The same rewriter (`rewrite_hls_manifest_with_target_resolver`) is reused for relay `/v1/tmp` proxying.
 
 ### 10.5 SSRF guard (`is_ssrf_target`)
 
 Blocks loopback (127/8, ::1) and link-local (169.254/16, fe80::/10). Also blocks when there is no host, when DNS fails, or when DNS returns nothing. RFC-1918 ranges are **allowed** on purpose, for LAN sources. Applied at `/v1/stream/start` and in the input proxy.
+
+`is_literal_ssrf_target` is the same check without DNS (IP literals and `localhost` names only). It is used for targets EasyProxy fetches on REFEREE's behalf: REFEREE never connects to those, and a lookup would send the hostname outside EasyProxy's network path.
+
+### 10.6 EasyProxy routing (`easy_proxy.rs`)
+
+Optional, off by default (`easyProxy.enabled`). [EasyProxy](https://github.com/realbestia1/EasyProxy) is a Python HLS/DASH proxy. `easyProxy.mode` picks who runs it: `managed` (default), where REFEREE installs and starts it (§10.7), or `external`, a server the user runs at `easyProxy.url` (default `http://127.0.0.1:7860`). An external URL must be a bare origin: EasyProxy writes rewritten URLs from scheme and host alone, so a path prefix cannot work, and credentials are rejected so they never reach logged URLs.
+
+- **Start (`server/easy_proxy.rs::resolve_easy_proxy_route`):** runs before existing sessions are evicted. Managed mode calls `EasyProxyService::ensure_running`. External mode builds an `EasyProxyRoute` and runs `check()`: `GET /health` reads the version, and `GET /proxy/manifest.m3u8` with no `url` must answer 400 (password accepted); 401 means a missing or wrong password. Any failure is 502 `EASYPROXY_UNAVAILABLE`, and the source is never fetched directly instead.
+- **Extract (`extract()`, via `server/easy_proxy.rs::extract_easy_proxy_source`):** also runs before eviction, so a page without a video leaves the current stream running. It sends `GET /extractor/video?url=<source>&h_<Name>=…` with the password header and reads EasyProxy's MediaFlow-style JSON (`destination_url`, `request_headers`, `mediaflow_proxy_url`, `query_params`). The timeout is 190 s, because EasyProxy's slowest extractors allow themselves 180 s.
+  - **Site extractor matched:** the source becomes `<mediaflow_proxy_url path>?d=<destination_url>&h_<Name>=…&<query_params>&orig_url=<source>`, on REFEREE's address for EasyProxy. Only the path is taken from `mediaflow_proxy_url`, because EasyProxy writes its own public host into it. The `h_` params come from the extractor's headers. `orig_url` lets EasyProxy extract again when the video's link expires (403). The URL must pass `allows_relay_target`.
+  - **`extractor_key` is `generic`** (no site extractor, e.g. a direct stream): the source goes through `route()` unchanged. EasyProxy's generic extractor would only percent-decode the URL a second time and swap in its own headers.
+  - **Failure:** an error answer (EasyProxy's `{"error": …}` text, or the HTTP status), a timeout, or a loopback video is 502 `EASYPROXY_EXTRACTION_FAILED`. The source is not fetched any other way.
+- **Rewrite:** `route()` maps the source onto `/proxy/manifest.m3u8?url=…` when it classifies as HLS (so REFEREE's input proxy still sits in front), else `/proxy/stream?url=…`. Client headers become `h_<Name>=<value>` params, which EasyProxy sends upstream and copies into the URLs it rewrites. The API password goes in the `x-api-password` header, never in a URL. A URL already on the EasyProxy origin is left alone and not sent to the extractor. Probes and direct-fetch encoders use the rewritten URL and password header.
+- **Session:** `Session::with_easy_proxy` stores the route, so a settings change does not reroute a running stream. `source_headers` are the extractor's headers for a video it found, else the client's.
+- **Input proxy (`resolve_upstream_request`):** a target on the EasyProxy origin must be one of its media paths (`/proxy/*`, `/segment/*`, `/decrypt/*`, `/key`), and every http(s) URL in its query (`url`, `d`, `key_url`, `orig_url`, …) must pass `is_literal_ssrf_target`. `proxy` is exempt because it names EasyProxy's own outbound proxy, such as WARP on `socks5://127.0.0.1:1080`. Only these requests get the password header, which keeps it away from other hosts and keeps EasyProxy's admin API out of reach of anyone holding a session ID. Any other target is first checked with `is_literal_ssrf_target`, then sent through EasyProxy with `route()`.
+- **Relay:** forwarded starts carry the original URL. The processing peer applies its own `easyProxy` setting.
+- **Logs:** `redact_url_for_log` masks `h_*` and `api_password` values (nested `url=` included) in the `[Input Proxy]` and `[Content Probe]` lines. Pipeline command lines at debug level are not redacted.
+
+### 10.7 Managed EasyProxy (`easy_proxy_service.rs`, `deps/easy_proxy/`)
+
+- **Pins** (`deps/easy_proxy/mod.rs`): EasyProxy has no releases, so one commit is pinned (`EASY_PROXY_COMMIT`, `EASY_PROXY_VERSION`) and its `codeload` tarball is checked against `EASY_PROXY_ARCHIVE_DIGEST`. CPython 3.12 comes from a pinned python-build-standalone `install_only` build (`PYTHON_RELEASE`, `PYTHON_BUILD`: Windows x86_64 and Linux x86_64 only; elsewhere the install state is `unsupported`). `constraints.txt` pins every Python package to the version `pip freeze` produced with that Python.
+- **Install** (`install`): takes `lib/.easyproxy.lock`, recovers an interrupted swap, then builds `lib/.easyproxy-stage-<uuid>/`. It downloads both archives through `download_verified` (size and SHA-256 checked), drops `easyproxy.apk`, runs `python -I -m pip install --only-binary :all: --no-binary construct --no-cache-dir -r app/requirements.txt -c constraints.txt` with `PIP_CONFIG_FILE` pointed at the null device, imports one module per requirement, writes `referee_launcher.py` and `install.json`, and swaps the directory in (the old install moves to `.easyproxy-old-<uuid>` and is then deleted). Progress phase `easyproxy`: Python 0–35%, EasyProxy 40–45%, pip 45–90% (counted from pip's `Collecting` lines), validation 95%. About 230 MB installed.
+- **Install state** compares `install.json` (commit, Python build, constraints hash) with the compiled pins: `missing`, `outdated`, or `current`. The launcher is rewritten on each start when it differs, so changing it needs no reinstall.
+- **When it installs:** at server start when managed mode is on and the install is missing or outdated (`spawn_easy_proxy_supervisor`); when the setting changes to managed and on (`apply_easy_proxy_settings`, called from `save_settings` and `save_stream_settings` only when `easyProxy` changed); from the UI (`install_easy_proxy`); and on a stream start that finds no install. A stream start never waits for an install: it fails with a message giving the progress. After a failed install, stream starts report the error instead of reinstalling; the UI's Retry or the next launch tries again.
+- **Process** (`ensure_running`): `python -I -u -X utf8 referee_launcher.py` in the install directory, with `PORT`, `API_PASSWORD`, `CONFIG_DIR=easyproxy-data`, and `REFEREE_PARENT_PID`. The launcher imports EasyProxy's `app` and serves it on **127.0.0.1** (EasyProxy's own `main()` binds 0.0.0.0, which would be an open proxy on the LAN). It exits within about 2 s of REFEREE's process disappearing (psutil watchdog), since nothing else would stop an orphan. The server is ready when `check()` passes, within 60 s; an early exit reports the last stderr lines. The API password (32 hex characters) and the port are chosen once per REFEREE run and reused across restarts while the port is free, so routes held by sessions stay valid. Development builds (`debug_assertions`, `ServerAccess::for_build`) use `ServerAccess::Open` instead: port 7860 while it is free (else a random port, with a warning) and no API password, with `API_PASSWORD` removed from the child's environment, so `http://127.0.0.1:7860/extractor` and the admin pages can be opened by hand. It still binds loopback only. Tests construct the service with `ServerAccess::Private`. A running server that fails `check()` is restarted. stderr goes to the log at debug level only, because EasyProxy logs request URLs.
+- **Idle stop:** every 30 s the supervisor stops the server when no session holds a route to it and it was last used more than `IDLE_SHUTDOWN` (5 min) ago. Turning managed mode off stops it at once unless a session uses it. Installs stop it first, because Windows cannot move files that a running Python holds open.
+- **Remove** (`remove_easy_proxy`): refused while streams are active. Stops the server and deletes `lib/easyproxy/`, moving it aside first so a half-deleted tree never looks installed. `easyproxy-data/` is kept.
+- **Bumping a pin:** update the constant and digest, run `pip freeze` with the pinned Python to refresh `constraints.txt`, and confirm Linux wheels exist (`pip download --only-binary :all: --platform manylinux…`). Then run the ignored live test `live_managed_easy_proxy_installs_starts_and_routes_a_stream`, which installs, starts, and pulls a segment of a public test stream through the input proxy.
 
 ---
 
@@ -853,11 +889,13 @@ Probe output (`-filters`, `-buildconf`, encoder `--help`) goes through `process:
 | `executorPreference` | `"auto"` (`"nvidiaAi"`, `"amdAi"`, `"universal"`; aliases `"nvidia"`, `"nvidiaSpecialized"`, `"amd"`) | §6.2 |
 | `encodingProfiles` | `{}` | §7.8 |
 | `alwaysOnTop`, `showOnProxyStart`, `minimizeToTray`, `closeToTray` (`true`), `notifications` | mostly `false` | Desktop UI |
+| `autoUpdate` | `true` (also when missing from an older `config.json`) | §14 self-update: install new releases while idle |
 | `player` `{enabled, selectedPlayer, customPath}` | disabled | External player launch |
 | `relay` | disabled | §11 |
+| `easyProxy` `{enabled, mode, url, apiPassword}` | disabled; `mode` `"managed"` (`"external"`; unknown values load as managed); `url` `null` = `http://127.0.0.1:7860` | §10.6–10.7. `url` and `apiPassword` are for external mode. Not settable through `/v1/settings/stream`. `apiPassword` is redacted in the change log. |
 | `instanceId`, `apiToken` | generated at startup | Identity / auth |
 
-- `ServerSettings` (`server/state.rs`) is the in-memory subset the server reads (`resolution, quality, framegen, framegen_target, framegen_engine, hdr, executor_preference, show_on_proxy_start, notifications, encoding_profiles, relay`). After any persisted change, rebuild it with `ServerSettings::from(&settings)`. Both the Tauri commands and `/v1/settings/stream` do this.
+- `ServerSettings` (`server/state.rs`) is the in-memory subset the server reads (`resolution, quality, framegen, framegen_target, framegen_engine, hdr, executor_preference, show_on_proxy_start, notifications, encoding_profiles, relay, easy_proxy`). After any persisted change, rebuild it with `ServerSettings::from(&settings)`. Both the Tauri commands and `/v1/settings/stream` do this.
 - `SettingsManager::update` normalizes, logs changed top-level keys, and writes pretty JSON. `merge_and_update` applies a partial JSON object.
 - Settings are read **once per session start**. Changes don't affect a running session.
 
@@ -870,9 +908,10 @@ Probe output (`-filters`, `-buildconf`, encoder `--help`) goes through `process:
 - Boot and window: `get_boot_setting`, `set_boot_setting`, `minimize_window`, `close_window`, `toggle_pin`, `open_external`, `open_github`.
 - Setup: `renderer_ready`, `get_setup_state`, `retry_setup`.
 - Auth: `get_api_token`, `get_pending_consent`, `respond_to_consent`, `get_approved_origins`, `revoke_approved_origin`.
-- Streams: `stop_stream`.
+- Streams: `stop_stream`, `start_debug_stream` (debug builds only; see §15).
 - Relay: `discover_lan_peers`, `get_linked_relay_status`, `link_relay_peer`, `unlink_relay_peer`.
-- Updates: `check_for_update`, `download_and_install_update`.
+- EasyProxy: `check_easy_proxy` (managed: starts the server; external: checks the values being edited), `get_easy_proxy_status`, `install_easy_proxy`, `remove_easy_proxy` (§10.6–10.7).
+- Updates: `get_update_status`, `check_for_update` (returns the status; a failed check is in its `error`), `install_update` (downloads if needed, installs, exits; rejects while sessions run).
 - Players: `detect_players`, `launch_player`.
 - Misc: `get_app_version`.
 
@@ -886,13 +925,15 @@ The renderer calls them through `/desktop/ui/src/lib/renderer-api.ts`.
 | `consent-request` | `server/auth.rs::request_user_consent` | `{nonce, origin, appName}` |
 | `settings-sync` | `commands.rs` settings and relay commands, `/v1/settings/stream` | `Settings` |
 | `setup-gpu-detected` / `setup-progress` / `setup-complete` / `setup-error` | `commands.rs::run_setup_download` | `{vendor,name}` / `SetupProgress{phase,percent,detail}` / `()` / `{message}` |
-| `update-progress` | `download_and_install_update` | percent |
+| `update-status` | `updater.rs`, on every change | `UpdateStatus{currentVersion, phase, latestVersion, releaseUrl, progress, error, lastChecked, unsupportedReason}` |
 | `navigate-view` | `tray.rs` | `"settings"` |
 | `token-rotated` | `server/auth.rs::handle_rotate_token` | new token (the renderer does not subscribe) |
 
 The renderer also subscribes to `boot-setting-sync`, but nothing in the backend emits it.
 
 **Windows:** `main` (`index.html`) and `stream-player` (`player.html`), both in `tray.rs`. `showOnProxyStart` raises `main` on stream start. `notifications` shows "… stream is live" / "… stream stopped".
+
+**Self-update** (`updater.rs`): a check lists `cmacrowther/referee` releases and takes the highest semver above the running version, skipping drafts, GitHub prereleases and semver prerelease tags. The release must carry this installation's asset (decided by `tauri::utils::platform::bundle_type()`, which the bundler stamps into the binary; NSIS → `*_x64-setup.exe`, deb → `*_amd64.deb`, rpm → `*.x86_64.rpm`, arm64 equivalents) **with** a GitHub `sha256:` digest. The download goes through `deps::download_verified` and is re-hashed before reuse. Install: Windows starts the NSIS installer with `ShellExecuteExW` (the per-machine installer requires the UAC prompt, which `CreateProcess` cannot raise) using `/P /UPDATE /R` (passive, update mode, relaunch), then exits. Linux runs `pkexec dpkg -i` / `pkexec rpm -U`, then `request_restart()`. Builds without a bundle type (dev, `cargo run`) report `unsupportedReason` and only link the release page. A failed or declined install is not retried automatically until the next launch. The renderer never supplies the URL that is downloaded.
 
 **CSP** (`tauri.conf.json`): `connect-src` and `media-src` allow `http://127.0.0.1:14002`.
 
@@ -904,8 +945,9 @@ The renderer also subscribes to `boot-setting-sync`, but nothing in the backend 
 - **Levels:**
   - `RUST_LOG=referee=debug` logs **full command lines for every stage** (`[Pipeline:<backend>]: Command:` / `[Pipeline:<backend>:<stage>]: Command:`), retry decisions, and cleanup.
   - `trace` adds the full `SourceDescriptor` / `PipelineRequest` / `BackendCapabilities` / `ExecutionPlan` dump per session (`[Pipeline]: Prepared session …`), per-heartbeat lines, bridge byte counts, and `frame=`/`size=` progress lines.
-- **Log prefixes:** `[Main]`, `[Setup]`, `[GPU]`, `[Deps/…]`, `[Settings]`, `[Auth]`, `[Planner]` (content classification + chosen upscaler), `[Metadata Probe]`, `[Content Probe]`, `[Input Proxy]`, `[Relay]`, `[Relay Proxy]`, `[Pipeline]`, `[Pipeline:<backend>]`, `[Pipeline:<stage>:<label>]` (child stderr), `[PipelineSupervisor]`.
+- **Log prefixes:** `[Main]`, `[Debug]`, `[Setup]`, `[GPU]`, `[Deps/…]`, `[Settings]`, `[Auth]`, `[Planner]` (content classification + chosen upscaler), `[Metadata Probe]`, `[Content Probe]`, `[Input Proxy]`, `[EasyProxy]`, `[EasyProxy:server]` (managed server stderr, debug), `[Deps:pip]` (debug), `[Relay]`, `[Relay Proxy]`, `[Pipeline]`, `[Pipeline:<backend>]`, `[Pipeline:<stage>:<label>]` (child stderr), `[PipelineSupervisor]`.
 - **On failure:** the failed stage's last stderr is logged at `error` (`Last stderr for session …`). Capability probe results are logged at session start (`Capabilities — vpp-resize=…, fruc=…, native-double=…, truehdr=…, rife=…, hqdn3d=…`).
+- **Test streams without a web client:** in a dev build (`npm run dev`) the standby screen shows a **Test Stream** field (`desktop/ui/src/dev/DebugStreamPanel.tsx`, delivered through `useRendererDebugPanel`'s `statusPanel`, so production bundles leave it out). Submitting calls `start_debug_stream`, which runs the same validation, SSRF check, relay routing, and local start as `/v1/stream/start` (`server::stream::start_stream`, without the per-IP rate limit). It names the app `REFEREE Debug` and heartbeats the session every 5 s until it is stopped or ends, because no client is there to do it. It then opens the built-in player unless player auto-open is configured, in which case the renderer's auto-launch opens the chosen player. Release builds reject the command.
 - **Reproducing a stage by hand:** copy the logged command line. Inside the pipeline, `/v1/input/{id}` URLs only work while that session exists, so replace them with the original source URL.
 - **Quick API checks:**
 
@@ -922,7 +964,8 @@ The renderer also subscribes to `boot-setting-sync`, but nothing in the backend 
 
 - **Rust:** unit tests sit inline as `#[cfg(test)] mod tests` at the bottom of each file. The largest suites are `pipeline/tests.rs`, `exec/universal.rs`, `server/tests.rs`, `exec/nvidia.rs`, `graph/planner.rs`, and `exec/amd.rs`. Tests assert on **generated argument vectors and plan structures**, not on running encoders. No GPU is needed.
 - **`server/tests.rs` helpers:** `settings()`, `runtime_backend()`, `amd_runtime_backend()`, `source_descriptor(...)`, `planner_capabilities()`, `encoder_capabilities()`, `gpu_info()`, `insert_session_with_executor()`, and `spawn_relay_mock_server()` (a real Axum server on an ephemeral port for relay round-trips).
-- **CI** (`release.yml`, only when the `package.json` version changes on `main`): `cargo test --features headless --no-default-features` on Windows and Ubuntu, plus `npm test -- --run`. Desktop-only tests (`commands.rs`) do **not** run in CI. Run plain `cargo test` locally to cover them.
+- **CI** (`release.yml`, only when the `package.json` version changes on `main`): `cargo test --features headless --no-default-features` on Windows and Ubuntu, plus `npm test -- --run`. Desktop-only tests (`commands.rs`, `updater.rs`, `deps/`, `settings.rs`) do **not** run in CI. Run plain `cargo test` locally to cover them.
+- **Desktop tests on Windows:** `tauri-build` embeds the Common Controls v6 manifest only into `[[bin]]` targets, and the lib test binary imports `TaskDialogIndirect`, so plain `cargo test` exits with `STATUS_ENTRYPOINT_NOT_FOUND` (0xc0000139) before any test runs. Link the manifest dependency into the test build, then run the binary it prints: `cargo rustc --manifest-path desktop/native/Cargo.toml --lib --profile test -- -C link-arg=/MANIFEST:EMBED -C "link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"`, then `desktop/native/target/debug/deps/referee_lib-<hash>.exe`.
 - **UI:** Vitest + Testing Library, co-located `*.test.tsx`. `@tauri-apps/api` is mocked in `/desktop/ui/src/__mocks__`.
 - **When you change an executor or planner rule,** update or add an argument-level assertion next to the existing ones in that module. `pipeline/tests.rs` covers executor selection, staged-launch decisions, and context wiring across modules.
 
@@ -940,7 +983,7 @@ The renderer also subscribes to `boot-setting-sync`, but nothing in the backend 
 8. **Never hold a `DashMap` guard across `.await`.** Existing code clones what it needs and `drop`s the guard first (see `handle_heartbeat`, `stop_tracked_session`, `serve_tmp_file`).
 9. **Child processes:** spawn through `ProcessSpec` so that piped stderr, `kill_on_drop`, and `CREATE_NO_WINDOW` always apply. One-off capability probes go through `process::cached_probe_output`.
 10. **Headless parity:** every Tauri reference is `cfg`-gated with a headless twin, and new modules are declared in both crate roots.
-11. **Security posture:** only http(s) sources; SSRF check on start and on every proxied URL; forwarded-header blocklist; path-traversal check on `/v1/tmp`; token on all mutating routes; CORS limited to approved origins.
+11. **Security posture:** only http(s) sources; SSRF check on start and on every proxied URL (EasyProxy sessions: media paths only, password sent only to EasyProxy, §10.6); forwarded-header blocklist; path-traversal check on `/v1/tmp`; token on all mutating routes; CORS limited to approved origins.
 
 ---
 

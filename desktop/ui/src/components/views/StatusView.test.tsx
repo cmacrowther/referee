@@ -187,4 +187,29 @@ describe('StatusView — relay link card', () => {
 
         expect(screen.queryByRole('group', { name: 'RELAY TARGET relay-box' })).toBeNull()
     })
+
+    it('shows the debug panel on standby and while a stream starts, but not once it is live', () => {
+        const debugPanel = <div data-testid="debug-panel" />
+        const startingSession = makeSession({ startupComplete: false })
+        const statuses: Array<[Status, boolean]> = [
+            [DEFAULT_STATUS, true],
+            [{ ...DEFAULT_STATUS, activeSessions: 1, sessions: [startingSession], primarySession: startingSession }, true],
+            [makeLiveStatus(), false],
+        ]
+
+        for (const [status, visible] of statuses) {
+            const { unmount } = render(
+                <StatusView
+                    status={status}
+                    settings={DEFAULT_SETTINGS}
+                    relayLinkStatus={DEFAULT_RELAY_LINK_STATUS}
+                    isStopping={false}
+                    onStop={vi.fn()}
+                    debugPanel={debugPanel}
+                />
+            )
+            expect(screen.queryByTestId('debug-panel') !== null).toBe(visible)
+            unmount()
+        }
+    })
 })

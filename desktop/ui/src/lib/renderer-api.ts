@@ -1,6 +1,17 @@
-import { DEFAULT_RELAY_LINK_STATUS, DEFAULT_SETTINGS, DEFAULT_STATUS, type ApprovedOrigin, type ConsentRequest, type RelayPeer, type RendererApi, type Unsubscribe } from '@/lib/types';
+import { DEFAULT_RELAY_LINK_STATUS, DEFAULT_SETTINGS, DEFAULT_STATUS, type ApprovedOrigin, type ConsentRequest, type EasyProxyMode, type EasyProxyStatus, type ManagedEasyProxyStatus, type RelayPeer, type RendererApi, type Unsubscribe, type UpdateStatus } from '@/lib/types';
 
 const noopSubscription = () => () => {};
+
+const BROWSER_UPDATE_STATUS: UpdateStatus = {
+    currentVersion: 'dev',
+    phase: 'idle',
+    latestVersion: null,
+    releaseUrl: null,
+    progress: null,
+    error: null,
+    lastChecked: null,
+    unsupportedReason: 'Updates need the desktop app.',
+};
 
 const mockApi: RendererApi = {
     isElectron: false,
@@ -22,13 +33,15 @@ const mockApi: RendererApi = {
     async getAppVersion() {
         return 'dev';
     },
-    async checkForUpdate() {
-        return {
-            currentVersion: 'dev',
-            hasUpdate: false
-        };
+    async getUpdateStatus() {
+        return BROWSER_UPDATE_STATUS;
     },
-    async downloadAndInstallUpdate() {},
+    async checkForUpdate() {
+        return BROWSER_UPDATE_STATUS;
+    },
+    async installUpdate() {
+        throw new Error('Updates need the desktop app.');
+    },
     async stopStream() {
         return DEFAULT_STATUS;
     },
@@ -71,7 +84,7 @@ const mockApi: RendererApi = {
     onSetupProgress: noopSubscription,
     onSetupComplete: noopSubscription,
     onSetupError: noopSubscription,
-    onUpdateProgress: noopSubscription,
+    onUpdateStatus: noopSubscription,
     respondToConsent() {},
     async getPendingConsent() { return null; },
     onConsentRequest: noopSubscription,
@@ -81,6 +94,26 @@ const mockApi: RendererApi = {
     async getRelayLinkStatus() { return DEFAULT_RELAY_LINK_STATUS; },
     async linkRelayPeer(_peer: RelayPeer) {},
     async unlinkRelayPeer() {},
+    async checkEasyProxy() {
+        throw new Error('EasyProxy checks need the desktop app.');
+    },
+    async getEasyProxyStatus() {
+        return {
+            installState: 'unsupported',
+            installing: false,
+            progress: null,
+            error: null,
+            running: false,
+            starting: false,
+            version: '',
+            commit: '',
+        };
+    },
+    async installEasyProxy() {},
+    async removeEasyProxy() {},
+    async startDebugStream() {
+        throw new Error('Debug streams need the desktop app.');
+    },
 };
 
 export function isTauri(): boolean {
@@ -162,12 +195,16 @@ function createTauriApi(): RendererApi {
             return invoke('get_app_version') as Promise<string>;
         },
 
-        async checkForUpdate() {
-            return invoke('check_for_update') as any;
+        async getUpdateStatus() {
+            return invoke('get_update_status') as Promise<UpdateStatus>;
         },
 
-        async downloadAndInstallUpdate(downloadUrl: string) {
-            await invoke('download_and_install_update', { downloadUrl });
+        async checkForUpdate() {
+            return invoke('check_for_update') as Promise<UpdateStatus>;
+        },
+
+        async installUpdate() {
+            await invoke('install_update');
         },
 
         async stopStream(sessionId: string) {
@@ -214,7 +251,7 @@ function createTauriApi(): RendererApi {
         onSetupProgress: createTauriEventSubscription('setup-progress'),
         onSetupComplete: createTauriEventSubscription('setup-complete'),
         onSetupError: createTauriEventSubscription('setup-error'),
-        onUpdateProgress: createTauriEventSubscription('update-progress'),
+        onUpdateStatus: createTauriEventSubscription('update-status'),
 
         respondToConsent(nonce: string, approved: boolean, alwaysAllow: boolean) {
             invoke('respond_to_consent', { nonce, approved, alwaysAllow });
@@ -248,6 +285,26 @@ function createTauriApi(): RendererApi {
 
         async unlinkRelayPeer() {
             await invoke('unlink_relay_peer');
+        },
+
+        async checkEasyProxy(mode: EasyProxyMode, url: string | null, apiPassword: string | null) {
+            return invoke('check_easy_proxy', { mode, url, apiPassword }) as Promise<EasyProxyStatus>;
+        },
+
+        async getEasyProxyStatus() {
+            return invoke('get_easy_proxy_status') as Promise<ManagedEasyProxyStatus>;
+        },
+
+        async installEasyProxy() {
+            await invoke('install_easy_proxy');
+        },
+
+        async removeEasyProxy() {
+            await invoke('remove_easy_proxy');
+        },
+
+        async startDebugStream(url: string) {
+            await invoke('start_debug_stream', { url });
         },
     };
 }

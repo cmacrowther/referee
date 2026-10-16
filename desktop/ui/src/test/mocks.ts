@@ -9,6 +9,7 @@ import {
     type SetupProgress,
     type Settings,
     type Status,
+    type UpdateStatus,
 } from '@/lib/types'
 
 // ─── Generic event channel ────────────────────────────────────────────────────
@@ -37,6 +38,18 @@ function makeVoidChannel() {
 
 // ─── Mock API factory ─────────────────────────────────────────────────────────
 
+/** Checked a minute ago; no newer release. */
+export const UP_TO_DATE: UpdateStatus = {
+    currentVersion: 'test',
+    phase: 'idle',
+    latestVersion: null,
+    releaseUrl: null,
+    progress: null,
+    error: null,
+    lastChecked: Date.now() - 60_000,
+    unsupportedReason: null,
+}
+
 /**
  * Creates a mock RendererApi suitable for hook tests. All `on*` subscriptions
  * store their callback and return a real unsubscribe function. An `emit` object
@@ -51,7 +64,7 @@ export function makeMockApi() {
     const setupProgress = makeChannel<SetupProgress>()
     const setupComplete = makeVoidChannel()
     const setupError = makeChannel<{ message?: string }>()
-    const updateProgress = makeChannel<number>()
+    const updateStatus = makeChannel<UpdateStatus>()
     const consentRequest = makeChannel<ConsentRequest>()
 
     const api: RendererApi = {
@@ -64,8 +77,9 @@ export function makeMockApi() {
         getBootSetting: vi.fn().mockResolvedValue(false),
         setBootSetting: vi.fn(),
         getAppVersion: vi.fn().mockResolvedValue('test'),
-        checkForUpdate: vi.fn().mockResolvedValue({ currentVersion: 'test', hasUpdate: false }),
-        downloadAndInstallUpdate: vi.fn().mockResolvedValue(undefined),
+        getUpdateStatus: vi.fn().mockResolvedValue(UP_TO_DATE),
+        checkForUpdate: vi.fn().mockResolvedValue(UP_TO_DATE),
+        installUpdate: vi.fn().mockResolvedValue(undefined),
         stopStream: vi.fn().mockResolvedValue(DEFAULT_STATUS),
         retrySetup: vi.fn().mockResolvedValue(undefined),
         detectPlayers: vi.fn().mockResolvedValue([
@@ -96,7 +110,7 @@ export function makeMockApi() {
         onSetupProgress: setupProgress.listen,
         onSetupComplete: setupComplete.listen,
         onSetupError: setupError.listen,
-        onUpdateProgress: updateProgress.listen,
+        onUpdateStatus: updateStatus.listen,
         respondToConsent: vi.fn(),
         getPendingConsent: vi.fn().mockResolvedValue(null),
         onConsentRequest: consentRequest.listen,
@@ -106,6 +120,20 @@ export function makeMockApi() {
         getRelayLinkStatus: vi.fn().mockResolvedValue(DEFAULT_RELAY_LINK_STATUS),
         linkRelayPeer: vi.fn().mockResolvedValue(undefined),
         unlinkRelayPeer: vi.fn().mockResolvedValue(undefined),
+        checkEasyProxy: vi.fn().mockResolvedValue({ version: null }),
+        getEasyProxyStatus: vi.fn().mockResolvedValue({
+            installState: 'missing',
+            installing: false,
+            progress: null,
+            error: null,
+            running: false,
+            starting: false,
+            version: '2.13.35',
+            commit: '1d4ad76',
+        }),
+        installEasyProxy: vi.fn().mockResolvedValue(undefined),
+        removeEasyProxy: vi.fn().mockResolvedValue(undefined),
+        startDebugStream: vi.fn().mockResolvedValue(undefined),
     }
 
     return {
@@ -119,7 +147,7 @@ export function makeMockApi() {
             setupProgress: setupProgress.emit,
             setupComplete: setupComplete.emit,
             setupError: setupError.emit,
-            updateProgress: updateProgress.emit,
+            updateStatus: updateStatus.emit,
             consentRequest: consentRequest.emit,
         },
     }

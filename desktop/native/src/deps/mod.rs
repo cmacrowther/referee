@@ -2,11 +2,13 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 
 mod download;
+pub mod easy_proxy;
 mod install;
 mod resolution;
 mod shaders;
 mod transaction;
 
+pub(crate) use download::{download_verified, VerifiedDownload};
 pub use resolution::{
     detect_ffmpeg_filter, resolve_ffmpeg_path, resolve_rife_model_path, resolve_rife_worker_path,
 };

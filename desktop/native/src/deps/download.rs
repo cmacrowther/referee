@@ -423,7 +423,7 @@ fn inventory(root: &Path, dir: &Path) -> Result<Vec<InstalledFile>, String> {
     Ok(files)
 }
 
-fn extract_archive(archive: &Path, dest: &Path, name: &str) -> Result<(), String> {
+pub(super) fn extract_archive(archive: &Path, dest: &Path, name: &str) -> Result<(), String> {
     if name.ends_with(".zip") {
         extract_zip(archive, dest)
     } else if name.ends_with(".7z") {
@@ -549,21 +549,53 @@ async fn download_archive<F: FnMut(SetupProgress)>(
     package: Package,
     progress: &mut F,
 ) -> Result<(), String> {
+    let download = VerifiedDownload {
+        url: &asset.browser_download_url,
+        size: (asset.size > 0).then_some(asset.size),
+        digest: asset.digest.as_deref(),
+        label: package.label(),
+        phase: package.phase(),
+    };
+    download_verified(client, &download, path, progress).await
+}
+
+/// A file to download, checked against `size` and a `sha256:<hex>` digest
+/// when they are known.
+pub(crate) struct VerifiedDownload<'a> {
+    pub(crate) url: &'a str,
+    pub(crate) size: Option<u64>,
+    pub(crate) digest: Option<&'a str>,
+    pub(crate) label: &'a str,
+    pub(crate) phase: &'a str,
+}
+
+/// Downloads to `path` with retries and a stall timeout, reporting 0–90%.
+pub(crate) async fn download_verified<F: FnMut(SetupProgress)>(
+    client: &reqwest::Client,
+    download: &VerifiedDownload<'_>,
+    path: &Path,
+    progress: &mut F,
+) -> Result<(), String> {
+    let label = download.label;
+    let mut report = |percent: u32, detail: String| {
+        progress(SetupProgress {
+            phase: download.phase.into(),
+            percent,
+            detail,
+        })
+    };
     let mut last_error = String::new();
     for attempt in 0..ATTEMPTS {
         report(
-            progress,
-            package,
             0,
             format!(
-                "Downloading {} (attempt {}/{ATTEMPTS})...",
-                package.label(),
+                "Downloading {label} (attempt {}/{ATTEMPTS})...",
                 attempt + 1
             ),
         );
         let result = async {
             let mut response = client
-                .get(&asset.browser_download_url)
+                .get(download.url)
                 .header(reqwest::header::USER_AGENT, "REFEREE-Dependency-Updater")
                 .timeout(DOWNLOAD_TIMEOUT)
                 .send()
@@ -571,11 +603,7 @@ async fn download_archive<F: FnMut(SetupProgress)>(
                 .map_err(|e| e.to_string())?
                 .error_for_status()
                 .map_err(|e| e.to_string())?;
-            let expected = if asset.size > 0 {
-                Some(asset.size)
-            } else {
-                response.content_length()
-            };
+            let expected = download.size.or_else(|| response.content_length());
             let mut file = fs::File::create(path).map_err(|e| e.to_string())?;
             let mut hasher = Sha256::new();
             let mut downloaded = 0u64;
@@ -591,12 +619,7 @@ async fn download_archive<F: FnMut(SetupProgress)>(
                 if let Some(total) = expected.filter(|total| *total > 0) {
                     let percent = (downloaded.saturating_mul(90) / total).min(90) as u32;
                     if percent > last_percent {
-                        report(
-                            progress,
-                            package,
-                            percent,
-                            format!("Downloading {}...", package.label()),
-                        );
+                        report(percent, format!("Downloading {label}..."));
                         last_percent = percent;
                     }
                 }
@@ -604,7 +627,7 @@ async fn download_archive<F: FnMut(SetupProgress)>(
             if downloaded == 0 || expected.is_some_and(|size| size != downloaded) {
                 return Err("Incomplete dependency download".to_string());
             }
-            if let Some(digest) = &asset.digest {
+            if let Some(digest) = download.digest {
                 let actual = format!("sha256:{:x}", hasher.finalize());
                 if !actual.eq_ignore_ascii_case(digest) {
                     return Err("Dependency checksum verification failed".into());
@@ -624,7 +647,7 @@ async fn download_archive<F: FnMut(SetupProgress)>(
             tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
         }
     }
-    Err(format!("{} download failed: {last_error}", package.label()))
+    Err(format!("{label} download failed: {last_error}"))
 }
 
 fn report<F: FnMut(SetupProgress)>(

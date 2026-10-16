@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, error, info, trace, warn};
 
+use crate::easy_proxy_service::EasyProxyService;
 use crate::gpu::GpuInfo;
 use crate::graph::{
     parse_resolution, BackendCapabilities, ExecutionPlan, ExecutorKind, GraphPlanner, HdrRequest,
@@ -33,8 +34,10 @@ use crate::pipeline::{
     ORPHAN_SESSION_TIMEOUT_MS,
 };
 use crate::settings::{
-    ApprovedOriginMeta, RelayPeerMetadata, RelaySettings, Settings, SettingsManager,
+    ApprovedOriginMeta, EasyProxyMode, EasyProxySettings, RelayPeerMetadata, RelaySettings,
+    Settings, SettingsManager,
 };
+use crate::source::easy_proxy::{redact_url_for_log, EasyProxyRoute};
 use crate::source::hls_relay;
 use crate::source::{
     describe_source, SourceContentKind, SourceDescriptor, SourceKind, SourceMetadata,
@@ -49,6 +52,7 @@ type DesktopAppHandle = ();
 
 mod auth;
 mod clients;
+mod easy_proxy;
 mod relay;
 mod responses;
 mod routes;
@@ -66,6 +70,10 @@ use auth::{
 pub use auth::{load_approved_origins, persist_approved_origins};
 pub(crate) use clients::validate_http_clients;
 use clients::{relay_control_http_client, remote_tmp_proxy_http_client};
+pub(crate) use easy_proxy::apply_easy_proxy_settings;
+use easy_proxy::{
+    extract_easy_proxy_source, resolve_easy_proxy_route, spawn_easy_proxy_supervisor,
+};
 use relay::*;
 #[cfg(not(feature = "headless"))]
 pub(crate) use relay::{adopt_moved_relay_peer, linked_relay_peer, RelayLinkFreshness};
@@ -77,6 +85,8 @@ pub use state::{ConsentDecision, ServerSettings, ServerState};
 use state::{LocalStreamSettings, RemoteIp, StreamUiSettings};
 pub(crate) use status::{build_status, finalize_status};
 use status::{emit_status_update, handle_ping, handle_status};
+#[cfg(not(feature = "headless"))]
+pub(crate) use stream::start_debug_stream;
 use stream::*;
 
 const PORT: u16 = 14002;
@@ -120,6 +130,8 @@ mod error_codes {
     pub const CONSENT_DENIED: &str = "CONSENT_DENIED";
     #[cfg(not(feature = "headless"))]
     pub const CONSENT_TIMEOUT: &str = "CONSENT_TIMEOUT";
+    pub const EASYPROXY_EXTRACTION_FAILED: &str = "EASYPROXY_EXTRACTION_FAILED";
+    pub const EASYPROXY_UNAVAILABLE: &str = "EASYPROXY_UNAVAILABLE";
     #[cfg(feature = "headless")]
     pub const HEADLESS_MODE: &str = "HEADLESS_MODE";
     pub const INVALID_HEADERS: &str = "INVALID_HEADERS";

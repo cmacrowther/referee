@@ -1,4 +1,5 @@
 import {
+    DEFAULT_EASY_PROXY_SETTINGS,
     DEFAULT_ENCODING_PROFILES,
     DEFAULT_PLAYER_SETTINGS,
     DEFAULT_RELAY_SETTINGS,
@@ -253,6 +254,12 @@ export function normalizeSettings(settings?: Partial<Settings>): Settings {
             linkedPeerIp: normalizeNullableString(settings?.relay?.linkedPeerIp),
             remoteToken: normalizeNullableString(settings?.relay?.remoteToken),
             lastKnownPeer: normalizeRelayPeerMetadata(settings?.relay?.lastKnownPeer),
+        },
+        easyProxy: {
+            enabled: Boolean(settings?.easyProxy?.enabled ?? DEFAULT_EASY_PROXY_SETTINGS.enabled),
+            mode: settings?.easyProxy?.mode === 'external' ? 'external' : 'managed',
+            url: normalizeNullableString(settings?.easyProxy?.url),
+            apiPassword: normalizeNullableString(settings?.easyProxy?.apiPassword),
         },
     }
 }

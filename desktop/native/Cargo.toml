@@ -49,10 +49,18 @@ zstd = "0.13"
 zip = "2"
 sysinfo = "0.33"
 sha2 = "0.10"
+semver = "1"
 
 [target.'cfg(windows)'.dependencies]
-# Primary display refresh rate for the Match Display frame generation target.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
+# Primary display refresh rate for the Match Display frame generation target,
+# and ShellExecuteExW to start the elevated update installer.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

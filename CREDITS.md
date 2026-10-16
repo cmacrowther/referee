@@ -22,6 +22,21 @@ This document lists the key libraries and tools that make this application possi
 - **License:** MIT
 - **Usage:** Hardware-accelerated AMD encoding.
 
+## Optional Downloads
+
+Installed only when managed EasyProxy routing is turned on (Settings → Stream → Source Proxy).
+
+### EasyProxy
+- **Project:** [https://github.com/realbestia1/EasyProxy](https://github.com/realbestia1/EasyProxy)
+- **Author:** realbestia1
+- **License:** MIT
+- **Usage:** Optional HLS/DASH source proxy. REFEREE downloads one pinned commit and runs it locally on demand.
+
+### CPython (python-build-standalone)
+- **Project:** [https://github.com/astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+- **License:** Python Software Foundation License (CPython); build scripts under the Mozilla Public License 2.0
+- **Usage:** Private Python 3.12 runtime for EasyProxy, plus EasyProxy's Python dependencies from PyPI at pinned versions, each under its own license.
+
 ## Software Frameworks
 
 ### Tauri

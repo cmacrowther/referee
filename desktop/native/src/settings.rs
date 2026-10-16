@@ -45,6 +45,16 @@ fn redact_setting_for_log(key: &str, value: &serde_json::Value) -> serde_json::V
             }
             relay
         }
+        "easyProxy" => {
+            let mut easy_proxy = value.clone();
+            if let Some(password) = easy_proxy
+                .get_mut("apiPassword")
+                .filter(|password| !password.is_null())
+            {
+                *password = serde_json::Value::from(REDACTED);
+            }
+            easy_proxy
+        }
         _ => value.clone(),
     }
 }
@@ -154,6 +164,44 @@ impl RelaySettings {
     }
 }
 
+/// Who runs the EasyProxy server that sources are routed through.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EasyProxyMode {
+    /// REFEREE installs EasyProxy and starts it on demand (`easy_proxy_service`).
+    #[default]
+    Managed,
+    /// A server the user runs, at `url`.
+    External,
+}
+
+/// Optional routing of stream sources through an EasyProxy server
+/// (https://github.com/realbestia1/EasyProxy). Off by default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EasyProxySettings {
+    pub enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_or_default")]
+    pub mode: EasyProxyMode,
+    /// External mode: base URL of the server. `None` means
+    /// `crate::source::easy_proxy::DEFAULT_EASY_PROXY_URL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// External mode: the server's `API_PASSWORD`, when it sets one.
+    #[serde(
+        rename = "apiPassword",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_password: Option<String>,
+}
+
+impl EasyProxySettings {
+    fn normalize(&mut self) {
+        normalize_optional_string(&mut self.url);
+        normalize_optional_string(&mut self.api_password);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub resolution: String,
@@ -183,6 +231,9 @@ pub struct Settings {
     #[serde(rename = "closeToTray")]
     pub close_to_tray: bool,
     pub notifications: bool,
+    /// Download new REFEREE releases and install them while no stream runs.
+    #[serde(rename = "autoUpdate", default = "enabled")]
+    pub auto_update: bool,
     #[serde(rename = "encodingProfiles", default)]
     pub encoding_profiles: HashMap<String, EncodingProfile>,
     #[serde(default)]
@@ -195,6 +246,8 @@ pub struct Settings {
     pub instance_id: Option<String>,
     #[serde(default)]
     pub relay: RelaySettings,
+    #[serde(rename = "easyProxy", default)]
+    pub easy_proxy: EasyProxySettings,
     #[serde(rename = "apiToken", default, skip_serializing_if = "Option::is_none")]
     pub api_token: Option<String>,
 }
@@ -214,13 +267,19 @@ impl Default for Settings {
             minimize_to_tray: false,
             close_to_tray: true,
             notifications: false,
+            auto_update: true,
             encoding_profiles: HashMap::new(),
             player: PlayerSettings::default(),
             instance_id: None,
             relay: RelaySettings::default(),
+            easy_proxy: EasyProxySettings::default(),
             api_token: None,
         }
     }
+}
+
+fn enabled() -> bool {
+    true
 }
 
 /// Reads a field, falling back to its default for unknown values so one bad
@@ -243,6 +302,7 @@ impl Settings {
         self.quality = self.quality.clamp(1, MAX_VSR_QUALITY);
         normalize_optional_string(&mut self.instance_id);
         self.relay.normalize();
+        self.easy_proxy.normalize();
     }
 }
 
@@ -410,6 +470,7 @@ impl SettingsManager {
             apply_bool!(obj, "minimizeToTray", current.minimize_to_tray);
             apply_bool!(obj, "closeToTray", current.close_to_tray);
             apply_bool!(obj, "notifications", current.notifications);
+            apply_bool!(obj, "autoUpdate", current.auto_update);
 
             if let Some(profiles_val) = obj.get("encodingProfiles") {
                 if let Ok(profiles) =
@@ -467,6 +528,26 @@ impl SettingsManager {
                     }
                 }
             }
+
+            if let Some(easy_proxy_val) = obj.get("easyProxy") {
+                if easy_proxy_val.is_null() {
+                    current.easy_proxy = EasyProxySettings::default();
+                } else if let Some(easy_proxy_obj) = easy_proxy_val.as_object() {
+                    apply_bool!(easy_proxy_obj, "enabled", current.easy_proxy.enabled);
+                    if let Some(mode) = easy_proxy_obj
+                        .get("mode")
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                    {
+                        current.easy_proxy.mode = mode;
+                    }
+                    apply_opt_str!(easy_proxy_obj, "url", current.easy_proxy.url);
+                    apply_opt_str!(
+                        easy_proxy_obj,
+                        "apiPassword",
+                        current.easy_proxy.api_password
+                    );
+                }
+            }
         }
         self.update(current)
     }
@@ -484,9 +565,94 @@ impl SettingsManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovedOriginMeta, FramegenEngine, FramegenTarget, RelayPeerMetadata, RelaySettings,
-        Settings, SettingsManager,
+        ApprovedOriginMeta, EasyProxyMode, EasyProxySettings, FramegenEngine, FramegenTarget,
+        RelayPeerMetadata, RelaySettings, Settings, SettingsManager,
     };
+
+    #[test]
+    fn setting_change_log_redacts_easy_proxy_password() {
+        let easy_proxy = serde_json::json!({
+            "enabled": true,
+            "url": "http://127.0.0.1:7860",
+            "apiPassword": "proxy-secret"
+        });
+        let logged = super::redact_setting_for_log("easyProxy", &easy_proxy).to_string();
+        assert!(!logged.contains("proxy-secret"));
+        assert!(logged.contains("127.0.0.1:7860"));
+    }
+
+    #[test]
+    fn easy_proxy_settings_default_off_and_round_trip_through_json() {
+        let json = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(
+            json["easyProxy"],
+            serde_json::json!({ "enabled": false, "mode": "managed" })
+        );
+
+        // Configs written before the setting existed load with it off.
+        let mut legacy = json.clone();
+        legacy.as_object_mut().unwrap().remove("easyProxy");
+        let parsed: Settings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.easy_proxy, EasyProxySettings::default());
+
+        let mut s = Settings::default();
+        s.easy_proxy = EasyProxySettings {
+            enabled: true,
+            mode: EasyProxyMode::External,
+            url: Some("http://media-box:7860".to_string()),
+            api_password: Some("ep".to_string()),
+        };
+        let mut json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["easyProxy"]["mode"], "external");
+        assert_eq!(json["easyProxy"]["url"], "http://media-box:7860");
+        assert_eq!(json["easyProxy"]["apiPassword"], "ep");
+        let parsed: Settings = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(parsed.easy_proxy, s.easy_proxy);
+
+        // An unknown mode falls back to managed without failing the file.
+        json["easyProxy"]["mode"] = serde_json::json!("sidecar");
+        let parsed: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.easy_proxy.mode, EasyProxyMode::Managed);
+        assert!(parsed.easy_proxy.enabled);
+    }
+
+    #[test]
+    fn settings_manager_merge_and_update_applies_easy_proxy_fields() {
+        let path = std::env::temp_dir().join(format!("referee-test-{}.json", uuid::Uuid::new_v4()));
+        let manager = SettingsManager::new(&path);
+
+        let updated = manager.merge_and_update(serde_json::json!({
+            "easyProxy": {
+                "enabled": true,
+                "mode": "external",
+                "url": "  http://127.0.0.1:7860  ",
+                "apiPassword": "ep"
+            }
+        }));
+        assert!(updated.easy_proxy.enabled);
+        assert_eq!(updated.easy_proxy.mode, EasyProxyMode::External);
+        assert_eq!(
+            updated.easy_proxy.url.as_deref(),
+            Some("http://127.0.0.1:7860")
+        );
+        assert_eq!(updated.easy_proxy.api_password.as_deref(), Some("ep"));
+
+        // A partial patch leaves the other fields alone; blank strings clear.
+        let updated = manager.merge_and_update(serde_json::json!({
+            "easyProxy": { "apiPassword": "   ", "mode": "sidecar" }
+        }));
+        assert!(updated.easy_proxy.enabled);
+        assert_eq!(updated.easy_proxy.mode, EasyProxyMode::External);
+        assert_eq!(
+            updated.easy_proxy.url.as_deref(),
+            Some("http://127.0.0.1:7860")
+        );
+        assert!(updated.easy_proxy.api_password.is_none());
+
+        let updated = manager.merge_and_update(serde_json::json!({ "easyProxy": null }));
+        assert_eq!(updated.easy_proxy, EasyProxySettings::default());
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn setting_change_log_redacts_tokens() {
@@ -632,6 +798,21 @@ mod tests {
         // Unknown values leave the current target in place.
         let updated = manager.merge_and_update(serde_json::json!({ "framegenTarget": "999fps" }));
         assert_eq!(updated.framegen_target, FramegenTarget::MatchDisplay);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_update_defaults_on_for_existing_settings_files_and_can_be_turned_off() {
+        let path = std::env::temp_dir().join(format!("referee-test-{}.json", uuid::Uuid::new_v4()));
+        let mut saved = serde_json::to_value(Settings::default()).unwrap();
+        saved.as_object_mut().unwrap().remove("autoUpdate");
+        std::fs::write(&path, saved.to_string()).unwrap();
+        let manager = SettingsManager::new(&path);
+        assert!(manager.get().auto_update);
+
+        let updated = manager.merge_and_update(serde_json::json!({ "autoUpdate": false }));
+        assert!(!updated.auto_update);
+        assert!(!SettingsManager::new(&path).get().auto_update);
         let _ = std::fs::remove_file(&path);
     }
 

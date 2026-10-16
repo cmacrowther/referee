@@ -666,6 +666,8 @@ export function ApiReference() {
                   ["502", "RELAY_UNAVAILABLE", "Selected relay peer is unavailable or not ready", "Check the peer connection and processing readiness"],
                   ["502", "RELAY_START_FAILED", "The peer could not start the stream", "Check the peer and source before retrying"],
                   ["502", "RELAY_STATUS_SYNC_FAILED", "The started peer session could not be synchronized", "The remote start is rolled back; check peer connectivity and retry"],
+                  ["502", "EASYPROXY_UNAVAILABLE", "The user turned on EasyProxy routing, but EasyProxy is unreachable or refuses the API password", "Fall back to native playback; the user fixes it in REFEREE's Source Proxy settings"],
+                  ["502", "EASYPROXY_EXTRACTION_FAILED", "EasyProxy's extractor found no video at the source URL", "Fall back to native playback; the error message carries EasyProxy's reason"],
                 ].map(([status, code, meaning, action]) => (
                   <tr key={code}>
                     <td className="px-4 py-3 align-top"><code className="text-accent">{status}</code>{" "}<code className="text-muted-foreground text-xs">{code}</code></td>

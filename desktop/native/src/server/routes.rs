@@ -34,6 +34,8 @@ pub(super) async fn add_security_headers(
 /// # Examples
 ///
 pub async fn start_server(state: ServerState) {
+    spawn_easy_proxy_supervisor(state.clone());
+
     // Clone the approved-origins map so the CORS predicate closure can reference it
     // without holding a borrow on `state`.  The Arc means both share the live map.
     let approved_origins_for_cors = state.approved_origins.clone();

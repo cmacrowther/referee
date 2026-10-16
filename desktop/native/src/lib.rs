@@ -6,6 +6,8 @@ mod commands;
 #[cfg(not(feature = "headless"))]
 mod deps;
 #[cfg(not(feature = "headless"))]
+mod easy_proxy_service;
+#[cfg(not(feature = "headless"))]
 mod exec;
 #[cfg(not(feature = "headless"))]
 mod gpu;
@@ -26,6 +28,8 @@ mod server;
 mod settings;
 #[cfg(not(feature = "headless"))]
 mod tray;
+#[cfg(not(feature = "headless"))]
+mod updater;
 
 #[cfg(not(feature = "headless"))]
 use commands::{AppState, SetupLifecycle};
@@ -233,9 +237,25 @@ pub fn run() {
                 pending_consent_ui: Arc::new(std::sync::Mutex::new(None)),
                 setup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 relay_link: Arc::new(server::RelayLinkMonitor::default()),
+                easy_proxy: easy_proxy_service::EasyProxyService::new(
+                    lib_dir.clone(),
+                    app_data_dir.join("easyproxy-data"),
+                    http_client.clone(),
+                    easy_proxy_service::ServerAccess::for_build(),
+                ),
             };
 
             let setup_done = Arc::new(Notify::new());
+
+            let update_events = app_handle.clone();
+            let updater = updater::Updater::new(
+                app.package_info().version.clone(),
+                http_client.clone(),
+                paths::update_dir(&app_handle),
+                move |status| {
+                    let _ = update_events.emit("update-status", status);
+                },
+            );
 
             let app_state = AppState {
                 settings_manager,
@@ -244,9 +264,11 @@ pub fn run() {
                 setup_done: setup_done.clone(),
                 setup_state: Arc::new(std::sync::Mutex::new(SetupLifecycle::default())),
                 http_client,
+                updater,
             };
 
             app.manage(app_state);
+            updater::spawn_auto_updates(app_handle.clone());
 
             // Setup tray
             tray::setup_tray(&app_handle)?;
@@ -371,8 +393,9 @@ pub fn run() {
             commands::get_api_token,
             commands::get_pending_consent,
             commands::respond_to_consent,
+            commands::get_update_status,
             commands::check_for_update,
-            commands::download_and_install_update,
+            commands::install_update,
             commands::stop_stream,
             commands::get_setup_state,
             commands::retry_setup,
@@ -393,6 +416,11 @@ pub fn run() {
             commands::get_linked_relay_status,
             commands::link_relay_peer,
             commands::unlink_relay_peer,
+            commands::check_easy_proxy,
+            commands::get_easy_proxy_status,
+            commands::install_easy_proxy,
+            commands::remove_easy_proxy,
+            commands::start_debug_stream,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

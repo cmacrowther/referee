@@ -19,6 +19,7 @@ use crate::pipeline::{
     PipelineCompletionSignal, Session, SessionInfo,
 };
 use crate::settings::{ApprovedOriginMeta, RelayPeerMetadata, SettingsManager};
+use crate::source::easy_proxy::EasyProxyRoute;
 use crate::source::{
     SourceClassification, SourceContentKind, SourceDescriptor, SourceKind, SourceMetadata,
     SourceTransport,
@@ -49,6 +50,7 @@ fn settings(resolution: &str, framegen: bool) -> ServerSettings {
         notifications: false,
         encoding_profiles: HashMap::<String, EncodingProfile>::new(),
         relay: crate::settings::RelaySettings::default(),
+        easy_proxy: crate::settings::EasyProxySettings::default(),
     }
 }
 
@@ -1419,6 +1421,17 @@ fn persist_and_reload_approved_origins_survives_round_trip() {
 
 // ── handle_auth_request handler tests ────────────────────────────────────
 
+/// A managed EasyProxy service over an empty temp directory: nothing installed.
+fn test_easy_proxy_service() -> Arc<crate::easy_proxy_service::EasyProxyService> {
+    let root = std::env::temp_dir().join(format!("referee-test-{}", uuid::Uuid::new_v4()));
+    crate::easy_proxy_service::EasyProxyService::new(
+        root.join("lib"),
+        root.join("easyproxy-data"),
+        reqwest::Client::new(),
+        crate::easy_proxy_service::ServerAccess::Private,
+    )
+}
+
 fn make_auth_state() -> super::ServerState {
     super::ServerState {
         sessions: crate::pipeline::new_session_map(),
@@ -1439,6 +1452,7 @@ fn make_auth_state() -> super::ServerState {
         pending_consent_ui: Arc::new(std::sync::Mutex::new(None)),
         setup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         relay_link: Arc::new(super::RelayLinkMonitor::without_rebind_scans()),
+        easy_proxy: test_easy_proxy_service(),
     }
 }
 
@@ -1519,6 +1533,7 @@ async fn auth_request_approved_origin_returns_token_without_consent_prompt() {
         pending_consent_ui: Arc::new(std::sync::Mutex::new(None)),
         setup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         relay_link: Arc::new(super::RelayLinkMonitor::without_rebind_scans()),
+        easy_proxy: test_easy_proxy_service(),
     };
 
     let req = axum::http::Request::builder()
@@ -1580,6 +1595,162 @@ async fn stream_settings_update_uses_shared_settings_manager() {
     assert_eq!(updated.quality, 4);
     assert!(!updated.framegen);
     assert!(updated.hdr);
+}
+
+#[tokio::test]
+async fn stream_settings_update_cannot_change_easy_proxy() {
+    let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let settings_manager = Arc::new(SettingsManager::new(&dir.join("config.json")));
+    let mut state = make_auth_state();
+    state.settings_manager = Some(settings_manager.clone());
+
+    let response = super::handle_stream_settings_update(
+        axum::extract::State(state.clone()),
+        Json(json!({
+            "resolution": "2560x1440",
+            "easyProxy": { "enabled": true, "url": "http://127.0.0.1:22" }
+        })),
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let updated = settings_manager.get();
+    assert_eq!(updated.resolution, "2560x1440");
+    assert_eq!(
+        updated.easy_proxy,
+        crate::settings::EasyProxySettings::default()
+    );
+    assert!(!state.settings.read().await.easy_proxy.enabled);
+}
+
+/// Serves EasyProxy's `/health` and password-checked proxy endpoint.
+async fn spawn_mock_easy_proxy(password: &'static str) -> String {
+    async fn health() -> Json<serde_json::Value> {
+        Json(json!({ "status": "ok", "version": "9.9.9" }))
+    }
+
+    let proxy = move |headers: axum::http::HeaderMap| async move {
+        match headers
+            .get("x-api-password")
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(value) if value == password => axum::http::StatusCode::BAD_REQUEST,
+            _ => axum::http::StatusCode::UNAUTHORIZED,
+        }
+    };
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/proxy/manifest.m3u8", get(proxy));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", address)
+}
+
+#[tokio::test]
+async fn external_easy_proxy_is_checked_before_a_stream_starts() {
+    let service = test_easy_proxy_service();
+    let easy_proxy = |url: &str, api_password: Option<&str>| crate::settings::EasyProxySettings {
+        enabled: true,
+        mode: crate::settings::EasyProxyMode::External,
+        url: Some(url.to_string()),
+        api_password: api_password.map(String::from),
+    };
+    let resolve = |settings: crate::settings::EasyProxySettings| {
+        let service = service.clone();
+        async move { super::resolve_easy_proxy_route(&service, &settings).await }
+    };
+
+    // Off: no route and no request.
+    assert!(resolve(Default::default()).await.unwrap().is_none());
+
+    let base_url = spawn_mock_easy_proxy("ep").await;
+    let route = resolve(easy_proxy(&base_url, Some("ep")))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        route.check().await.unwrap().version.as_deref(),
+        Some("9.9.9")
+    );
+
+    let message = easy_proxy_error(resolve(easy_proxy(&base_url, Some("nope"))).await);
+    assert!(message.contains("rejected the API password"), "{message}");
+    let message = easy_proxy_error(resolve(easy_proxy(&base_url, None)).await);
+    assert!(message.contains("requires an API password"), "{message}");
+
+    let message = easy_proxy_error(resolve(easy_proxy(&unreachable_base_url().await, None)).await);
+    assert!(message.contains("Could not connect"), "{message}");
+
+    let message = easy_proxy_error(resolve(easy_proxy("localhost:7860", None)).await);
+    assert!(message.contains("http:// or https://"), "{message}");
+}
+
+#[tokio::test]
+async fn managed_easy_proxy_installs_on_first_use_and_reports_a_failed_install() {
+    // A lib directory under a file cannot be created, so the install fails
+    // at once instead of downloading anything.
+    let root = std::env::temp_dir().join(format!("referee-test-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&root, b"").unwrap();
+    let service = crate::easy_proxy_service::EasyProxyService::new(
+        root.join("lib"),
+        root.join("data"),
+        reqwest::Client::new(),
+        crate::easy_proxy_service::ServerAccess::Private,
+    );
+    let managed = crate::settings::EasyProxySettings {
+        enabled: true,
+        ..Default::default()
+    };
+
+    let message = easy_proxy_error(super::resolve_easy_proxy_route(&service, &managed).await);
+    assert!(
+        message.contains("being installed for first use"),
+        "{message}"
+    );
+
+    assert!(wait_until(|| !service.status().installing).await);
+    let status = service.status();
+    assert!(status.error.is_some());
+
+    // A failed install is reported rather than retried on every stream start.
+    let message = easy_proxy_error(super::resolve_easy_proxy_route(&service, &managed).await);
+    assert!(
+        message.starts_with("EasyProxy is not installed:"),
+        "{message}"
+    );
+    assert!(!service.status().installing);
+    let _ = std::fs::remove_file(&root);
+}
+
+#[tokio::test]
+async fn a_failed_extraction_fails_the_start_with_its_own_code() {
+    // The mock serves no extractor, so EasyProxy answers 404.
+    let base_url = spawn_mock_easy_proxy("ep").await;
+    let route = EasyProxyRoute::new(Some(&base_url), Some("ep")).unwrap();
+
+    let (status, Json(body)) =
+        super::extract_easy_proxy_source(&route, "https://site.example/watch/1", &HashMap::new())
+            .await
+            .unwrap_err();
+
+    assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY);
+    let body = serde_json::to_value(&body).unwrap();
+    assert_eq!(body["code"], "EASYPROXY_EXTRACTION_FAILED");
+    let message = body["error"].as_str().unwrap();
+    assert!(message.ends_with("HTTP 404"), "{message}");
+}
+
+fn easy_proxy_error(result: super::HandlerResult<Option<EasyProxyRoute>>) -> String {
+    let (status, Json(body)) = result.unwrap_err();
+    assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY);
+    let body = serde_json::to_value(&body).unwrap();
+    assert_eq!(body["code"], "EASYPROXY_UNAVAILABLE");
+    body["error"].as_str().unwrap().to_string()
 }
 
 #[cfg(not(feature = "headless"))]
@@ -1656,4 +1827,61 @@ fn startup_context_keeps_rife_on_ffmpeg_universal() {
     assert!(context.framegen_enabled);
     assert_eq!(context.target_fps, Some(60.0));
     assert!(context.execution_plan.uses_rife());
+}
+
+#[tokio::test]
+async fn session_keepalive_heartbeats_until_the_session_is_gone() {
+    let sessions = new_session_map();
+    let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel(1);
+    sessions.insert(
+        "debug-1".to_string(),
+        Session::new_local(
+            SessionInfo {
+                id: "debug-1".to_string(),
+                source_url: "https://example.com/live/master.m3u8".to_string(),
+                output_url: "http://127.0.0.1:14002/v1/tmp/debug-1/index.m3u8".to_string(),
+                app_name: Some("REFEREE Debug".to_string()),
+                stream_title: None,
+                source_content_kind: None,
+                upscaler: None,
+                source_resolution: None,
+                output_resolution: "1920x1080".to_string(),
+                source_fps: None,
+                target_fps: None,
+                framegen_enabled: false,
+                framegen_engine: None,
+                hdr_enabled: false,
+                quality_level: 2,
+                executor: ExecutorKind::Universal,
+                encoder_backend: None,
+                startup_complete: true,
+                retrying_startup: false,
+                startup_stage: "ready".to_string(),
+            },
+            HashMap::new(),
+            heartbeat_tx,
+            PathBuf::from("debug-1"),
+            PipelineCompletionSignal::new(),
+            1,
+            "low-latency",
+        ),
+    );
+
+    let keepalive = super::spawn_session_keepalive(
+        sessions.clone(),
+        "debug-1".to_string(),
+        std::time::Duration::from_millis(10),
+    );
+    for _ in 0..2 {
+        tokio::time::timeout(std::time::Duration::from_secs(2), heartbeat_rx.recv())
+            .await
+            .expect("keepalive should heartbeat the session")
+            .expect("session still holds its heartbeat sender");
+    }
+
+    sessions.remove("debug-1");
+    tokio::time::timeout(std::time::Duration::from_secs(2), keepalive)
+        .await
+        .expect("keepalive should stop once the session is gone")
+        .unwrap();
 }

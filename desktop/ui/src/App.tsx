@@ -79,7 +79,8 @@ export default function App() {
         settings.player.enabled,
         settings.player.selectedPlayer
     ]);
-    const { effectiveView, effectiveStatus, effectiveSetupState, settingsPanel, isSimulating } = useRendererDebugPanel({
+    const { effectiveView, effectiveStatus, effectiveSetupState, settingsPanel, statusPanel, isSimulating } = useRendererDebugPanel({
+        api,
         currentView,
         status,
         setupState
@@ -276,6 +277,7 @@ export default function App() {
                 isStopping={isStoppingStream}
                 onOpenRelaySettings={handleOpenRelaySettings}
                 onStop={handleStopStream}
+                debugPanel={statusPanel}
             />
             <SettingsView
                 api={api}

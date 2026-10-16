@@ -4,9 +4,11 @@ import { type ReactNode, useEffect, useState } from 'react';
 import { AboutCard } from '@/components/settings/AboutCard';
 import { AccessCard } from '@/components/settings/AccessCard';
 import { ApplicationSettingsCard } from '@/components/settings/ApplicationSettingsCard';
+import { EasyProxyCard } from '@/components/settings/EasyProxyCard';
 import { HardwareDetectionCard } from '@/components/settings/HardwareDetectionCard';
 import { PlayerSettingsCard } from '@/components/settings/PlayerSettingsCard';
 import { RelayCard } from '@/components/settings/RelayCard';
+import { UpdatesCard } from '@/components/settings/UpdatesCard';
 import { UpscalerSettingsCard } from '@/components/settings/UpscalerSettingsCard';
 import type { RelayLinkStatus, RendererApi, Settings, Status } from '@/lib/types';
 import { cn } from '@/lib/utils';
@@ -130,22 +132,31 @@ export function SettingsView({
             <div key={activeTab} role="tabpanel" className="custom-scrollbar flex-1 overflow-y-auto">
                 <div className="flex flex-col gap-3 p-2.5">
                     {isActive && activeTab === 'pipeline' && (
-                        <UpscalerSettingsCard
-                            settings={settings}
-                            locked={locked}
-                            relayLocked={requireRelayRoute && !relayRouteEnabled}
-                            relayRemote={relayRouteEnabled}
-                            relayRemoteOffline={relayRouteOffline}
-                            relayUpdating={isSavingRelayStreamSettings}
-                            relayUpdateError={relayStreamSettingsError}
-                            relayRequired={requireRelayRoute}
-                            relayPeerName={relayRoutePeerName}
-                            relayPeer={relayRoutePeer}
-                            status={status}
-                            onChange={onChangeStreamSettings ?? onChangeSettings}
-                            onOpenRelaySettings={() => setActiveTab('relay')}
-                            engineSettings={!!debugPanel}
-                        />
+                        <>
+                            <UpscalerSettingsCard
+                                settings={settings}
+                                locked={locked}
+                                relayLocked={requireRelayRoute && !relayRouteEnabled}
+                                relayRemote={relayRouteEnabled}
+                                relayRemoteOffline={relayRouteOffline}
+                                relayUpdating={isSavingRelayStreamSettings}
+                                relayUpdateError={relayStreamSettingsError}
+                                relayRequired={requireRelayRoute}
+                                relayPeerName={relayRoutePeerName}
+                                relayPeer={relayRoutePeer}
+                                status={status}
+                                onChange={onChangeStreamSettings ?? onChangeSettings}
+                                onOpenRelaySettings={() => setActiveTab('relay')}
+                                engineSettings={!!debugPanel}
+                            />
+                            <EasyProxyCard
+                                api={api}
+                                settings={settings}
+                                locked={locked}
+                                relayPeerName={relayRouteEnabled ? relayRoutePeerName ?? 'the linked REFEREE instance' : null}
+                                onChange={onChangeSettings}
+                            />
+                        </>
                     )}
 
                     {isActive && activeTab === 'relay' && (
@@ -175,6 +186,7 @@ export function SettingsView({
                     {isActive && activeTab === 'about' && (
                         <>
                             <HardwareDetectionCard status={status} />
+                            <UpdatesCard api={api} settings={settings} locked={locked} onChange={onChangeSettings} />
                             <AboutCard api={api} />
                         </>
                     )}

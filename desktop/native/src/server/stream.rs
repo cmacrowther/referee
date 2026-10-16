@@ -711,7 +711,7 @@ pub(super) fn maybe_show_stream_notification(
 pub(super) async fn handle_stream_start(
     State(state): State<ServerState>,
     RemoteIp(ip_str): RemoteIp,
-    Json(mut req): Json<StreamStartRequest>,
+    Json(req): Json<StreamStartRequest>,
 ) -> HandlerResult<Json<StreamStartResponse>> {
     // Rate limit: 3 stream-start requests per minute per IP to prevent GPU DoS.
     let rate_key = format!("stream:{}", ip_str);
@@ -723,6 +723,64 @@ pub(super) async fn handle_stream_start(
         ));
     }
 
+    start_stream(&state, req).await.map(Json)
+}
+
+/// How often [`start_debug_stream`] heartbeats its session, well inside
+/// `HEARTBEAT_TIMEOUT_MS`.
+#[cfg(not(feature = "headless"))]
+const DEBUG_STREAM_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Starts a stream for a URL entered in the desktop app's debug panel, the
+/// same way `/v1/stream/start` would, and returns the session ID. Nothing on
+/// the desktop side sends heartbeats, so the session is kept alive until it
+/// is stopped or its pipeline ends.
+#[cfg(not(feature = "headless"))]
+pub(crate) async fn start_debug_stream(state: &ServerState, url: String) -> Result<String, String> {
+    let req = StreamStartRequest {
+        url,
+        app_name: Some("REFEREE Debug".to_string()),
+        stream_title: None,
+        headers: None,
+        content_kind: None,
+        display_refresh_rate: None,
+    };
+    let response = start_stream(state, req)
+        .await
+        .map_err(|(_, Json(error))| error.error)?;
+    spawn_session_keepalive(
+        state.sessions.clone(),
+        response.session_id.clone(),
+        DEBUG_STREAM_HEARTBEAT_INTERVAL,
+    );
+    Ok(response.session_id)
+}
+
+/// Heartbeats `session_id` every `interval` until the session is gone.
+#[cfg(any(test, not(feature = "headless")))]
+pub(super) fn spawn_session_keepalive(
+    sessions: SessionMap,
+    session_id: String,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            match sessions.get(&session_id) {
+                Some(session) => session.try_send_heartbeat(),
+                None => break,
+            }
+        }
+    })
+}
+
+/// Validates and starts a stream, through the linked relay peer when relay is
+/// on. Shared by `/v1/stream/start` and [`start_debug_stream`].
+pub(super) async fn start_stream(
+    state: &ServerState,
+    mut req: StreamStartRequest,
+) -> HandlerResult<StreamStartResponse> {
     validate_stream_start_request(&req)?;
 
     // Match Display targets the viewer's display. Without a client hint, assume
@@ -756,7 +814,7 @@ pub(super) async fn handle_stream_start(
     let app_name = normalize_optional_text(req.app_name.clone());
     let stream_title = normalize_optional_text(req.stream_title.clone());
 
-    if let Some(relay_target) = resolve_active_relay_target(&state, &relay_settings)
+    if let Some(relay_target) = resolve_active_relay_target(state, &relay_settings)
         .await
         .map_err(|error| {
             error_response(
@@ -767,15 +825,14 @@ pub(super) async fn handle_stream_start(
         })?
     {
         return handle_relay_stream_start(
-            &state,
+            state,
             ui_settings,
             &req,
             relay_target,
             app_name,
             stream_title,
         )
-        .await
-        .map(Json);
+        .await;
     }
 
     let local_settings = {
@@ -784,7 +841,7 @@ pub(super) async fn handle_stream_start(
     };
 
     handle_local_stream_start(
-        &state,
+        state,
         local_settings,
         req,
         extra_headers,
@@ -792,7 +849,6 @@ pub(super) async fn handle_stream_start(
         stream_title,
     )
     .await
-    .map(Json)
 }
 
 pub(super) async fn handle_relay_stream_start(
@@ -898,6 +954,14 @@ pub(super) async fn handle_local_stream_start(
 ) -> HandlerResult<StreamStartResponse> {
     let gpu = state.gpu_info.read().await.clone();
     let runtime_backend = resolve_runtime_backend(&gpu)?;
+    // Checked before eviction so a stopped EasyProxy leaves the current stream running.
+    let easy_proxy = resolve_easy_proxy_route(&state.easy_proxy, &settings.easy_proxy).await?;
+    // Extracted before eviction too: it can take a while, and a page with no
+    // video EasyProxy can find should not end the current stream.
+    let easy_proxy_source = match &easy_proxy {
+        Some(route) => Some(extract_easy_proxy_source(route, &req.url, &extra_headers).await?),
+        None => None,
+    };
 
     // Kill any active sessions before starting a new one — only one stream at a time.
     let evicted_sessions = stop_existing_sessions(state).await;
@@ -909,13 +973,39 @@ pub(super) async fn handle_local_stream_start(
     let session_dir = state.tmp_dir.join(&session_id);
     tokio::fs::create_dir_all(&session_dir).await.ok();
 
+    // With EasyProxy on, probes and the encoder read the source from EasyProxy.
+    // The input proxy sends EasyProxy's password itself, and only to EasyProxy,
+    // so the session keeps the headers the source's host expects.
+    let (input_url, input_headers, source_headers) = match (&easy_proxy, easy_proxy_source) {
+        (Some(route), Some(source)) => {
+            info!(
+                "[EasyProxy]: Session {} routes its source through EasyProxy at {}",
+                session_id,
+                route.origin()
+            );
+            if let Some(video_url) = &source.video_url {
+                info!(
+                    "[EasyProxy]: Session {} plays the video EasyProxy's extractor found: {}",
+                    session_id,
+                    redact_url_for_log(video_url)
+                );
+            }
+            (
+                source.routed.url,
+                source.routed.headers,
+                source.source_headers,
+            )
+        }
+        _ => (req.url.clone(), extra_headers.clone(), extra_headers),
+    };
+
     let startup_context = build_startup_context(
         state,
         &settings,
         &runtime_backend,
         &session_id,
-        &req.url,
-        &extra_headers,
+        &input_url,
+        &input_headers,
         quality_level,
         req.content_kind,
         req.display_refresh_rate,
@@ -927,12 +1017,12 @@ pub(super) async fn handle_local_stream_start(
         .get(&output_resolution)
         .cloned()
         .unwrap_or_else(|| get_encoding_profile(&output_resolution));
-    let source_headers = startup_context.source_descriptor.session_headers.clone();
 
     if let Some(relayed_source) = &startup_context.source_descriptor.relay {
         info!(
             "[Input Proxy]: Session {} will proxy encoder input via {}",
-            session_id, relayed_source.relay_url
+            session_id,
+            redact_url_for_log(&relayed_source.relay_url)
         );
     }
 
@@ -996,7 +1086,8 @@ pub(super) async fn handle_local_stream_start(
         completion.clone(),
         1,
         "low-latency",
-    );
+    )
+    .with_easy_proxy(easy_proxy);
 
     state.sessions.insert(session_id.clone(), session);
 
@@ -1217,9 +1308,9 @@ pub(super) async fn handle_input_proxy(
     AxumPath(session_id): AxumPath<String>,
     Query(req): Query<InputProxyRequest>,
 ) -> Result<axum::response::Response, StatusCode> {
-    let source_headers = match state.sessions.get(&session_id) {
+    let (source_headers, easy_proxy) = match state.sessions.get(&session_id) {
         Some(session) => match session.source_headers() {
-            Some(headers) => headers.clone(),
+            Some(headers) => (headers.clone(), session.easy_proxy().cloned()),
             None => return Err(StatusCode::BAD_GATEWAY),
         },
         None => return Err(StatusCode::NOT_FOUND),
@@ -1230,6 +1321,7 @@ pub(super) async fn handle_input_proxy(
         PORT,
         &session_id,
         &source_headers,
+        easy_proxy.as_ref(),
         &req.url,
     )
     .await

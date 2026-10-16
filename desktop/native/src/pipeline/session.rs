@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 
 use crate::graph::ExecutorKind;
 use crate::settings::RelayPeerMetadata;
+use crate::source::easy_proxy::EasyProxyRoute;
 use crate::source::SourceContentKind;
 
 /// How long `cleanup_session` waits for the pipeline task to reap its stages
@@ -122,6 +123,9 @@ pub struct Session {
 #[derive(Debug, Clone)]
 pub struct LocalSessionBacking {
     pub source_headers: HashMap<String, String>,
+    /// EasyProxy server the source is routed through, captured at start so a
+    /// settings change does not reroute a running stream.
+    pub easy_proxy: Option<EasyProxyRoute>,
     /// Sending on this channel signals the pipeline task that the client is alive.
     /// Dropping it (via cleanup_session) signals the task to stop the running
     /// pipeline stages, including any inline or standalone packager work.
@@ -167,6 +171,7 @@ impl Session {
             info,
             backing: SessionBacking::Local(LocalSessionBacking {
                 source_headers,
+                easy_proxy: None,
                 heartbeat_tx,
                 session_dir,
                 completion,
@@ -217,8 +222,21 @@ impl Session {
         }
     }
 
+    /// Routes a local session's source through `easy_proxy`.
+    pub fn with_easy_proxy(mut self, easy_proxy: Option<EasyProxyRoute>) -> Self {
+        if let Some(local) = self.local_backing_mut() {
+            local.easy_proxy = easy_proxy;
+        }
+        self
+    }
+
     pub fn source_headers(&self) -> Option<&HashMap<String, String>> {
         self.local_backing().map(|local| &local.source_headers)
+    }
+
+    pub fn easy_proxy(&self) -> Option<&EasyProxyRoute> {
+        self.local_backing()
+            .and_then(|local| local.easy_proxy.as_ref())
     }
 
     pub fn session_dir(&self) -> Option<&Path> {

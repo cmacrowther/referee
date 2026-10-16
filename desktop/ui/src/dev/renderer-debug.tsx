@@ -3,8 +3,9 @@ import { useMemo, useState } from 'react';
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { DebugStreamPanel } from '@/dev/DebugStreamPanel';
 import { cn } from '@/lib/utils';
-import type { AppView, Session, SetupState, Status } from '@/lib/types';
+import type { AppView, RendererApi, Session, SetupState, Status } from '@/lib/types';
 
 export type DevUiSimulation = 'live' | 'setup' | 'standby' | 'active';
 
@@ -22,6 +23,7 @@ interface DevStatePanelProps {
 }
 
 interface UseRendererDebugPanelOptions {
+    api: RendererApi;
     currentView: AppView;
     status: Status;
     setupState: SetupState;
@@ -153,13 +155,15 @@ const PANEL_OPTIONS: Array<{ value: DevUiSimulation; label: string }> = [
  * - `effectiveStatus`: The `Status` to use (simulation `status` when present, otherwise the provided `status`).
  * - `effectiveSetupState`: The `SetupState` to use (simulation `setupState` when present, otherwise the provided `setupState`).
  * - `settingsPanel`: A React node for the debug panel UI that allows selecting the active simulation.
+ * - `statusPanel`: A React node for the standby screen that starts a stream from a pasted URL.
  * - `isSimulating`: `true` when a simulation other than `'live'` is active, `false` otherwise.
  */
-export function useRendererDebugPanel({ currentView, status, setupState }: UseRendererDebugPanelOptions): {
+export function useRendererDebugPanel({ api, currentView, status, setupState }: UseRendererDebugPanelOptions): {
     effectiveView: AppView;
     effectiveStatus: Status;
     effectiveSetupState: SetupState;
     settingsPanel: ReactNode;
+    statusPanel: ReactNode;
     isSimulating: boolean;
 } {
     const [simulation, setSimulation] = useState<DevUiSimulation>('live');
@@ -173,6 +177,7 @@ export function useRendererDebugPanel({ currentView, status, setupState }: UseRe
         effectiveStatus: snapshot?.status ?? status,
         effectiveSetupState: snapshot?.setupState ?? setupState,
         settingsPanel: <DevStatePanel simulation={simulation} onChange={setSimulation} />,
+        statusPanel: <DebugStreamPanel api={api} />,
         isSimulating: simulation !== 'live'
     };
 }

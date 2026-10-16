@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::classify_source_url;
+use super::easy_proxy::{redact_url_for_log, EasyProxyRoute};
 
 const INPUT_PROXY_USER_AGENT: &str = "REFEREE-InputProxy";
 /// Upstream stall bounds for the input proxy. NVEncC and the single-process
@@ -82,6 +83,7 @@ pub async fn relay_request(
     relay_port: u16,
     session_id: &str,
     source_headers: &HashMap<String, String>,
+    easy_proxy: Option<&EasyProxyRoute>,
     target_url: &str,
 ) -> Result<axum::response::Response, StatusCode> {
     let target_url = reqwest::Url::parse(target_url).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -89,27 +91,20 @@ pub async fn relay_request(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // SSRF protection: block loopback and link-local targets.
-    // RFC-1918 private ranges are allowed so LAN stream sources remain reachable.
-    if super::is_ssrf_target(target_url.as_str()).await {
-        tracing::warn!(
-            "[Input Proxy]: Blocked SSRF attempt for session {}: {}",
-            session_id,
-            target_url
-        );
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let (target_url, request_headers) =
+        resolve_upstream_request(session_id, source_headers, easy_proxy, target_url).await?;
 
     let mut request = INPUT_PROXY_HTTP_CLIENT.get(target_url.clone());
-    for (key, value) in source_headers {
+    for (key, value) in &request_headers {
         request = request.header(key.as_str(), value.as_str());
     }
 
     let upstream = request.send().await.map_err(|error| {
         tracing::warn!(
-            "[Input Proxy]: Failed to fetch upstream URL for session {}: {}",
+            "[Input Proxy]: Failed to fetch upstream URL for session {} ({}): {}",
             session_id,
-            error
+            redact_url_for_log(target_url.as_str()),
+            error.without_url()
         );
         StatusCode::BAD_GATEWAY
     })?;
@@ -148,6 +143,58 @@ pub async fn relay_request(
     Ok(response
         .body(Body::from_stream(upstream.bytes_stream()))
         .unwrap())
+}
+
+/// Picks the URL and headers the input proxy fetches for `target_url`.
+///
+/// A session routed through EasyProxy reaches that server's media paths with
+/// its API password and sends every other target through EasyProxy too, so
+/// the source is never fetched directly. Other sessions fetch the target with
+/// the client's headers.
+async fn resolve_upstream_request(
+    session_id: &str,
+    source_headers: &HashMap<String, String>,
+    easy_proxy: Option<&EasyProxyRoute>,
+    target_url: reqwest::Url,
+) -> Result<(reqwest::Url, HashMap<String, String>), StatusCode> {
+    let blocked = |reason: &str, url: &reqwest::Url| {
+        tracing::warn!(
+            "[Input Proxy]: Blocked {} for session {}: {}",
+            reason,
+            session_id,
+            redact_url_for_log(url.as_str())
+        );
+        StatusCode::BAD_REQUEST
+    };
+
+    match easy_proxy {
+        Some(route) if route.serves(&target_url) => {
+            if !route.allows_relay_target(&target_url) {
+                return Err(blocked(
+                    "EasyProxy request outside its media paths",
+                    &target_url,
+                ));
+            }
+            Ok((target_url, route.request_headers()))
+        }
+        Some(route) => {
+            if super::is_literal_ssrf_target(target_url.as_str()) {
+                return Err(blocked("SSRF attempt", &target_url));
+            }
+            let routed = route.route(target_url.as_str(), source_headers);
+            let routed_url =
+                reqwest::Url::parse(&routed.url).map_err(|_| StatusCode::BAD_GATEWAY)?;
+            Ok((routed_url, routed.headers))
+        }
+        None => {
+            // SSRF protection: block loopback and link-local targets.
+            // RFC-1918 private ranges are allowed so LAN stream sources remain reachable.
+            if super::is_ssrf_target(target_url.as_str()).await {
+                return Err(blocked("SSRF attempt", &target_url));
+            }
+            Ok((target_url, source_headers.clone()))
+        }
+    }
 }
 
 fn is_hls_manifest_response(content_type: Option<&str>, target_url: &reqwest::Url) -> bool {
@@ -320,8 +367,9 @@ fn rewrite_hls_manifest_line(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_relay_url, describe_relayed_source, resolve_relay_target, rewrite_hls_manifest,
-        rewrite_hls_manifest_with_target_resolver, should_relay_input,
+        build_relay_url, describe_relayed_source, resolve_relay_target, resolve_upstream_request,
+        rewrite_hls_manifest, rewrite_hls_manifest_with_target_resolver, should_relay_input,
+        EasyProxyRoute,
     };
     use std::collections::HashMap;
 
@@ -453,6 +501,71 @@ mod tests {
         let resolved = resolve_relay_target(&base_url, "segment0.ts").unwrap();
 
         assert_eq!(resolved.as_str(), "https://example.com/live/segment0.ts");
+    }
+
+    #[tokio::test]
+    async fn easy_proxy_sessions_send_the_password_only_to_easy_proxy() {
+        let route = EasyProxyRoute::new(Some("http://127.0.0.1:7860"), Some("ep")).unwrap();
+        let client_headers = HashMap::from([("Referer".to_string(), "https://site/".to_string())]);
+        let password_only = HashMap::from([("x-api-password".to_string(), "ep".to_string())]);
+
+        // EasyProxy's own media URLs: password, no client headers (those
+        // already travel as h_ params).
+        let segment = reqwest::Url::parse(
+            "http://127.0.0.1:7860/proxy/hls/segment.ts?d=https%3A%2F%2Fcdn.example.com%2F1.ts",
+        )
+        .unwrap();
+        let (url, headers) =
+            resolve_upstream_request("s", &client_headers, Some(&route), segment.clone())
+                .await
+                .unwrap();
+        assert_eq!(url, segment);
+        assert_eq!(headers, password_only);
+
+        // Anything else is sent through EasyProxy rather than fetched directly.
+        let direct = reqwest::Url::parse("https://cdn.example.com/live/2.ts").unwrap();
+        let (url, headers) = resolve_upstream_request("s", &client_headers, Some(&route), direct)
+            .await
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:7860/proxy/stream?url=https%3A%2F%2Fcdn.example.com%2Flive%2F2.ts&h_Referer=https%3A%2F%2Fsite%2F"
+        );
+        assert_eq!(headers, password_only);
+    }
+
+    #[tokio::test]
+    async fn easy_proxy_sessions_block_admin_paths_and_loopback_targets() {
+        let route = EasyProxyRoute::new(Some("http://127.0.0.1:7860"), Some("ep")).unwrap();
+        for blocked in [
+            "http://127.0.0.1:7860/api/admin/config",
+            "http://127.0.0.1:7860/proxy/stream?url=http%3A%2F%2F127.0.0.1%3A22%2F",
+            "http://127.0.0.1:22/",
+            "http://localhost:14002/v1/status",
+        ] {
+            let result = resolve_upstream_request(
+                "s",
+                &HashMap::new(),
+                Some(&route),
+                reqwest::Url::parse(blocked).unwrap(),
+            )
+            .await;
+            assert_eq!(
+                result.unwrap_err(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{blocked}"
+            );
+        }
+
+        // Without EasyProxy the loopback server is blocked like any other.
+        let result = resolve_upstream_request(
+            "s",
+            &HashMap::new(),
+            None,
+            reqwest::Url::parse("http://127.0.0.1:7860/proxy/manifest.m3u8").unwrap(),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
