@@ -5,11 +5,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Keep standalone output aligned with OpenNext's docs-local package root.
+  outputFileTracingRoot: __dirname,
   images: {
     unoptimized: true,
   },
   turbopack: {
-    root: path.resolve(__dirname, '..'),
+    root: __dirname,
   },
   async redirects() {
     return [
