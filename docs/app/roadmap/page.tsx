@@ -651,6 +651,24 @@ export default async function RoadmapPage() {
                 <li className="relative pl-8">
                   <span className="absolute left-0 top-1.5 flex h-[15px] w-[15px] items-center justify-center rounded-full border-2 border-accent bg-background" aria-hidden="true" />
                   <div className="flex flex-wrap items-baseline gap-3 mb-3">
+                    <h3 className="font-semibold">v0.7.2</h3>
+                    <time dateTime="2026-10-16" className="text-xs text-muted-foreground">October 16, 2026</time>
+                  </div>
+                  <ul className="space-y-1.5 text-sm text-muted-foreground">
+                    {[
+                      "NVIDIA playback of input-relayed HLS streams now uses an FFmpeg remuxer to correct timestamp jumps, preventing prolonged frozen frames after skipped segments or source timestamp resets while preserving audio/video alignment.",
+                      "Remuxed stream startup falls back to direct source ingestion if the remuxer cannot start or fails during ingest before startup completes.",
+                      "Pipeline stages now finish draining buffered output when an upstream stage exits successfully, avoiding truncated playback at the end of a source.",
+                      "Documentation site adds Cloudflare Workers deployment support through OpenNext, with preview and deployment scripts and static asset caching configuration.",
+                    ].map((change) => (
+                      <li key={change} className="flex gap-2"><span className="text-accent flex-shrink-0">+</span>{change}</li>
+                    ))}
+                  </ul>
+                </li>
+
+                <li className="relative pl-8">
+                  <span className="absolute left-0 top-1.5 flex h-[15px] w-[15px] items-center justify-center rounded-full border-2 border-accent bg-background" aria-hidden="true" />
+                  <div className="flex flex-wrap items-baseline gap-3 mb-3">
                     <h3 className="font-semibold">v0.7.1</h3>
                     <time dateTime="2026-10-15" className="text-xs text-muted-foreground">October 15, 2026</time>
                   </div>

@@ -156,7 +156,7 @@ const endpoints = [
     response: `{
   "instanceId": "peer-a1b2c3d4-...",
   "hostname": "my-pc",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "platform": "windows",
   "gpuReady": true,
   "gpuVendor": "nvidia",
