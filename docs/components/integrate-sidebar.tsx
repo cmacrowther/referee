@@ -44,7 +44,9 @@ const navItems: NavItem[] = [
     label: "Relay Server (Linux)",
     children: [
       { id: "relay-server-approval", label: "Linking Without Consent" },
+      { id: "relay-server-updates", label: "Updates" },
       { id: "relay-server-operate", label: "Operating the Service" },
+      { id: "relay-server-source", label: "Building from Source" },
       { id: "relay-server-unit", label: "The Service Unit" },
     ],
   },

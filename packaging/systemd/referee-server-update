@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# Updates the REFEREE relay server from its GitHub releases.
+#
+#   sudo referee-server-update          Install the newest stable release if it is
+#                                       newer than the running server.
+#   sudo referee-server-update --now    The same, even if streams are active.
+#   referee-server-update --check       Only report whether an update is available.
+#   sudo referee-server-update --auto   Used by referee-server-update.timer. Installs
+#                                       only when REFEREE_AUTO_UPDATE=true is set in
+#                                       /etc/referee/referee-server.env, once no stream
+#                                       has run for 5 minutes. Otherwise it only logs
+#                                       that an update is available.
+#
+# A release counts when it is stable and publishes referee-server-linux-<arch>.tar.gz
+# with a SHA-256 digest recorded by GitHub. The archive is checked against that
+# digest before anything is installed. If the service does not come back on the
+# new version, the previous binaries are restored.
+
+set -euo pipefail
+
+# Overridable for testing and non-standard layouts.
+releases_url=${REFEREE_UPDATE_RELEASES_URL:-https://api.github.com/repos/cmacrowther/referee/releases?per_page=30}
+env_file=${REFEREE_UPDATE_ENV_FILE:-/etc/referee/referee-server.env}
+bin_dir=${REFEREE_UPDATE_BIN_DIR:-/usr/local/bin}
+sbin_dir=${REFEREE_UPDATE_SBIN_DIR:-/usr/local/sbin}
+unit_dir=${REFEREE_UPDATE_UNIT_DIR:-/etc/systemd/system}
+state_dir=${REFEREE_UPDATE_STATE_DIR:-/var/lib/referee-server-update}
+lock_file=${REFEREE_UPDATE_LOCK_FILE:-/run/lock/referee-server-update.lock}
+server_url=${REFEREE_UPDATE_SERVER_URL:-http://127.0.0.1:14002}
+idle_required=${REFEREE_UPDATE_IDLE_SECS:-300}
+idle_max_wait=${REFEREE_UPDATE_IDLE_MAX_WAIT_SECS:-3600}
+idle_poll=${REFEREE_UPDATE_IDLE_POLL_SECS:-30}
+health_timeout=${REFEREE_UPDATE_HEALTH_TIMEOUT_SECS:-600}
+health_poll=${REFEREE_UPDATE_HEALTH_POLL_SECS:-5}
+
+service=referee-server
+binaries=(referee-server rife-worker)
+units=(referee-server.service referee-server-update.service referee-server-update.timer)
+
+log() { printf '%s\n' "$*"; }
+die() {
+    printf 'referee-server-update: %s\n' "$*" >&2
+    exit 1
+}
+usage() { sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; }
+
+mode=install
+now=false
+while [ $# -gt 0 ]; do
+    case $1 in
+        --check) mode=check ;;
+        --auto) mode=auto ;;
+        --now) now=true ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'referee-server-update: unknown option %s\n\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+for cmd in curl jq sha256sum tar; do
+    command -v "$cmd" >/dev/null || die "$cmd is required. Install it with your package manager."
+done
+
+if [ "$mode" != check ]; then
+    [ "$(id -u)" -eq 0 ] || die "run as root: sudo referee-server-update"
+    for cmd in flock systemctl; do
+        command -v "$cmd" >/dev/null || die "$cmd is required."
+    done
+    exec 9>"$lock_file"
+    if ! flock -n 9; then
+        log "Another referee-server-update is already running."
+        exit 0
+    fi
+fi
+
+case $(uname -m) in
+    x86_64 | amd64) arch=x86_64 ;;
+    *) die "REFEREE does not publish referee-server builds for $(uname -m)." ;;
+esac
+bundle="referee-server-linux-$arch"
+asset="$bundle.tar.gz"
+
+# The version the running server reports, or nothing when it is not answering.
+running_version() {
+    curl -fsS --max-time 5 "$server_url/v1/ping" 2>/dev/null | jq -r '.version // empty' 2>/dev/null
+}
+
+active_sessions() {
+    curl -fsS --max-time 5 "$server_url/v1/status" 2>/dev/null | jq -er '.activeSessions' 2>/dev/null
+}
+
+# version<TAB>download url<TAB>sha256<TAB>release page for the newest stable
+# release that publishes $asset with a digest.
+latest_release() {
+    curl -fsSL --max-time 30 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'User-Agent: referee-server-update' \
+        "$releases_url" |
+        jq -r --arg asset "$asset" '
+            .[]
+            | select((.draft | not) and (.prerelease | not))
+            | (.tag_name | ltrimstr("v")) as $version
+            | select($version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+            | .html_url as $page
+            | .assets[]?
+            | select(.name == $asset and ((.digest // "") | test("^sha256:[0-9a-fA-F]{64}$")))
+            | [$version, .browser_download_url, (.digest | ltrimstr("sha256:") | ascii_downcase), $page]
+            | @tsv' |
+        sort -t "$(printf '\t')" -k1,1V |
+        tail -n 1
+}
+
+# Whether stable version $1 is newer than $2, which may be a pre-release.
+version_gt() {
+    local base=${2%%[-+]*}
+    if [ "$1" = "$base" ]; then
+        [ "$2" != "$base" ]
+        return
+    fi
+    [ "$(printf '%s\n%s\n' "$1" "$base" | sort -V | tail -n 1)" = "$1" ]
+}
+
+auto_update_enabled() {
+    local value
+    [ -r "$env_file" ] || return 1
+    value=$(sed -n 's/^[[:space:]]*REFEREE_AUTO_UPDATE[[:space:]]*=//p' "$env_file" | tail -n 1)
+    value=$(printf '%s' "$value" | tr -d "\"'[:space:]" | tr '[:upper:]' '[:lower:]')
+    case $value in
+        true | yes | on | 1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Succeeds once the server has reported no active session for $idle_required
+# seconds; fails after $idle_max_wait seconds without that.
+wait_for_idle() {
+    local start now count idle_since=""
+    start=$(date +%s)
+    while :; do
+        now=$(date +%s)
+        count=$(active_sessions) || count=""
+        if [ "$count" = 0 ]; then
+            idle_since=${idle_since:-$now}
+            if [ $((now - idle_since)) -ge "$idle_required" ]; then
+                return 0
+            fi
+        else
+            idle_since=""
+        fi
+        if [ $((now - start)) -ge "$idle_max_wait" ]; then
+            return 1
+        fi
+        sleep "$idle_poll"
+    done
+}
+
+wait_for_version() {
+    local start version
+    start=$(date +%s)
+    while [ $(($(date +%s) - start)) -lt "$health_timeout" ]; do
+        version=$(running_version) || version=""
+        if [ "$version" = "$1" ]; then
+            return 0
+        fi
+        if systemctl is-failed --quiet "$service"; then
+            return 1
+        fi
+        sleep "$health_poll"
+    done
+    return 1
+}
+
+# Replaces $2 by renaming a copy of $1 over it, so a running binary or this
+# script keeps its open file and the swap is atomic.
+install_file() {
+    local staged
+    staged="$(dirname "$2")/.$(basename "$2").new"
+    install -m 0755 "$1" "$staged"
+    mv -f "$staged" "$2"
+}
+
+backup_binaries() {
+    local f
+    rm -rf "$state_dir/previous"
+    mkdir -p "$state_dir/previous"
+    chmod 0700 "$state_dir"
+    for f in "${binaries[@]}"; do
+        if [ -f "$bin_dir/$f" ]; then
+            cp -p "$bin_dir/$f" "$state_dir/previous/$f"
+        fi
+    done
+}
+
+restore_binaries() {
+    local f
+    for f in "${binaries[@]}"; do
+        if [ -f "$state_dir/previous/$f" ]; then
+            install_file "$state_dir/previous/$f" "$bin_dir/$f"
+        else
+            rm -f "$bin_dir/$f"
+        fi
+    done
+}
+
+# Unit files are left alone because they may be customized; point out the
+# ones this release ships differently.
+note_unit_changes() {
+    local f
+    command -v cmp >/dev/null || return 0
+    mkdir -p "$state_dir/units"
+    for f in "${units[@]}"; do
+        cp "$src/$f" "$state_dir/units/$f"
+        if [ -f "$unit_dir/$f" ] && ! cmp -s "$src/$f" "$unit_dir/$f"; then
+            log "Note: this release ships a different $f. Compare with: diff $unit_dir/$f $state_dir/units/$f"
+        fi
+    done
+}
+
+release=$(latest_release) || die "could not read releases from GitHub ($releases_url)."
+if [ -z "$release" ]; then
+    log "No stable release publishes $asset yet."
+    exit 0
+fi
+IFS=$'\t' read -r latest url digest page <<<"$release"
+
+current=$(running_version) || current=""
+if [ -n "$current" ] && ! version_gt "$latest" "$current"; then
+    log "referee-server $current is up to date."
+    exit 0
+fi
+
+case $mode in
+    check)
+        if [ -n "$current" ]; then
+            log "Update available: $current -> $latest ($page)"
+        else
+            log "Latest release is $latest ($page). The server is not answering on $server_url, so its version is unknown."
+        fi
+        exit 0
+        ;;
+    auto)
+        if [ -z "$current" ]; then
+            log "Update $latest is available, but the server is not answering on $server_url. Retrying on the next check."
+            exit 0
+        fi
+        if ! auto_update_enabled; then
+            log "Update available: $current -> $latest ($page). Run 'sudo referee-server-update' to install it, or set REFEREE_AUTO_UPDATE=true in $env_file to install updates automatically."
+            exit 0
+        fi
+        ;;
+esac
+
+was_active=false
+if systemctl is-active --quiet "$service"; then
+    was_active=true
+fi
+
+if [ "$mode" = install ] && $was_active && ! $now; then
+    sessions=$(active_sessions) || sessions=0
+    if [ "$sessions" -gt 0 ]; then
+        die "$sessions stream(s) are active and would be interrupted. Try again later, or rerun with --now."
+    fi
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+log "Downloading referee-server $latest..."
+curl -fsSL --max-time 900 -o "$work/$asset" "$url" || die "could not download $url"
+printf '%s  %s\n' "$digest" "$work/$asset" | sha256sum -c --status ||
+    die "$asset does not match the SHA-256 digest GitHub recorded. Nothing was installed."
+tar -xzf "$work/$asset" -C "$work" --no-same-owner || die "could not unpack $asset."
+
+src="$work/$bundle"
+for f in "${binaries[@]}" referee-server-update VERSION "${units[@]}"; do
+    if [ ! -f "$src/$f" ] || [ -L "$src/$f" ]; then
+        die "$asset is missing $f. Nothing was installed."
+    fi
+done
+bundled_version=$(tr -d '[:space:]' <"$src/VERSION")
+[ "$bundled_version" = "$latest" ] ||
+    die "$asset contains version $bundled_version, expected $latest. Nothing was installed."
+
+if [ "$mode" = auto ]; then
+    log "Waiting for $((idle_required / 60)) minutes without an active stream..."
+    if ! wait_for_idle; then
+        log "Streams kept running for $((idle_max_wait / 60)) minutes. Retrying on the next check."
+        exit 0
+    fi
+fi
+
+backup_binaries
+for f in "${binaries[@]}"; do
+    install_file "$src/$f" "$bin_dir/$f"
+done
+
+if $was_active; then
+    log "Restarting $service..."
+    systemctl restart "$service" || true
+    if ! wait_for_version "$latest"; then
+        printf 'referee-server-update: %s did not come back on %s. Restoring the previous version.\n' \
+            "$service" "$latest" >&2
+        restore_binaries
+        systemctl restart "$service" || true
+        die "update to $latest was rolled back. See: journalctl -u $service"
+    fi
+    log "referee-server updated to $latest."
+else
+    log "Installed referee-server $latest. $service is not running; start it with: sudo systemctl start $service"
+fi
+
+install_file "$src/referee-server-update" "$sbin_dir/referee-server-update"
+note_unit_changes

@@ -1,0 +1,20 @@
+# Checks GitHub for a newer referee-server release. Installs it only when
+# REFEREE_AUTO_UPDATE=true is set in /etc/referee/referee-server.env; otherwise
+# it logs that an update is available. Started by referee-server-update.timer.
+#
+# Docs: https://referee.craw.ca/developers#relay-server-updates
+
+[Unit]
+Description=Update the REFEREE relay server from GitHub releases
+Documentation=https://referee.craw.ca/developers#relay-server-updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/referee-server-update --auto
+# Waits up to an hour for active streams to end before installing.
+TimeoutStartSec=90min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true

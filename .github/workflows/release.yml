@@ -192,8 +192,86 @@ jobs:
           path: ${{ matrix.artifact_glob }}
           if-no-files-found: error
 
+  # Headless referee-server for the Linux relay service, installed and updated by
+  # packaging/systemd/referee-server-update. Built on the oldest supported
+  # Ubuntu so the binary runs on glibc 2.35 and newer (Ubuntu 22.04, Debian 12).
+  build-server:
+    needs: [check-version, test, test-ui]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Runs scripts/fetch-rife-vendor.js.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            desktop/native -> target
+            desktop/native/rife-worker -> target
+
+      # tauri-build runs in build.rs, so the WebKitGTK headers are needed even
+      # for the headless binary.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            build-essential \
+            cmake
+
+      - name: Build referee-server
+        working-directory: desktop/native
+        run: cargo build --features headless --bin referee-server --release
+
+      - name: Build rife-worker
+        run: |
+          node scripts/fetch-rife-vendor.js
+          cd desktop/native/rife-worker
+          cargo build --release --locked
+
+      # The asset name carries no version so releases/latest/download/ links
+      # stay stable; VERSION inside lets the updater check what it unpacked.
+      - name: Package referee-server
+        shell: bash
+        run: |
+          BUNDLE=referee-server-linux-x86_64
+          mkdir -p "dist/${BUNDLE}"
+          install -m 0755 desktop/native/target/release/referee-server "dist/${BUNDLE}/"
+          install -m 0755 desktop/native/rife-worker/target/release/rife-worker "dist/${BUNDLE}/"
+          install -m 0755 packaging/systemd/referee-server-update "dist/${BUNDLE}/"
+          install -m 0644 \
+            packaging/systemd/referee-server.service \
+            packaging/systemd/referee-server-update.service \
+            packaging/systemd/referee-server-update.timer \
+            packaging/systemd/referee-server.env \
+            LICENSE \
+            "dist/${BUNDLE}/"
+          echo "${{ needs.check-version.outputs.version }}" > "dist/${BUNDLE}/VERSION"
+          tar -C dist -czf "dist/${BUNDLE}.tar.gz" "${BUNDLE}"
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-server-linux
+          path: dist/referee-server-linux-x86_64.tar.gz
+          if-no-files-found: error
+
   publish:
-    needs: [check-version, build]
+    needs: [check-version, build, build-server]
     if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
 

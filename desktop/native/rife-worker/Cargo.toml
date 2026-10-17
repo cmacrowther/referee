@@ -1,6 +1,6 @@
 [package]
 name = "rife-worker"
-version = "0.7.2"
+version = "0.7.3"
 description = "NUT-in/NUT-out RIFE frame interpolation stage for the REFEREE pipeline."
 authors = ["cmacrowther"]
 edition = "2021"
