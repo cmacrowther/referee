@@ -651,6 +651,25 @@ export default async function RoadmapPage() {
                 <li className="relative pl-8">
                   <span className="absolute left-0 top-1.5 flex h-[15px] w-[15px] items-center justify-center rounded-full border-2 border-accent bg-background" aria-hidden="true" />
                   <div className="flex flex-wrap items-baseline gap-3 mb-3">
+                    <h3 className="font-semibold">v0.7.3</h3>
+                    <time dateTime="2026-10-17" className="text-xs text-muted-foreground">October 17, 2026</time>
+                  </div>
+                  <ul className="space-y-1.5 text-sm text-muted-foreground">
+                    {[
+                      "Release builds now package the Linux x86_64 headless relay server with the RIFE worker, updater, and systemd units in a downloadable archive.",
+                      "Added a systemd service and environment configuration for running the relay server at boot, with a dedicated service account, persistent application data, GPU access, and automatic restart on failure.",
+                      "Relay server updates support manual checks and installation, plus an opt-in automatic update timer that waits for five minutes without active streams. Downloads are verified against GitHub's SHA-256 digest, and failed startup checks restore the previous binaries.",
+                      "Developer documentation now includes relay server installation, configuration, service management, updates, and building from source.",
+                      "Fixed Cloudflare Workers deployment by upgrading Next.js to 16.4.2, aligning standalone output with OpenNext's package root, and adding a dedicated Workers build command with deployment instructions.",
+                    ].map((change) => (
+                      <li key={change} className="flex gap-2"><span className="text-accent flex-shrink-0">+</span>{change}</li>
+                    ))}
+                  </ul>
+                </li>
+
+                <li className="relative pl-8">
+                  <span className="absolute left-0 top-1.5 flex h-[15px] w-[15px] items-center justify-center rounded-full border-2 border-accent bg-background" aria-hidden="true" />
+                  <div className="flex flex-wrap items-baseline gap-3 mb-3">
                     <h3 className="font-semibold">v0.7.2</h3>
                     <time dateTime="2026-10-16" className="text-xs text-muted-foreground">October 16, 2026</time>
                   </div>
