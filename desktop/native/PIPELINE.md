@@ -39,7 +39,7 @@ REFEREE is a local HTTP service on port **14002**. A web page sends it a source 
 
 ### Five facts that most often trip people up
 
-1. **Most sessions are a single child process.** The 4-stage normalizer → preprocess → executor → packager topology exists, but `should_attempt_staged_launch` uses it only when the plan has preprocessor-owned work: on `Universal` and `AmdSpecialized` for any such work (in practice RIFE, `minterpolate`, or libplacebo HDR that VCEEncC lacks), and on `NvidiaSpecialized` only for **RIFE**. Everything else runs one encoder process that ingests, filters, encodes, and muxes HLS inline. See [§7.1](#71-launch-mode-single-process-vs-staged).
+1. **Most sessions are a single encoder process.** The 4-stage normalizer → preprocess → executor → packager topology exists, but `should_attempt_staged_launch` uses it only when the plan has preprocessor-owned work: on `Universal` and `AmdSpecialized` for any such work (in practice RIFE, `minterpolate`, or libplacebo HDR that VCEEncC lacks), and on `NvidiaSpecialized` only for **RIFE**. Everything else runs one encoder process that filters, encodes, and muxes HLS inline. NVEncC on a relayed HLS source does not pull the source itself: an FFmpeg stream-copy remuxer feeds it MPEG-TS on stdin (`should_remux_source_ingest`). See [§7.1](#71-launch-mode-single-process-vs-staged).
 2. **There are two crate roots.** `src/lib.rs` (desktop) and `src/server_main.rs` (headless) each declare the module tree with `mod`. A new module must be declared in both, and Tauri-only code must be `#[cfg(not(feature = "headless"))]`. See [§2.2](#22-module-gating-between-desktop-and-headless).
 3. **An AMD session can change executor mid-startup.** `ExecutorKind` (`NvidiaSpecialized | AmdSpecialized | Universal | Cpu`) maps one-to-one onto a runtime executor in `exec/family.rs` (`Cpu` renders through Universal), but when VCEEncC fails before startup completes, the session is replanned onto `Universal` FFmpeg for its retry and loses AMF FRC ([§8.3](#83-retries)).
 4. **User settings drive the pipeline, not the request body.** Output resolution, quality, framegen, HDR, and executor preference come from persisted `ServerSettings`. The `/v1/stream/start` body supplies only the source URL, headers, display labels, an optional `contentKind` hint, and an optional `displayRefreshRate` for the Match Display frame generation target.
@@ -499,6 +499,8 @@ Op order is fixed: `NormalizeInput` → *(one upscale op)* → `Interpolate` →
 
 If a staged launch fails to build or spawn, the session falls back to single-process **for that attempt and all later ones** (`SessionPipeline::launch_attempt` clears `allow_staged`). When the plan needs preprocessing but runs single-process, a warning is logged that preprocess-owned work (interpolation, resize, HDR) will be skipped.
 
+**Remuxed ingest** (`should_remux_source_ingest`): a single-process launch whose runtime executor is NVEncC and whose source is HLS with an input relay runs as remuxer → executor (`launch_remuxed_single_process`, contexts from `RemuxedIngestContexts::new`). The reason: NVEncC's `--avsync forcecfr` fills any forward timestamp jump with repeats of the last frame, up to `CHECK_PTS_MAX_INSERT_FRAMES` = 18 000 frames (5 min at 60 fps). A live source that skips expired segments or restarts its timestamps froze the picture for the length of the gap. Those repeats are encoded without reading input and bypass `--max-procfps`, so the reader fell further behind the source playlist window, skipped again, and froze again with each freeze shorter than the last. During the bursts NVEncC printed no progress (it prints only when it reads an input frame), so logs showed silent stretches where the frame count leapt ahead at above the cap. The remuxer cuts jumps over 2 s out of the timeline instead ([§7.5](#75-normalizer-normalizeffmpeg_normalizerrs-staged-only)). If the remuxed launch fails to build or spawn, or fails in ingest before startup ([§8.3](#83-retries)), the session falls back to NVEncC pulling the source for that attempt and later ones (`SessionPipeline::use_direct_source_ingest`). VCEEncC shares the forcecfr behavior but has not been validated reading MPEG-TS from stdin, so AMD still pulls directly.
+
 **Single-process topology** (`launch_single_process`). The stage context comes from `StageRuntimeContext::single_process`: input `SourcePull`, output `HlsOutput`.
 
 ```
@@ -507,6 +509,12 @@ source ─► /v1/input/{id}?url=… (remote HLS) ─► [Executor: NVEncC | VCE
                                                          │
                                                          ▼
                                       {tmp}/RefereeProxy/{id}/index.m3u8 + segment_%06d.ts
+```
+
+With remuxed ingest the executor's input is `RemuxedSourcePipe` instead:
+
+```
+/v1/input/{id}?url=… ─► Source remuxer (ffmpeg -c copy) ─MPEG-TS─► Executor (NVEncC --avhw -i -) ─► index.m3u8 + segments
 ```
 
 **Staged topology** (`launch_staged`; contexts from `StagedPipelineContexts::new`):
@@ -545,7 +553,8 @@ Every arrow is a `tokio::io::copy_buf` bridge task (`PipelineStageConnection`, 1
 
 | Hop | Container | Video | Audio |
 |---|---|---|---|
-| Source → normalizer / single-process executor | whatever the source is (via input proxy) | — | — |
+| Source → normalizer / remuxer / single-process executor | whatever the source is (via input proxy) | — | — |
+| Source remuxer → NVEncC (remuxed ingest) | MPEG-TS (`-flush_packets 1`), timestamp jumps > 2 s cut | source codec, copied | source codec, copied |
 | Normalizer → preprocess / executor | NUT | `rawvideo` yuv420p (nv12 if backend is `nvenc`, which never stages) | `pcm_s16le` (`aresample async=0`, PTS rebased to 0) |
 | `FfmpegPreprocessor` → executor | NUT | `rawvideo` yuv420p / yuv420p10le, or `-c copy` passthrough | `copy` |
 | `rife-worker` → executor | NUT | `rawvideo` nv12 (NVEncC) or yuv420p, CFR at the target fps, starting at 0 | `pcm_s16le`, starting at 0 (passed through) |
@@ -565,7 +574,7 @@ Shared behavior:
 **`NvidiaSpecializedExecutor`** (`exec/nvidia.rs`, log label `nvenc`, stderr `Raw`)
 - Renders from intermediate bindings. `Resize` owned by the executor sets `--output-res` and, with `NvidiaNgxVsr`, adds `--vpp-resize algo=ngx-vsr,vsr-quality=N`. A preprocess-owned `Resize` still sets `--output-res` ("CompatibilityFallback"). `NvidiaFruc` adds `--vpp-fruc fps=<round(output_fps)>/1`. `NvidiaFramegen` adds `--vpp-nvvfx-framegen multiplier=2,mode=high` below 4K output and `mode=medium` at 4K (`framegen_mode`; `high` costs about 1.5× `medium`). NVEncC runs both **after** VSR and TrueHDR, at output resolution, and converts to 8-bit RGB for them, so frame generation with HDR processes the HDR-mapped frames in 8 bits. Any HDR op adds `--colorprim/--transfer/--colormatrix/--colorrange` and sets `--profile main10` for 10-bit. `NvidiaTrueHdr` adds `--vpp-ngx-truehdr`.
 - **Rejects** shader upscale ops with `InvalidInput`.
-- Source pull from HLS **always uses buffered ingest**, even on attempt 1 (startup mode `Buffered`). Source pull adds `--crop` to match the target aspect ratio. `--avsync forcecfr` is always set.
+- HLS input **always uses buffered ingest**, even on attempt 1 (startup mode `Buffered`), whether pulled or remuxed. Remuxed input (`RemuxedSourcePipe`) reads `--avhw -i - --input-format mpegts` with `--input-analyze 4 --input-probesize 1000000`, and the remuxer owns reconnects and headers. Pulled or remuxed source input adds denoise and `--crop` to match the target aspect ratio (`EncoderInput::carries_source_stream`). `--avsync forcecfr` is always set.
 - `--multipass` is `1pass` or `none` (probed via `--help`). `--cu-max 64` at ≥ 1440p. `--aq --aq-temporal`. Inline HLS adds `--strict-gop`, `hls_list_size:8`, `hls_delete_threshold:8`, and, **only when the source fps is known**, `--max-procfps ceil(source_fps × 1.05)`. The cap counts input frames, before FRUC or frame generation adds any. The 5% `PROCESSING_FPS_CAP_HEADROOM` exists because NVEncC's limiter (`CProcSpeedControl`) resets its reference clock when it falls behind, so at exactly 1.0× any stall becomes permanent lag behind the live edge.
 
 **`AmdExecutor`** (`exec/amd.rs`, log label `vceenc`, stderr `Raw`), the AMD counterpart of the NVIDIA executor
@@ -592,6 +601,8 @@ Shared behavior:
 - `with_stream_offsets_preserved(true)` (set when the plan uses RIFE) drops both `setpts`/`asetpts`, so FFmpeg shifts the streams by the input's shared start and the source's A/V offset survives; audio is still padded to start at 0. `rife-worker` then starts both of its output streams at exactly 0, so the executor cannot skew them. Verified with a flash/beep clip through normalizer → worker → NVEncC: sync matched the source.
 - Readiness `ReadyOnSpawn`. Stderr is `Filtered`, suppressing `"Invalid timestamps stream="`.
 
+**Source remuxer** (`normalize/ffmpeg_source_remuxer.rs`, remuxed ingest only). Runs as the `Normalizer` stage, log label `ffmpeg-remux`. Input must be `SourcePull` and output `RemuxedSourcePipe`. Reads `runtime_url` (the relay URL) with forwarded headers, `-rw_timeout 15 s`, reconnect (max delay 2 s), `-analyzeduration 4 s -probesize 1 MB`, and `-extension_picky 0` (relayed segment URLs are `/v1/input/{id}?url=…` with no media extension, which FFmpeg's HLS demuxer otherwise rejects with "is not in allowed_segment_extensions"; NVEncC's direct pull passes the same option). Then `-map 0:v:0 -map 0:a:0? -c copy -dts_delta_threshold 2 -flush_packets 1 -f mpegts pipe:1`. HLS is a discontinuous-timestamp format, so the FFmpeg CLI removes any jump over 2 s and applies one offset to every stream, which keeps A/V aligned. Its warnings (`timestamp discontinuity`, `skipping N segments ahead, expired from playlists`) reach the log. NVEncC's own HLS reader keeps them to itself. Do not add `-copyts`: it disables that correction. Readiness `ReadyOnSpawn`, stderr `Filtered` like the normalizer.
+
 ### 7.6 Preprocessors (`preprocess/`)
 
 Selection (`pipeline/launch.rs::build_shared_preprocess_spec`):
@@ -614,11 +625,12 @@ Selection (`pipeline/launch.rs::build_shared_preprocess_spec`):
 |---|---|
 | `SourcePull` | Stage reads the source URL itself (normalizer, single-process executors) |
 | `StdoutPipe` | Live. Bridged by the supervisor. |
+| `RemuxedSourcePipe` | Live. Bridged like `StdoutPipe`, but carries the source's compressed streams as MPEG-TS (remuxer → NVEncC), so the executor treats it as source input |
 | `HlsOutput {playlist_path, segment_dir}` | Terminal output of the packager or a single-process executor |
 
 A transport a builder cannot handle returns `FrameTransport::unsupported(stage, direction)` (`InvalidInput`). FFmpeg stages map pipes with `ffmpeg_input_url` / `ffmpeg_output_url` (`pipe:0` / `pipe:1`).
 
-`ProcessSpec` carries `stage`, `program`, `args`, `transport`, `current_dir`, `readiness_policy` (defaults to `PipelineStageId::default_readiness_policy`), `log_label`, and `stderr_mode` (`Raw | Filtered{suppress} | FfmpegProgress{gpu_vendor}`). `spawn_stage` always pipes stderr, sets `kill_on_drop`, and hides the console window; stdin and stdout are piped exactly when the matching transport is `StdoutPipe`. Every stage builder's `build_command` returns a `ProcessSpec` directly, and the stage traits (`BackendExecutor::build_executor_spec(ctx, attempt)` → `ExecutorSpec { process, startup_mode }`, `Normalizer`, `Preprocessor`, `Packager`) wrap it.
+`ProcessSpec` carries `stage`, `program`, `args`, `transport`, `current_dir`, `readiness_policy` (defaults to `PipelineStageId::default_readiness_policy`), `log_label`, and `stderr_mode` (`Raw | Filtered{suppress} | FfmpegProgress{gpu_vendor}`). `spawn_stage` always pipes stderr, sets `kill_on_drop`, and hides the console window; stdin and stdout are piped exactly when the matching transport is a pipe (`StdoutPipe` or `RemuxedSourcePipe`). Every stage builder's `build_command` returns a `ProcessSpec` directly, and the stage traits (`BackendExecutor::build_executor_spec(ctx, attempt)` → `ExecutorSpec { process, startup_mode }`, `Normalizer`, `Preprocessor`, `Packager`) wrap it.
 
 ### 7.8 Encoding profiles
 
@@ -639,7 +651,7 @@ A transport a builder cannot handle returns `FrameTransport::unsupported(stage, 
 ### 8.1 `PipelineSupervisor::run` (`runtime/supervisor.rs`)
 
 Each loop iteration:
-1. **Poll children** (`try_wait`). If **any** stage exited (any exit code, including 0): mark it, kill the other stages, abort bridges, flush its stderr (≤ 5 s), and return `StageExited{stage, exit_code}`.
+1. **Poll children** (`try_wait`). If a stage that feeds a bridge exited with code 0, mark it and keep going: its bridge closes the next stage's stdin once drained, and that stage finishes its own output (end of a finished HLS source). If any other stage exited (any exit code, including 0): mark it, kill the other stages, abort bridges, flush its stderr (≤ 5 s), and return `StageExited{stage, exit_code}`.
 2. `select!` on:
    - **heartbeat message** → `first_heartbeat_seen = true`, deadline = now + **15 s**, mark heartbeat-policy stages ready.
    - **heartbeat channel closed** (the session's sender was dropped by `cleanup_session`) → stop everything → `HeartbeatChannelClosed`.
@@ -666,12 +678,14 @@ Readiness is **informational**. It never gates spawning or data flow. Session re
 
 ### 8.3 Retries
 
-`MAX_PIPELINE_START_ATTEMPTS = 2`. A retry happens only while `startup_complete == false` and `attempt < 2`, in one of these two cases:
+`MAX_PIPELINE_START_ATTEMPTS = 2`. A retry happens only while `startup_complete == false` and `attempt < 2`, in one of these three cases:
 
 1. **Executor failure** (`AttemptResolution::Retry`): the failed stage is `Executor` with a non-zero exit, and either
    - the executor is `AmdSpecialized` on attempt 1, whatever stderr says (an AMF filter the GPU or driver lacks fails with varied messages). `SessionPipeline::switch_to_universal_fallback` re-prepares the session on `ExecutionPlan::for_universal_fallback` (FFmpeg with AMF on Windows or VA-API on Linux; FSR becomes libplacebo resize, VCEEncC tonemapping becomes libplacebo HDR, AMF FRC is dropped so the output runs at the source rate), recomputes the launch mode, and updates `SessionInfo`; or
    - the executor is `NvidiaSpecialized` **or** the backend is `vceenc`, and stderr contains `input video info not parsed yet`, `failed to initialize file reader`, or `break in task amfenc`.
 2. **RIFE failure:** the plan uses RIFE and the `Preprocess` stage exited non-zero → `SessionPipeline::switch_to_rife_fallback` re-prepares the session on `rife_fallback_plan` (FRUC on NVIDIA, `minterpolate` on AMD, none on Universal-NVIDIA), recomputes the launch mode, and updates `SessionInfo`.
+
+3. **Remuxed ingest failure** (`AttemptResolution::RetryWithDirectIngest`, checked first): the attempt used remuxed ingest and `run.rs::is_ingest_failure` holds, meaning the remuxer (`Normalizer` stage) exited non-zero, or the executor did with one of the retryable messages above. `SessionPipeline::use_direct_source_ingest` makes the retry pull the source in NVEncC, as before remuxed ingest existed.
 
 Both replans update `SessionInfo` through `run.rs::sync_session_plan` (`framegenEnabled`, `framegenEngine`, `executor`, `targetFps`). Before a retry, `clear_session_output` deletes every file in the session dir, `retrying_startup` is set, and the attempt number increments. Attempt 2 uses `StartupMode::Buffered` (larger analyze/probe).
 
@@ -977,7 +991,7 @@ The renderer also subscribes to `boot-setting-sync`, but nothing in the backend 
 2. **The plan decides and executors render.** `ExecutionPlan` is the source of truth. Stage builders get `IntermediateExecutionPlan` (`to_intermediate_plan()`) and act only on ops whose `owner` is theirs. Normalizer and preprocessors re-derive the intermediate plan from `context.execution_plan`, so any replanning must change the session's `ExecutionPlan` (as `switch_to_universal_fallback` and `switch_to_rife_fallback` do), not one executor's copy.
 3. **Planner purity.** `graph/` does no I/O. Probing belongs in `source/` or `pipeline/`. Command construction belongs in `exec/`, `normalize/`, and `preprocess/`.
 4. **Session readiness = a non-empty `index.m3u8`.** This holds for every launch mode. Stage readiness policies are diagnostic.
-5. **Wire formats:** NUT (rawvideo + PCM) between normalizer, preprocess, and executor. MPEG-TS from executor to packager. HLS out.
+5. **Wire formats:** NUT (rawvideo + PCM) between normalizer, preprocess, and executor. MPEG-TS from source remuxer to NVEncC, and from executor to packager. HLS out.
 6. **Heartbeat contract:** the first heartbeat must arrive within 300 s of launch, and every later one within 15 s. Clients should send every ~10 s and always call stop. Relay sessions enforce the same contract locally (`relay::relay_client_expiry`, reusing `HEARTBEAT_TIMEOUT_MS` / `ORPHAN_SESSION_TIMEOUT_MS`).
 7. **One active session.** A new start evicts everything, and the response reports the evicted IDs.
 8. **Never hold a `DashMap` guard across `.await`.** Existing code clones what it needs and `drop`s the guard first (see `handle_heartbeat`, `stop_tracked_session`, `serve_tmp_file`).
@@ -1140,4 +1154,5 @@ All graph and source enums serialize as camelCase.
   rg -n 'pub const [A-Z_]+: &str' desktop/native/src/server.rs # §4.7
   rg -n 'const .*_(MS|SECS|LIMIT|ATTEMPTS|INTERVAL)' desktop/native/src  # §8.4
   rg -n 'fn should_attempt_staged_launch' -A 30 desktop/native/src/pipeline/launch.rs  # §7.1
+  rg -n 'fn should_remux_source_ingest' -A 10 desktop/native/src/pipeline/launch.rs    # §7.1
   ```

@@ -766,6 +766,12 @@ fn build_ffmpeg_input_args(input: &EncoderInput, low_latency: bool) -> Vec<Strin
             "-i".to_string(),
             "pipe:0".to_string(),
         ],
+        EncoderInput::RemuxedSourcePipe => vec![
+            "-f".to_string(),
+            "mpegts".to_string(),
+            "-i".to_string(),
+            "pipe:0".to_string(),
+        ],
     }
 }
 

@@ -14,7 +14,7 @@ use crate::exec::{
     UniversalExecutorContext,
 };
 use crate::graph::{parse_resolution, ExecutionPlan, ExecutorKind, IntermediateExecutionPlan};
-use crate::normalize::FfmpegNormalizer;
+use crate::normalize::{FfmpegNormalizer, FfmpegSourceRemuxer};
 use crate::preprocess::{FfmpegPreprocessor, StreamingRifePreprocessor};
 use crate::runtime::{
     BackendExecutor, FrameTransport, Normalizer, Packager, PipelineStageSpawn, PipelineSupervisor,
@@ -116,6 +116,9 @@ pub(super) struct SessionPipeline {
     /// The plan has preprocessor-owned work, so staged launches include a
     /// preprocess stage.
     preprocess_stage: bool,
+    /// Feed the executor an FFmpeg stream-copy of the source instead of
+    /// letting it pull the source (see `should_remux_source_ingest`).
+    remux_source_ingest: bool,
     streaming_rife: Option<StreamingRifeParams>,
 }
 
@@ -152,6 +155,8 @@ impl SessionPipeline {
 
         let intermediate_plan = launch.execution_plan.to_intermediate_plan();
         let preprocess_stage = intermediate_plan.shared_preprocess_plan().requires_stage();
+        let remux_source_ingest =
+            should_remux_source_ingest(&launch.source, &launch.execution_plan);
         let executor = build_runtime_executor(RuntimeExecutorBuildContext {
             intermediate_plan: &intermediate_plan,
             backend,
@@ -164,6 +169,7 @@ impl SessionPipeline {
             executor,
             denoise,
             preprocess_stage,
+            remux_source_ingest,
             streaming_rife,
         }
     }
@@ -216,11 +222,25 @@ impl SessionPipeline {
         should_attempt_staged_launch(&self.launch.source, &self.launch.execution_plan)
     }
 
+    /// Whether single-process launches feed the executor through the source
+    /// remuxer.
+    pub(super) fn remuxes_source_ingest(&self) -> bool {
+        self.remux_source_ingest
+    }
+
+    /// Makes later single-process launches pull the source in the executor,
+    /// after the remuxed ingest failed to start.
+    pub(super) fn use_direct_source_ingest(&mut self) {
+        self.remux_source_ingest = false;
+    }
+
     /// Launches one attempt. A staged launch that fails to build or spawn
     /// falls back to single-process, and `allow_staged` is cleared so later
-    /// attempts go straight there.
+    /// attempts go straight there. A remuxed single-process launch that
+    /// fails to build or spawn falls back to the executor pulling the source,
+    /// for this attempt and later ones.
     pub(super) async fn launch_attempt(
-        &self,
+        &mut self,
         attempt_number: u32,
         allow_staged: &mut bool,
     ) -> io::Result<PreparedLaunch> {
@@ -246,6 +266,21 @@ impl SessionPipeline {
                 self.backend_label(),
                 self.session_id()
             );
+        }
+
+        if self.remux_source_ingest {
+            match self.launch_remuxed_single_process(attempt_number).await {
+                Ok(launch) => return Ok(launch),
+                Err(error) => {
+                    warn!(
+                        "[Pipeline:{}]: Failed to start remuxed source ingest for session {}: {}; falling back to the encoder pulling the source.",
+                        self.backend_label(),
+                        self.session_id(),
+                        error
+                    );
+                    self.use_direct_source_ingest();
+                }
+            }
         }
 
         self.launch_single_process(attempt_number)
@@ -286,6 +321,45 @@ impl SessionPipeline {
         Ok(PreparedLaunch {
             supervisor,
             startup_mode: spec.startup_mode,
+        })
+    }
+
+    /// The single-process executor reading an FFmpeg stream-copy of the
+    /// source on stdin: source remuxer → executor (inline HLS).
+    async fn launch_remuxed_single_process(
+        &self,
+        attempt_number: u32,
+    ) -> io::Result<PreparedLaunch> {
+        let contexts = RemuxedIngestContexts::new(&self.base_context());
+        let remuxer = FfmpegSourceRemuxer::new(&self.launch.backend.ffmpeg_path)
+            .build_normalizer_spec(&contexts.remuxer)?;
+        let executor_spec = self
+            .executor
+            .build_executor_spec(&contexts.executor, attempt_number)?;
+        let startup_mode = executor_spec.startup_mode;
+        let specs = [remuxer, executor_spec.process];
+
+        info!(
+            "[Pipeline:{}]: Launching {} remuxed-ingest path for session {} (attempt {}/{})",
+            self.backend_label(),
+            startup_mode.as_str(),
+            self.session_id(),
+            attempt_number,
+            MAX_PIPELINE_START_ATTEMPTS
+        );
+        for spec in &specs {
+            debug!(
+                "[Pipeline:{}:{}]: Command: {}",
+                self.backend_label(),
+                spec.stage,
+                spec.command_line()
+            );
+        }
+
+        let supervisor = spawn_connected_stages(self.session_id(), &specs).await?;
+        Ok(PreparedLaunch {
+            supervisor,
+            startup_mode,
         })
     }
 
@@ -427,6 +501,48 @@ pub(super) fn should_attempt_staged_launch(
         }
         ExecutorKind::Universal | ExecutorKind::AmdSpecialized => requires_preprocess_stage(),
         ExecutorKind::Cpu => false,
+    }
+}
+
+/// Whether a single-process launch feeds the executor an FFmpeg stream-copy
+/// of the source instead of letting it pull the source.
+///
+/// Only NVEncC on an input-relayed HLS source. NVEncC's `--avsync forcecfr`
+/// fills a forward timestamp jump with repeats of the last frame, up to 5
+/// minutes' worth. Live HLS sources jump when they skip expired segments or
+/// restart their timestamps, so the picture froze for as long as the gap,
+/// and encoding those repeats put the reader further behind the source's
+/// playlist window, which caused the next skip. The remuxer cuts such jumps
+/// out of the timeline. VCEEncC shares the forcecfr behavior but has not been
+/// validated reading MPEG-TS from stdin.
+pub(super) fn should_remux_source_ingest(
+    source_descriptor: &SourceDescriptor,
+    execution_plan: &ExecutionPlan,
+) -> bool {
+    source_descriptor.classification.is_hls_like()
+        && source_descriptor.relay.is_some()
+        && select_runtime_executor_target(execution_plan.executor) == RuntimeExecutorTarget::Nvidia
+}
+
+/// Stage contexts for a remuxed single-process launch: the remuxer pulls the
+/// source, and the executor reads its MPEG-TS and writes the session's HLS.
+pub(super) struct RemuxedIngestContexts {
+    pub(super) remuxer: StageRuntimeContext,
+    pub(super) executor: StageRuntimeContext,
+}
+
+impl RemuxedIngestContexts {
+    pub(super) fn new(base: &StageRuntimeContext) -> Self {
+        Self {
+            remuxer: base.with_transport(
+                FrameTransport::SourcePull,
+                FrameTransport::RemuxedSourcePipe,
+            ),
+            executor: base.with_transport(
+                FrameTransport::RemuxedSourcePipe,
+                base.transport.output.clone(),
+            ),
+        }
     }
 }
 

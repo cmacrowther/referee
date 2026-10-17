@@ -134,7 +134,7 @@ impl NvidiaSpecializedExecutor {
         let output_fps = context
             .planned_output_fps()
             .unwrap_or(UNKNOWN_SOURCE_FPS_FALLBACK);
-        if input.is_source_url() {
+        if input.carries_source_stream() {
             if self.context.denoise {
                 append_rigaya_denoise_args(&mut args);
             }
@@ -960,6 +960,51 @@ NVEnc (x64) 9.14
 
         let spec = executor.build_executor_spec(&context, 1).unwrap();
         assert_eq!(spec.startup_mode, StartupMode::Buffered);
+    }
+
+    #[test]
+    fn build_command_reads_remuxed_source_from_stdin_like_a_direct_pull() {
+        let mut context = context(
+            vec![
+                VideoOp::NormalizeInput,
+                VideoOp::Resize(ResizePlan {
+                    target_resolution: "1920x1080".to_string(),
+                    quality: Some(2),
+                    stage: OpExecutionStage::Executor,
+                }),
+            ],
+            FrameTransport::RemuxedSourcePipe,
+            FrameTransport::HlsOutput {
+                playlist_path: PathBuf::from("session\\index.m3u8"),
+                segment_dir: PathBuf::from("session"),
+            },
+        );
+        context.source.metadata = Some(SourceMetadata {
+            width: Some(2560),
+            height: Some(1080),
+            source_resolution: Some("2560x1080".to_string()),
+            source_fps: Some(60.0),
+            ..SourceMetadata::default()
+        });
+        let executor = executor_for_plan_with_denoise(&context.execution_plan, true);
+
+        let spec = executor.build_executor_spec(&context, 1).unwrap();
+        let args = &spec.process.args;
+
+        assert_eq!(spec.startup_mode, StartupMode::Buffered);
+        assert!(has_subsequence(
+            args,
+            &["--avhw", "-i", "-", "--input-format", "mpegts"]
+        ));
+        assert!(has_subsequence(args, &["--input-analyze", "4"]));
+        assert!(!args.iter().any(|arg| arg == "fflags:nobuffer"));
+        assert!(!args.iter().any(|arg| arg == "reconnect:1"));
+        // Source-level processing still runs in NVEncC.
+        assert!(args.iter().any(|arg| arg == "--vpp-convolution3d"));
+        assert!(has_subsequence(args, &["--crop", "320,0,320,0"]));
+        assert!(has_subsequence(args, &["--avsync", "forcecfr"]));
+        assert!(has_subsequence(args, &["--max-procfps", "63"]));
+        assert!(has_subsequence(args, &["--format", "hls"]));
     }
 
     #[test]

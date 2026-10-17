@@ -160,7 +160,7 @@ impl AmdExecutor {
             .planned_output_fps()
             .unwrap_or(UNKNOWN_SOURCE_FPS_FALLBACK);
 
-        if input.is_source_url() {
+        if input.carries_source_stream() {
             if self.context.denoise {
                 append_rigaya_denoise_args(&mut args);
             }

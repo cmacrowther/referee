@@ -15,7 +15,8 @@ use super::session::{
 /// Starts a session's pipeline on a background task and returns immediately.
 ///
 /// The task launches the stages (staged when the plan needs a preprocess
-/// stage, single-process otherwise), supervises them against client
+/// stage, single-process otherwise, with NVEncC reading HLS sources through
+/// the source remuxer), supervises them against client
 /// heartbeats, retries known transient startup failures once, and finally
 /// removes the session and its directory and signals `completion`.
 pub fn start_pipeline(
@@ -38,6 +39,8 @@ enum AttemptResolution {
     Retry,
     /// Retry on the session's plan without RIFE.
     RetryWithoutRife,
+    /// Retry with the executor pulling the source instead of the remuxer.
+    RetryWithDirectIngest,
 }
 
 async fn run_session(
@@ -97,10 +100,18 @@ async fn run_session(
             pipeline.launch.execution_plan.executor,
             attempt_number,
             pipeline.uses_rife(),
+            pipeline.remuxes_source_ingest(),
         );
 
         match resolution {
             AttemptResolution::Finish => break,
+            AttemptResolution::RetryWithDirectIngest => {
+                warn!(
+                    "[Pipeline:{}]: Remuxed source ingest failed before producing output for session {}; retrying with the encoder pulling the source.",
+                    backend_label, session_id
+                );
+                pipeline.use_direct_source_ingest();
+            }
             AttemptResolution::Retry => {
                 if pipeline.switch_to_universal_fallback() {
                     let plan = &pipeline.launch.execution_plan;
@@ -178,6 +189,7 @@ fn resolve_attempt(
     executor: ExecutorKind,
     attempt_number: u32,
     uses_rife: bool,
+    remuxed_ingest: bool,
 ) -> AttemptResolution {
     let (failed_stage, exit_code) = match outcome.stop_reason {
         PipelineSupervisorStopReason::HeartbeatChannelClosed => {
@@ -241,6 +253,9 @@ fn resolve_attempt(
 
     let failed_before_startup =
         exit_code != Some(0) && !startup_complete && attempt_number < MAX_PIPELINE_START_ATTEMPTS;
+    if failed_before_startup && remuxed_ingest && is_ingest_failure(failed_stage, stderr_tail) {
+        return AttemptResolution::RetryWithDirectIngest;
+    }
     // The AMD executor's retries run the Universal FFmpeg fallback, so any
     // VCEEncC startup failure (AMF FRC or FSR unavailable on this GPU or
     // driver, for one) is worth one more attempt, whatever its message.
@@ -298,6 +313,18 @@ pub(super) fn is_retryable_failure(log_output: &str) -> bool {
         // output is produced.  The second attempt routes through the universal
         // (VAAPI) fallback via AmdExecutor, so this is safe to retry.
         || lower.contains("break in task amfenc")
+}
+
+/// Whether a remuxed launch failed in its ingest: the remuxer itself, or the
+/// executor failing to read what it was fed. The retry pulls the source
+/// directly, which is how these sessions launched before the remuxer and is
+/// also the right retry for a transient source failure.
+pub(super) fn is_ingest_failure(failed_stage: PipelineStageId, stderr_tail: &str) -> bool {
+    match failed_stage {
+        PipelineStageId::Normalizer => true,
+        PipelineStageId::Executor => is_retryable_failure(stderr_tail),
+        PipelineStageId::Preprocess | PipelineStageId::Packager => false,
+    }
 }
 
 /// Deletes every file in the session directory before a retry, so stale

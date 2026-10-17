@@ -25,6 +25,10 @@ pub enum FrameTransport {
     /// Anonymous process pipe. The supervisor bridges the upstream stage's
     /// stdout into the downstream stage's stdin.
     StdoutPipe,
+    /// Anonymous process pipe carrying the source's own compressed streams,
+    /// stream-copied to MPEG-TS by the source remuxer. The downstream stage
+    /// decodes them itself, as it would after pulling the source.
+    RemuxedSourcePipe,
     /// Final HLS output: the session playlist and its segments.
     HlsOutput {
         playlist_path: PathBuf,
@@ -55,14 +59,14 @@ impl FrameTransport {
     /// FFmpeg URL for writing to this transport.
     pub fn ffmpeg_output_url(&self, stage: PipelineStageId) -> io::Result<&'static str> {
         match self {
-            Self::StdoutPipe => Ok("pipe:1"),
+            Self::StdoutPipe | Self::RemuxedSourcePipe => Ok("pipe:1"),
             other => Err(other.unsupported(stage, "output")),
         }
     }
 
     fn stdio(&self) -> Stdio {
         match self {
-            Self::StdoutPipe => Stdio::piped(),
+            Self::StdoutPipe | Self::RemuxedSourcePipe => Stdio::piped(),
             Self::SourcePull | Self::HlsOutput { .. } => Stdio::null(),
         }
     }
@@ -176,8 +180,8 @@ impl StartupMode {
 ///
 /// Every stage is spawned with piped stderr (tailed by the supervisor),
 /// `kill_on_drop`, and a hidden console window on Windows. Stdin and stdout
-/// are piped exactly when the matching transport is
-/// [`FrameTransport::StdoutPipe`].
+/// are piped exactly when the matching transport is a pipe
+/// ([`FrameTransport::StdoutPipe`] or [`FrameTransport::RemuxedSourcePipe`]).
 #[derive(Debug, Clone)]
 pub struct ProcessSpec {
     pub stage: PipelineStageId,

@@ -848,6 +848,16 @@ impl PipelineSupervisor {
             if let Some((stage_index, exit_code)) = self.poll_exited_stage() {
                 let stage = self.stages[stage_index].stage();
                 self.stages[stage_index].mark_exited();
+                // A clean exit upstream is the end of the input: its bridge
+                // closes the next stage's stdin once drained, and that stage
+                // finishes its own output. Killing it here would cut the tail.
+                if exit_code == Some(0) && self.feeds_downstream_stage(stage) {
+                    trace!(
+                        "[PipelineSupervisor]: Stage {} finished; letting downstream stages drain.",
+                        stage
+                    );
+                    continue;
+                }
                 self.kill_other_stages(stage_index).await;
                 self.abort_all_connections().await;
                 self.stages[stage_index].child.flush_stderr().await;
@@ -924,6 +934,12 @@ impl PipelineSupervisor {
                 }
             }
         }
+    }
+
+    fn feeds_downstream_stage(&self, stage: PipelineStageId) -> bool {
+        self.connections
+            .iter()
+            .any(|connection| connection.upstream == stage)
     }
 
     fn poll_exited_stage(&mut self) -> Option<(usize, Option<i32>)> {
@@ -1011,5 +1027,110 @@ impl PipelineSupervisor {
                 .map(PipelineStageHandle::report)
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PipelineStageId, PipelineSupervisor, PipelineSupervisorStopReason,
+        PipelineSupervisorTimeouts,
+    };
+    use crate::runtime::{FrameTransport, ProcessSpec, TransportConfig};
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// A shell command line as program and arguments. Words are passed one
+    /// per argument on Windows so `cmd` sees its operators unquoted.
+    fn shell(windows: &[&str], unix: &str) -> (String, Vec<String>) {
+        if cfg!(windows) {
+            let mut args = vec!["/C".to_string()];
+            args.extend(windows.iter().map(|word| word.to_string()));
+            ("cmd".to_string(), args)
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), unix.to_string()])
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_upstream_exit_lets_the_downstream_stage_finish() {
+        let (up_program, up_args) = shell(&["echo", "payload"], "echo payload");
+        // Reads stdin to EOF, then takes about a second to "finish its
+        // output". Killed early, it would not exit 0.
+        let (down_program, down_args) = shell(
+            &[
+                "sort",
+                ">",
+                "NUL",
+                "&",
+                "ping",
+                "-n",
+                "2",
+                "127.0.0.1",
+                ">",
+                "NUL",
+                "&",
+                "exit",
+                "0",
+            ],
+            "cat > /dev/null; sleep 1; exit 0",
+        );
+        let upstream = ProcessSpec::new(
+            PipelineStageId::Normalizer,
+            up_program,
+            up_args,
+            TransportConfig {
+                input: FrameTransport::SourcePull,
+                output: FrameTransport::StdoutPipe,
+            },
+            "upstream",
+        );
+        let downstream = ProcessSpec::new(
+            PipelineStageId::Executor,
+            down_program,
+            down_args,
+            TransportConfig {
+                input: FrameTransport::StdoutPipe,
+                output: FrameTransport::HlsOutput {
+                    playlist_path: PathBuf::from("unused.m3u8"),
+                    segment_dir: PathBuf::from("."),
+                },
+            },
+            "downstream",
+        );
+
+        let mut upstream = upstream.spawn_stage().unwrap();
+        let mut downstream = downstream.spawn_stage().unwrap();
+        let mut supervisor = PipelineSupervisor::new(
+            "session-1",
+            PipelineSupervisorTimeouts {
+                inactivity_timeout: Duration::from_secs(30),
+                orphan_timeout: Duration::from_secs(30),
+            },
+        );
+        supervisor
+            .connect_pipe_stages(&mut upstream, &mut downstream)
+            .unwrap();
+        supervisor.add_stage_spawn(upstream);
+        supervisor.add_stage_spawn(downstream);
+
+        let (_heartbeat_tx, mut heartbeat_rx) = mpsc::channel(1);
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(20), supervisor.run(&mut heartbeat_rx))
+                .await
+                .expect("the downstream stage should finish once its input ends");
+
+        assert!(
+            matches!(
+                outcome.stop_reason,
+                PipelineSupervisorStopReason::StageExited {
+                    stage: PipelineStageId::Executor,
+                    exit_code: Some(0),
+                }
+            ),
+            "{:?}",
+            outcome.stop_reason
+        );
     }
 }

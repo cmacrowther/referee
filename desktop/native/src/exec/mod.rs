@@ -81,11 +81,19 @@ pub enum EncoderInput {
     },
     /// Staged launch: muxed NUT from the previous stage on stdin.
     StdinPipe,
+    /// Remuxed launch: the source's compressed streams as MPEG-TS on stdin.
+    RemuxedSourcePipe,
 }
 
 impl EncoderInput {
     pub(crate) fn is_source_url(&self) -> bool {
         matches!(self, Self::SourceUrl { .. })
+    }
+
+    /// Whether the executor decodes the source itself (pulled or remuxed), so
+    /// source-level work such as denoise and aspect crop is its job.
+    pub(crate) fn carries_source_stream(&self) -> bool {
+        matches!(self, Self::SourceUrl { .. } | Self::RemuxedSourcePipe)
     }
 }
 
@@ -96,6 +104,7 @@ pub(crate) fn resolve_encoder_input(context: &StageRuntimeContext) -> io::Result
             extra_headers: context.source.runtime_headers.clone(),
         }),
         FrameTransport::StdoutPipe => Ok(EncoderInput::StdinPipe),
+        FrameTransport::RemuxedSourcePipe => Ok(EncoderInput::RemuxedSourcePipe),
         other => Err(other.unsupported(PipelineStageId::Executor, "input")),
     }
 }
@@ -127,22 +136,38 @@ pub(crate) fn build_rigaya_input_args(input: &EncoderInput, low_latency: bool) -
                 "extension_picky:0".to_string(),
             ];
 
-            if low_latency {
-                input_args.push("--input-option".to_string());
-                input_args.push("fflags:nobuffer".to_string());
-            } else {
-                input_args.push("--input-analyze".to_string());
-                input_args.push(RETRY_INPUT_ANALYZE_SECONDS.to_string());
-                input_args.push("--input-probesize".to_string());
-                input_args.push(RETRY_INPUT_PROBESIZE_BYTES.to_string());
-            }
-
+            push_rigaya_ingest_buffering_args(&mut input_args, low_latency);
             input_args
         }
         // Staged FFmpeg handoff uses a muxed NUT stream carrying both rawvideo
         // and audio; force Rigaya onto the avformat/libav reader so the pipe
         // is probed as a containerized stream instead of a video-only raw pipe.
         EncoderInput::StdinPipe => vec!["--avsw".to_string(), "-i".to_string(), "-".to_string()],
+        // Still the compressed source, so it decodes on the GPU (`--avhw`)
+        // and buffers like a direct pull. A pipe cannot be probed by name.
+        EncoderInput::RemuxedSourcePipe => {
+            let mut input_args = vec![
+                "--avhw".to_string(),
+                "-i".to_string(),
+                "-".to_string(),
+                "--input-format".to_string(),
+                "mpegts".to_string(),
+            ];
+            push_rigaya_ingest_buffering_args(&mut input_args, low_latency);
+            input_args
+        }
+    }
+}
+
+fn push_rigaya_ingest_buffering_args(input_args: &mut Vec<String>, low_latency: bool) {
+    if low_latency {
+        input_args.push("--input-option".to_string());
+        input_args.push("fflags:nobuffer".to_string());
+    } else {
+        input_args.push("--input-analyze".to_string());
+        input_args.push(RETRY_INPUT_ANALYZE_SECONDS.to_string());
+        input_args.push("--input-probesize".to_string());
+        input_args.push(RETRY_INPUT_PROBESIZE_BYTES.to_string());
     }
 }
 
@@ -233,9 +258,10 @@ pub(crate) fn build_ffmpeg_hls_output_args(
     ]
 }
 
-/// Direct HLS source pulls always use buffered ingest in the Rigaya encoders.
-/// Their no-buffer mode keeps the stream close to the live edge but discards
-/// late packets, which shows up as visible timeline jumps under network jitter.
+/// HLS sources always use buffered ingest in the Rigaya encoders, whether
+/// pulled directly or remuxed onto stdin. Their no-buffer mode keeps the
+/// stream close to the live edge but discards late packets, which shows up as
+/// visible timeline jumps under network jitter.
 pub(crate) fn rigaya_startup_mode(
     context: &StageRuntimeContext,
     attempt_number: u32,
@@ -248,8 +274,10 @@ pub(crate) fn rigaya_startup_mode(
 }
 
 pub(crate) fn rigaya_prefers_buffered_ingest(context: &StageRuntimeContext) -> bool {
-    matches!(context.transport.input, FrameTransport::SourcePull)
-        && context.source.classification.is_hls_like()
+    matches!(
+        context.transport.input,
+        FrameTransport::SourcePull | FrameTransport::RemuxedSourcePipe
+    ) && context.source.classification.is_hls_like()
 }
 
 /// `--max-procfps` for a Rigaya encoder writing live HLS. The cap counts input
@@ -415,6 +443,24 @@ mod tests {
 
         assert!(has_subsequence(&args, &["--avsw", "-i", "-"]));
         assert!(!args.iter().any(|arg| arg == "--input-option"));
+    }
+
+    #[test]
+    fn remuxed_source_pipe_decodes_mpegts_on_the_gpu_with_buffered_probe() {
+        let args = build_rigaya_input_args(&EncoderInput::RemuxedSourcePipe, false);
+
+        assert!(has_subsequence(
+            &args,
+            &["--avhw", "-i", "-", "--input-format", "mpegts"]
+        ));
+        assert!(has_subsequence(&args, &["--input-analyze", "4"]));
+        assert!(has_subsequence(&args, &["--input-probesize", "1000000"]));
+        // Reconnect and headers belong to the remuxer that pulls the source.
+        assert!(!args.iter().any(|arg| arg.starts_with("reconnect")));
+        assert!(!args.iter().any(|arg| arg.starts_with("headers:")));
+        assert!(EncoderInput::RemuxedSourcePipe.carries_source_stream());
+        assert!(!EncoderInput::RemuxedSourcePipe.is_source_url());
+        assert!(!EncoderInput::StdinPipe.carries_source_stream());
     }
 
     #[test]

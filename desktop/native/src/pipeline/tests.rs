@@ -3,11 +3,11 @@ use super::capabilities::{
     ExecutorPreference, ExecutorSelectionContext,
 };
 use super::launch::{
-    build_runtime_executor, should_attempt_staged_launch, RuntimeBackend,
-    RuntimeExecutorBuildContext, StagedPipelineContexts,
+    build_runtime_executor, should_attempt_staged_launch, should_remux_source_ingest,
+    RemuxedIngestContexts, RuntimeBackend, RuntimeExecutorBuildContext, StagedPipelineContexts,
 };
 use super::profile::{EncodingProfile, MAX_VSR_QUALITY};
-use super::run::is_retryable_failure;
+use super::run::{is_ingest_failure, is_retryable_failure};
 use super::session::{
     cleanup_session, new_session_map, PipelineCompletionSignal, Session, SessionInfo,
 };
@@ -1328,4 +1328,79 @@ fn staged_launch_gate_stages_nvidia_only_for_rife() {
             OpExecutionStage::Preprocess
         ))
     ));
+}
+
+#[test]
+fn remuxed_ingest_gate_covers_nvenc_on_relayed_hls_sources_only() {
+    let relayed = relayed_source_descriptor();
+    let unrelayed = SourceDescriptor {
+        relay: None,
+        ..relayed.clone()
+    };
+    let direct_file = SourceDescriptor {
+        classification: SourceClassification {
+            transport: SourceTransport::RemoteHttp,
+            kind: SourceKind::Other,
+        },
+        original_url: "https://example.com/video.mp4".to_string(),
+        runtime_url: "https://example.com/video.mp4".to_string(),
+        relay: None,
+        ..relayed.clone()
+    };
+
+    let nvidia = executor_plan(ExecutorKind::NvidiaSpecialized);
+    assert!(should_remux_source_ingest(&relayed, &nvidia));
+    assert!(!should_remux_source_ingest(&unrelayed, &nvidia));
+    assert!(!should_remux_source_ingest(&direct_file, &nvidia));
+    for executor in [
+        ExecutorKind::AmdSpecialized,
+        ExecutorKind::Universal,
+        ExecutorKind::Cpu,
+    ] {
+        assert!(
+            !should_remux_source_ingest(&relayed, &executor_plan(executor)),
+            "{executor:?}"
+        );
+    }
+}
+
+#[test]
+fn remuxed_ingest_contexts_feed_the_executor_and_keep_its_hls_output() {
+    let base = StageRuntimeContext::single_process(
+        "session-1",
+        &executor_plan(ExecutorKind::NvidiaSpecialized),
+        &relayed_source_descriptor(),
+        Path::new("session\\index.m3u8"),
+    );
+    let contexts = RemuxedIngestContexts::new(&base);
+
+    assert_eq!(contexts.remuxer.transport.input, FrameTransport::SourcePull);
+    assert_eq!(
+        contexts.remuxer.transport.output,
+        FrameTransport::RemuxedSourcePipe
+    );
+    assert_eq!(
+        contexts.executor.transport.input,
+        FrameTransport::RemuxedSourcePipe
+    );
+    assert_eq!(contexts.executor.transport.output, base.transport.output);
+}
+
+#[test]
+fn remuxed_ingest_retries_direct_after_ingest_failures_only() {
+    use crate::runtime::PipelineStageId;
+
+    assert!(is_ingest_failure(
+        PipelineStageId::Normalizer,
+        "Error opening input: Server returned 403 Forbidden"
+    ));
+    assert!(is_ingest_failure(
+        PipelineStageId::Executor,
+        "ERROR: Failed to initialize file reader"
+    ));
+    assert!(!is_ingest_failure(
+        PipelineStageId::Executor,
+        "ERROR: out of memory"
+    ));
+    assert!(!is_ingest_failure(PipelineStageId::Packager, ""));
 }
