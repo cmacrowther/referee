@@ -70,7 +70,7 @@ REFEREE can be self-hosted to run the backend pipeline on a headless server. Con
 
 #### Rust Binary
 1. Clone this repository: `git clone https://github.com/cmacrowther/referee.git`
-2. Run `npm run build`
+2. Run `npm run build:server`. The binary is written to `desktop/native/target/release/referee-server`.
 
 #### Docker Compose
 1. Clone this repository: `git clone https://github.com/cmacrowther/referee.git`
@@ -79,6 +79,41 @@ REFEREE can be self-hosted to run the backend pipeline on a headless server. Con
 **Headless environment variables:**
 - `REFEREE_API_TOKEN` — Pre-set the API token (minimum 32 characters). Required for headless deployments.
 - `REFEREE_ALLOWED_ORIGINS` — Comma-separated list of origins to pre-approve without a consent dialog.
+
+#### Linux Relay Server (systemd)
+Install `referee-server` as a systemd service to dedicate a Linux machine with a supported GPU to [REFEREE Relay](https://referee.craw.ca/usage#relay). Other devices on your LAN link to it and hand off their streams. The service runs as an unprivileged `referee` user and keeps its data in `/var/lib/referee`. The server must use port `14002` and share a `/24` subnet with your viewing devices.
+
+1. Install build dependencies (Debian/Ubuntu shown; other distros use the package names from [Tauri's Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux)) and a Rust toolchain from [rustup](https://rustup.rs):
+   ```sh
+   sudo apt install build-essential pkg-config libssl-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+     libayatana-appindicator3-dev librsvg2-dev pciutils libvulkan1
+   ```
+2. Build and install the binary:
+   ```sh
+   git clone https://github.com/cmacrowther/referee.git && cd referee
+   cargo build --manifest-path desktop/native/Cargo.toml --features headless --bin referee-server --release
+   sudo install -m 0755 desktop/native/target/release/referee-server /usr/local/bin/
+   ```
+3. Create the service user and give it GPU access (leave out `render` if your distro has no such group):
+   ```sh
+   sudo useradd --system --home-dir /var/lib/referee --shell /usr/sbin/nologin referee
+   sudo usermod -aG video,render referee
+   ```
+4. Install the unit and its environment file:
+   ```sh
+   sudo install -m 0644 packaging/systemd/referee-server.service /etc/systemd/system/
+   sudo install -D -m 0600 packaging/systemd/referee-server.env /etc/referee/referee-server.env
+   ```
+5. Approve each viewing device. The headless server has no consent dialog, so it rejects link requests from devices it doesn't know. On the viewing device, read its `instanceId` with `curl -s http://localhost:14002/v1/ping`. Then add `https://peer-<instanceId>.referee.invalid` to `REFEREE_ALLOWED_ORIGINS` in `/etc/referee/referee-server.env` (comma-separated for several devices).
+6. Start the service, and open port 14002 to your LAN if a firewall is enabled:
+   ```sh
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now referee-server
+   sudo ufw allow from 192.168.1.0/24 to any port 14002 proto tcp   # adjust to your subnet
+   ```
+7. On the viewing device, open **Settings → Relay**, click **Scan**, and **Link** the server.
+
+On first start the server downloads encoder binaries before it begins listening, which can take a few minutes. Follow progress with `journalctl -u referee-server -f`. Every approved device receives the server's API token, so approve only devices you trust. See the [relay server docs](https://referee.craw.ca/developers#relay-server) for approving devices without a restart, revoking access, stream settings, updates, and uninstalling.
 
 ## Integration
 
