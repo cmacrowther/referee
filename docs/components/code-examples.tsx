@@ -878,6 +878,7 @@ export function CodeExamples() {
             <p>Connect your player to the viewing device&apos;s REFEREE instance as usual. With a linked peer selected in Relay settings, stream start, heartbeat, stop, and HLS output are forwarded through that instance. Use the returned session ID and playback URL unchanged.</p>
             <p><code>GET /v1/status</code> reports the linked peer&apos;s readiness when Relay is enabled. During a relay session, GPU utilization, executor, capability flags, and session processing details come from the peer, while session IDs and output URLs stay local. <code>GET /v1/ping</code> identifies the local installation.</p>
             <p>Peer discovery recovers a linked device after its LAN address changes. If the peer is unavailable, handle the relay error and offer the original source as a fallback. Configure quality and frame generation on the processing peer before starting a new session.</p>
+            <p>The processing peer can be a desktop install or a dedicated Linux machine running <code>referee-server</code> as a service. See <a href="#relay-server" className="text-accent hover:underline">Relay Server (Linux)</a>.</p>
             <p>For processing badges, read <code>sessions[].framegenEngine</code>, <code>framegenEnabled</code>, <code>targetFps</code>, and <code>hdrEnabled</code>. These describe the active pipeline after capability checks and fallbacks. The <code>encoderHasStreamingRife</code> client property is reserved and is absent from current server responses.</p>
           </div>
         </section>

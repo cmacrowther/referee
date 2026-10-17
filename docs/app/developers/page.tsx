@@ -4,6 +4,7 @@ import { CodeExamples } from "@/components/code-examples"
 import { ApiReference } from "@/components/api-reference"
 import { IntegrateFAQ } from "@/components/integrate-faq"
 import { CorsProxyGuide } from "@/components/headless-server"
+import { RelayServerService } from "@/components/relay-server"
 import { IntegrateSidebar } from "@/components/integrate-sidebar"
 import { Footer } from "@/components/footer"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -43,6 +44,9 @@ export default function DevelopersPage() {
               </Alert>
             </div>
             <CodeExamples />
+            <div className="pt-10 pb-0">
+              <RelayServerService />
+            </div>
             <div className="pt-10 pb-0">
               <CorsProxyGuide />
             </div>

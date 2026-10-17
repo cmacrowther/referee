@@ -39,6 +39,15 @@ const navItems: NavItem[] = [
       { id: "heartbeat-contract", label: "Heartbeat Contract" },
     ],
   },
+  {
+    id: "relay-server",
+    label: "Relay Server (Linux)",
+    children: [
+      { id: "relay-server-approval", label: "Linking Without Consent" },
+      { id: "relay-server-operate", label: "Operating the Service" },
+      { id: "relay-server-unit", label: "The Service Unit" },
+    ],
+  },
   { id: "cors-proxy", label: "CORS & Reverse Proxy" },
   {
     id: "api",

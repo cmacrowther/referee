@@ -1,0 +1,45 @@
+# REFEREE headless server as a dedicated Relay processing peer.
+#
+# Install:  sudo install -m 0644 packaging/systemd/referee-server.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now referee-server
+# Docs:     https://referee.craw.ca/developers#relay-server
+
+[Unit]
+Description=REFEREE relay server (headless)
+Documentation=https://referee.craw.ca/developers#relay-server
+# Encoder binaries download on first start, so wait for the network.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=referee
+Group=referee
+# GPU device access (/dev/dri, /dev/kfd) comes from the referee user's
+# video/render group membership, set with usermod during install.
+
+# referee-server keeps config.json, approved-origins.json, encoder binaries,
+# and logs under $HOME/.local/share/com.referee.proxy.
+StateDirectory=referee
+Environment=HOME=/var/lib/referee
+# Encoder shared libraries are installed into the data directory's lib folder.
+Environment=LD_LIBRARY_PATH=/var/lib/referee/.local/share/com.referee.proxy/lib
+# REFEREE_API_TOKEN, REFEREE_ALLOWED_ORIGINS, RUST_LOG.
+EnvironmentFile=-/etc/referee/referee-server.env
+
+ExecStart=/usr/local/bin/referee-server
+# referee-server stops active GPU sessions and cleans up on SIGINT.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+# Hardening that leaves GPU devices reachable. Avoid PrivateDevices=, which
+# hides /dev/dri and /dev/nvidia*.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
